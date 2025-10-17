@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# usage:
+#   signal ETH      -> анализ конкретного актива (строгий)
+#   signal          -> мульти-анализ по пулу (Аня + gpt-4.1-mini)
+#   signal full     -> мульти-анализ с глубокой моделью (Аня + gpt-4.1)
+
+if [[ -z "${1:-}" ]]; then
+  source .venv/bin/activate
+  ./run_multi.sh
+  exit 0
+fi
+
+# Режим FULL (deep analysis)
+if [[ "${1:-}" == "full" ]]; then
+  source .venv/bin/activate
+  ./run_multi.sh gpt-4.1
+  exit 0
+fi
+
+# --- Режим конкретного актива ---
+SYM_INPUT="$1"
+if [[ -z "${VIRTUAL_ENV:-}" && -f ".venv/bin/activate" ]]; then
+  source .venv/bin/activate
+fi
+
+SYM_UP=$(echo "$SYM_INPUT" | tr '[:lower:]' '[:upper:]')
+case "$SYM_UP" in
+  */*) SYMBOL="$SYM_UP" ;;
+  *) SYMBOL="${SYM_UP}/USDT" ;;
+esac
+
+PRICE_JSON=$(python3 get_price.py "$SYMBOL")
+SYMBOL=$(echo "$PRICE_JSON" | jq -r .symbol)
+PRICE=$(echo "$PRICE_JSON" | jq -r .price)
+
+TIME_MSK=$(python3 - <<'PY'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+print(datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y, %H:%M"))
+PY
+)
+
+cat > params.json <<PARAMS
+{
+  "hints": { "symbol": "$SYMBOL", "price": $PRICE, "time_msk": "$TIME_MSK" },
+  "constraints": { "validity_minutes": 90 }
+}
+PARAMS
+
+./run_signal.sh

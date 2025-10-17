@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source .venv/bin/activate
+
+echo "📅 $(date +"%d.%m.%Y, %H:%M %Z")"
+echo "💱 Текущие цены:"
+
+python3 - <<'PY'
+import ccxt, json, sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+def fmt_price(p: float) -> str:
+    if p >= 1:      return f"{p:.2f}"
+    if p >= 0.1:    return f"{p:.4f}"
+    if p >= 0.001:  return f"{p:.6f}"
+    return f"{p:.8f}"
+
+bybit = ccxt.bybit()
+binance = ccxt.binance()
+
+with open("pool.json","r",encoding="utf-8") as f:
+    pool = json.load(f)["pool"]
+
+for sym in pool:
+    price = None
+    # 1) пытаемся взять last с Bybit
+    try:
+        t = bybit.fetch_ticker(sym)
+        price = t.get("last")
+        if price is None:
+            bid, ask = t.get("bid"), t.get("ask")
+            if bid and ask:
+                price = (bid + ask) / 2
+    except Exception:
+        pass
+    # 2) если не получилось — фолбэк на Binance
+    if price is None:
+        try:
+            t = binance.fetch_ticker(sym)
+            price = t.get("last")
+            if price is None:
+                bid, ask = t.get("bid"), t.get("ask")
+                if bid and ask:
+                    price = (bid + ask) / 2
+        except Exception:
+            pass
+
+    base = sym.split('/')[0]
+    if price is None:
+        print(f"{base:<5}=  error")
+    else:
+        print(f"{base:<5}= {fmt_price(float(price)):>12} USDT")
+PY

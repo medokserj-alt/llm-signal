@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# usage:
+#   signal ETH      -> принудительно по активу (старый режим)
+#   signal          -> мульти-анализ по пулу (Аня: анализ+JSON)
+
+if [[ -z "${1:-}" ]]; then
+  source .venv/bin/activate
+  ./run_multi.sh
+  exit 0
+fi
+
+SYM_INPUT="$1"
+if [[ -z "${VIRTUAL_ENV:-}" && -f ".venv/bin/activate" ]]; then
+  source .venv/bin/activate
+fi
+
+SYM_UP=$(echo "$SYM_INPUT" | tr '[:lower:]' '[:upper:]')
+case "$SYM_UP" in
+  */*) SYMBOL="$SYM_UP" ;;
+  *) SYMBOL="${SYM_UP}/USDT" ;;
+esac
+
+PRICE_JSON=$(python3 get_price.py "$SYMBOL")
+SYMBOL=$(echo "$PRICE_JSON" | jq -r .symbol)
+PRICE=$(echo "$PRICE_JSON" | jq -r .price)
+
+TIME_MSK=$(python3 - <<'PY'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+print(datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y, %H:%M"))
+PY
+)
+
+cat > params.json <<PARAMS
+{
+  "hints": { "symbol": "$SYMBOL", "price": $PRICE, "time_msk": "$TIME_MSK" },
+  "constraints": { "validity_minutes": 90 }
+}
+PARAMS
+
+./run_signal.sh

@@ -1,0 +1,6 @@
+[0;1;31mUnit llm-signal-botsudo.service could not be found.[0m
+[0;1;31mUnit systemctl.service could not be found.[0m
+[0;1;31mUnit status.service could not be found.[0m
+○ llm-signal-bot.service - LLM Signal Telegram Bot
+     Loaded: loaded (]8;;file://gpt/etc/systemd/system/llm-signal-bot.service/etc/systemd/system/llm-signal-bot.service]8;;; [0;1;38;5;185mdisabled[0m; preset: [0;1;32menabled[0m)
+     Active: inactive (dead)

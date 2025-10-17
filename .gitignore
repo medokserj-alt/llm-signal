@@ -1,0 +1,7 @@
+.env
+*.log
+*.html
+__pycache__/
+*.pyc
+snapshot.txt
+analysis_*.md
