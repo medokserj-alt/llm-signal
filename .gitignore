@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 snapshot.txt
 analysis_*.md
+.env
+.env.tg
