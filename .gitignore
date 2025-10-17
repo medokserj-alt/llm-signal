@@ -19,3 +19,5 @@ snapshot.txt
 analysis_*.md
 signal_*.html
 status_cache.json
+.env
+.env.tg
