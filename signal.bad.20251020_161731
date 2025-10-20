@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+mkdir -p logs
+
+MODEL="gpt-4.1"
+PARAMS="params.json"
+
+# Разбор аргументов: "./signal full" или "./signal LINK"
+args=()
+if [[ $# -gt 0 ]]; then
+  if [[ "$1" == "full" ]]; then
+    shift
+    args+=(--multi)
+  elif [[ "$1" != -* && $# -eq 1 ]]; then
+    args+=(--symbol "$1")
+    shift
+  fi
+fi
+args+=("$@")
+
+ts=$(date -u +%Y%m%d_%H%M%S)
+run_log="logs/signal_${ts}.log"
+
+python3 get_signal_json.py --model "$MODEL" --params "$PARAMS" "${args[@]}" \
+| tee "$run_log" \
+| tee -a logs/last_signal.log \
+| awk 'BEGIN{f=0} /^[[:space:]]*\{/{f=1} f{print} /^[[:space:]]*\}/{if(f){f=0; print ""}}' \
+> logs/last.json
+
+echo "----------------------------------------"
+echo "✅ Saved logs: $run_log"
+echo "✅ Last JSON:  logs/last.json"

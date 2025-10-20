@@ -1,0 +1,1 @@
+{ path=/bin/bash ; argv[]=/bin/bash -lc cd /root/llm-signal && exec ./signal_bot.sh ; ignore_errors=no ; start_time=[Mon 2025-10-20 18:33:58 UTC] ; stop_time=[n/a] ; pid=528876 ; code=(null) ; status=0/0 }

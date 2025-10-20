@@ -1,0 +1,2 @@
+ExecStart={ path=/bin/bash ; argv[]=/bin/bash -lc cd /root/llm-signal && exec ./signal_bot.sh ; ignore_errors=no ; start_time=[Mon 2025-10-20 18:32:10 UTC] ; stop_time=[n/a] ; pid=528778 ; code=(null) ; status=0/0 }
+WorkingDirectory=/root/llm-signal

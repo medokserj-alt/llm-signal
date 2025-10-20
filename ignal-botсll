@@ -1,0 +1,16 @@
+[0;1;34m# ]8;;file://gpt/etc/systemd/system/llm-signal-bot.service/etc/systemd/system/llm-signal-bot.service]8;;[0m
+[0;1;36m[Unit][0m
+Description=LLM Signal Telegram Bot
+After=network.target
+[0;1;38;5;245m[0m
+[0;1;36m[Service][0m
+Type=simple
+User=root
+WorkingDirectory=/root/llm-signal
+ExecStart=/root/llm-signal/.venv/bin/python3 /root/llm-signal/tg_bot.py
+Restart=always
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+[0;1;38;5;245m[0m
+[0;1;36m[Install][0m
+WantedBy=multi-user.target

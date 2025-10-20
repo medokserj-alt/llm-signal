@@ -1,42 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# usage:
-#   signal ETH      -> принудительно по активу (старый режим)
-#   signal          -> мульти-анализ по пулу (Аня: анализ+JSON)
 
-if [[ -z "${1:-}" ]]; then
-  source .venv/bin/activate
-  ./run_multi.sh
-  exit 0
+cd "$(dirname "$0")"
+mkdir -p logs
+
+# Совместимость со старой командой: ./signal full -> --multi
+EXTRA_ARGS=()
+if [[ "${1-}" == "full" ]]; then
+  shift
+  EXTRA_ARGS+=(--multi)
+fi
+EXTRA_ARGS+=("$@")
+
+ts=$(date -u +%Y%m%d_%H%M%S)
+run_log="logs/signal_${ts}.log"
+last_json="logs/last.json"
+html_out="signal_${ts}.html"
+md_out="analysis_${ts}.md"
+
+# 1) Генерация (stdout на экран + в лог)
+python3 get_signal_json.py "${EXTRA_ARGS[@]}" | tee "$run_log"
+
+# 2) Добываем JSON из лога
+python3 extract_json.py < "$run_log" > "$last_json" || true
+if [[ ! -s "$last_json" ]]; then
+  echo "❌ JSON не извлечён (logs/last.json пуст). Проверь вывод LLM выше."
+  exit 1
+else
+  echo "✅ extracted JSON to $last_json"
 fi
 
-SYM_INPUT="$1"
-if [[ -z "${VIRTUAL_ENV:-}" && -f ".venv/bin/activate" ]]; then
-  source .venv/bin/activate
+# 3) Текстовый сетап (ВАЖНО: читаем ИЗ stdin, поэтому < "$run_log")
+python3 save_analysis_text.py < "$run_log" > "$md_out" && echo "[OK] ANALYSIS: $md_out" || echo "[WARN] analysis text not saved"
+
+# 3a) Покажем сетап в консоли (то, чего не хватало)
+echo
+echo "===== СЕТАП (текст) ====="
+cat "$md_out"
+echo "========================="
+
+# 4) HTML по strict JSON
+python3 render_strict.py "$last_json" > "$html_out" && echo "[OK] HTML сохранён: $html_out" || echo "[WARN] HTML render failed"
+
+# 5) Логические проверки уровней
+if python3 logical_check.py "$last_json"; then
+  echo "OK: logical checks passed."
+else
+  echo "FAIL: logical checks failed."
 fi
 
-SYM_UP=$(echo "$SYM_INPUT" | tr '[:lower:]' '[:upper:]')
-case "$SYM_UP" in
-  */*) SYMBOL="$SYM_UP" ;;
-  *) SYMBOL="${SYM_UP}/USDT" ;;
-esac
-
-PRICE_JSON=$(python3 get_price.py "$SYMBOL")
-SYMBOL=$(echo "$PRICE_JSON" | jq -r .symbol)
-PRICE=$(echo "$PRICE_JSON" | jq -r .price)
-
-TIME_MSK=$(python3 - <<'PY'
-from datetime import datetime
-from zoneinfo import ZoneInfo
-print(datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y, %H:%M"))
-PY
-)
-
-cat > params.json <<PARAMS
-{
-  "hints": { "symbol": "$SYMBOL", "price": $PRICE, "time_msk": "$TIME_MSK" },
-  "constraints": { "validity_minutes": 90 }
-}
-PARAMS
-
-./run_signal.sh
+# 6) Сводный лог «последнего»
+cat "$run_log" >> logs/last_signal.log || true
+echo "----------------------------------------"
+echo "✅ Saved logs: $run_log"
+echo "✅ Last JSON:  $last_json"

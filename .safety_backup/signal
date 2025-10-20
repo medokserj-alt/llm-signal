@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# usage:
+#   signal                 -> мульти-анализ (mini)
+#   signal full            -> мульти-анализ (gpt-4.1)
+#   signal --multi         -> мульти-анализ (mini)
+#   signal --multi --model gpt-4.1
+#   signal ETH             -> анализ одного актива (строгий)
+
+# venv
+if [[ -z "${VIRTUAL_ENV:-}" && -f ".venv/bin/activate" ]]; then
+  source .venv/bin/activate
+fi
+
+# ---- режим мульти по флагам/без аргументов ----
+if [[ $# -eq 0 ]]; then
+  ./run_multi.sh
+  exit 0
+fi
+
+if [[ "$1" == "full" ]]; then
+  ./run_multi.sh gpt-4.1
+  exit 0
+fi
+
+if [[ "$1" == "--multi" ]]; then
+  # опционально --model NAME
+  if [[ "${2:-}" == "--model" && -n "${3:-}" ]]; then
+    ./run_multi.sh "$3"
+  else
+    ./run_multi.sh
+  fi
+  exit 0
+fi
+
+if [[ "$1" == "--model" && -n "${2:-}" ]]; then
+  # допускаем краткую форму: signal --model gpt-4.1 (подразумевается мульти)
+  ./run_multi.sh "$2"
+  exit 0
+fi
+
+# ---- режим конкретного актива (строгий) ----
+SYM_INPUT="$1"
+SYM_UP=$(echo "$SYM_INPUT" | tr '[:lower:]' '[:upper:]')
+case "$SYM_UP" in
+  */*) SYMBOL="$SYM_UP" ;;
+  *) SYMBOL="${SYM_UP}/USDT" ;;
+esac
+
+PRICE_JSON=$(python3 get_price.py "$SYMBOL")
+SYMBOL=$(echo "$PRICE_JSON" | jq -r .symbol)
+PRICE=$(echo "$PRICE_JSON" | jq -r .price)
+
+TIME_MSK=$(python3 - <<'PY'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+print(datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y, %H:%M"))
+PY
+)
+
+cat > params.json <<PARAMS
+{
+  "hints": { "symbol": "$SYMBOL", "price": $PRICE, "time_msk": "$TIME_MSK" },
+  "constraints": { "validity_minutes": 90 }
+}
+PARAMS
+
+./run_signal.sh

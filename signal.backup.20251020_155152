@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+mkdir -p logs
+
+ts=$(date -u +%Y%m%d_%H%M%S)
+run_log="logs/signal_${ts}.log"
+
+# Разбор режима: "./signal full" ИЛИ "./signal LINK"
+sym=""
+if [[ $# -gt 0 ]]; then
+  first="$1"
+  if [[ "$first" != "full" && "$first" != -* ]]; then
+    sym="$first"
+    shift
+  fi
+fi
+
+# Базовые аргументы к Python
+py_args=(--model gpt-4o-mini --params params.json)
+if [[ -n "$sym" ]]; then
+  py_args+=(--symbol "$sym")
+fi
+
+# Запуск + логирование + извлечение JSON в logs/last.json
+python3 get_signal_json.py "${py_args[@]}" "$@" \
+| tee "$run_log" \
+| tee -a logs/last_signal.log \
+| awk '
+  BEGIN{f=0}
+  /^[[:space:]]*\{/{f=1}
+  f{print}
+  /^[[:space:]]*\}/{if(f){f=0; print "" > "/dev/stderr"}}
+' > logs/last.json
+
+echo "----------------------------------------"
+echo "✅ Saved logs: $run_log"
+echo "✅ Last JSON:  logs/last.json"

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+mkdir -p logs
+
+ts=$(date -u +%Y%m%d_%H%M%S)
+run_log="logs/signal_${ts}.log"
+
+# Режимы: "./signal full" или "./signal LINK"
+sym=""
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    full) shift ;;          # "full" в Python не передаём
+    -*) ;;                  # опции оставляем Python'у
+    *)  sym="$1"; shift ;;  # одиночный тикер -> --symbol
+  esac
+fi
+
+py_args=(--model gpt-4o-mini --params params.json)
+[[ -n "$sym" ]] && py_args+=(--symbol "$sym")
+
+# Выводим в консоль И одновременно:
+# 1) лог запуска, 2) общий last_signal.log, 3) извлекаем JSON в logs/last.json
+python3 get_signal_json.py "${py_args[@]}" "$@" \
+| tee "$run_log" \
+| tee -a logs/last_signal.log \
+| tee >(awk 'BEGIN{f=0} /^[[:space:]]*\{/{f=1} f{print} /^[[:space:]]*\}/{if(f){f=0; print ""}}' > logs/last.json)
+
+echo "----------------------------------------"
+echo "✅ Saved logs: $run_log"
+echo "✅ Last JSON:  logs/last.json"

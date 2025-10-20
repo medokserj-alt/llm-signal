@@ -128,11 +128,6 @@ pathlib.Path("logs/last.json").write_text(json.dumps(data, ensure_ascii=False, i
 print("[OK] extracted + validated JSON -> logs/last.json")
 PY
 
-# --- генерируем артефакты для бота (MD + HTML) ---
-last_json="logs/last.json"
-python3 save_analysis_text.py < "$run_log" | tee -a "$run_log" || true
-python3 render_strict.py < "$last_json" | tee -a "$run_log" || true
-
 echo "----------------------------------------"
 echo "✅ Saved logs: $run_log"
 echo "✅ Last JSON:  logs/last.json"
