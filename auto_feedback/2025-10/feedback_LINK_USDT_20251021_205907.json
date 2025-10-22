@@ -1,0 +1,43 @@
+{
+  "schema": "v1",
+  "signal_id": "20251021_095200",
+  "pair": "LINK/USDT",
+  "datetime": "2025-10-21T10:30:00+03:00",
+  "side": "short",
+  "result": "breakeven",
+  "exit_reason": "breakeven",
+  "planned": {
+    "entry_min": 17.92,
+    "entry_max": 18.0,
+    "sl": 18.18,
+    "tp1": 17.82,
+    "tp2": 17.64,
+    "rr_planned": 2.25
+  },
+  "actual": {
+    "entry": 17.95,
+    "exit": 17.95,
+    "filled": "full",
+    "time_entry": "2025-10-21T09:52:00+03:00",
+    "time_exit": "2025-10-21T10:15:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": 0.0,
+    "pct": 0.0,
+    "note": "Контртрендовый вход, TP1 почти достигнут, корректный выход в breakeven."
+  },
+  "issues": [
+    "btc_flip_ignored"
+  ],
+  "fixes": [
+    "btc_context_check"
+  ],
+  "context": [
+    "risk_off",
+    "ema20_retest",
+    "low_volume"
+  ],
+  "comment": "Фаза корректного возврата к EMA20, но BTC сменил тон — решение выйти в breakeven оправдано.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

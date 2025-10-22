@@ -1,0 +1,74 @@
+# /root/llm-signal/feedback_writer.py
+import os, json, datetime, pathlib
+BASE = pathlib.Path(os.getenv("AUTO_FEEDBACK_DIR", "/root/llm-signal/auto_feedback"))
+LESSONS_MAX = int(os.getenv("LESSONS_MAX", "200"))
+REQUIRED = {"pair","result"}
+ALLOWED_RESULT = {"win","loss","breakeven","skip"}
+ALLOWED_SIDE = {"long","short"}
+ALLOWED_EXIT = {"tp1","tp2","sl","manual","timeout","invalidated"}
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+def _ym():
+    return datetime.datetime.now().strftime("%Y-%m")
+
+def validate(d):
+    # normalization and validation
+    allowed_results = {"win","loss","breakeven","skip"}
+    allowed_exit    = {"tp1","tp2","sl","breakeven","manual","cancel","no_entry"}
+
+    d = dict(d)
+
+    # normalize result
+    r = str(d.get("result","")).lower().strip()
+    if r in {"be","break_even"}:
+        r = "breakeven"
+    d["result"] = r
+
+    # normalize exit_reason
+    er = str(d.get("exit_reason","")).lower().strip()
+    if er in {"be","break_even"}:
+        er = "breakeven"
+
+    # auto: if result=skip and no entry filled -> no_entry
+    actual = d.get("actual") or {}
+    filled = str(actual.get("filled","")).lower().strip()
+    if r == "skip" and (actual.get("entry") in (None, "") or filled in {"", "none"}):
+        if not er:
+            er = "no_entry"
+
+    d["exit_reason"] = er
+
+    if r not in allowed_results:
+        raise ValueError("wrong result")
+    if er not in allowed_exit:
+        raise ValueError("wrong exit_reason")
+    return d
+def save_feedback(d):
+    d = validate(d)
+    ym = _ym()
+    out_dir = BASE / ym
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pair_tag = str(d["pair"]).replace("/","_")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = out_dir / f"feedback_{pair_tag}_{ts}.json"
+    out.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    lessons_dir = BASE / "lessons"
+    lessons_dir.mkdir(parents=True, exist_ok=True)
+    roll = lessons_dir / "rolling.jsonl"
+    with roll.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    try:
+        lines = roll.read_text(encoding="utf-8").splitlines()
+        if len(lines) > LESSONS_MAX:
+            roll.write_text("\n".join(lines[-LESSONS_MAX:]) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return out
+
+if __name__ == "__main__":
+    import sys
+    payload = sys.stdin.read().strip()
+    d = json.loads(payload)
+    p = save_feedback(d)
+    print(f"[OK] Feedback saved: {p}")

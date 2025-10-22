@@ -1,0 +1,47 @@
+{
+  "schema": "v1",
+  "signal_id": "20251022_045300",
+  "pair": "SUI/USDT",
+  "datetime": "2025-10-22T09:30:00+03:00",
+  "side": "long",
+  "result": "loss",
+  "exit_reason": "sl",
+  "planned": {
+    "entry_min": 2.476,
+    "entry_max": 2.484,
+    "sl": 2.451,
+    "tp1": 2.505,
+    "tp2": 2.554,
+    "rr_planned": 2.09
+  },
+  "actual": {
+    "entry": 2.476,
+    "exit": 2.416,
+    "filled": "full",
+    "time_entry": "2025-10-22T08:15:00+03:00",
+    "time_exit": "2025-10-22T09:10:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": -1.0,
+    "pct": -2.4,
+    "note": "Цена пробила EMA20 и ушла по тренду вниз, SL выполнен полностью"
+  },
+  "issues": [
+    "counter_trend_entry",
+    "early_entry",
+    "no_htf_confirmation"
+  ],
+  "fixes": [
+    "restrict_counter_trend",
+    "wait_for_htf_volume",
+    "cancel_if_rsi<45"
+  ],
+  "context": [
+    "btc_neutral",
+    "sui_under_ema60",
+    "risk_off"
+  ],
+  "comment": "Вход против локального тренда без подтверждения объёмом. RSI и старшие ТФ не подтверждали разворот. Стоп сработал быстро.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

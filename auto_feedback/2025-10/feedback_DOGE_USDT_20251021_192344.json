@@ -1,0 +1,13 @@
+{
+  "signal_id": "20251021_223045",
+  "pair": "DOGE/USDT",
+  "side": "long",
+  "result": "win",
+  "exit_reason": "tp2",
+  "issues": [],
+  "fixes": [],
+  "comment": "чистый отскок от EMA20, идеальный RR",
+  "reviewer": "Anya",
+  "datetime": "2025-10-21T19:23:44+00:00",
+  "context": []
+}

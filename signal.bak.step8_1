@@ -24,12 +24,6 @@ ts=$(date -u +%Y%m%d_%H%M%S)
 run_log="logs/signal_${ts}.log"
 
 # 1) Генерация + запись логов (сырой поток)
-# --- Step8: refresh LESSONS and export path ---
-
-./lessons_block.py >/dev/null 2>&1 || true
-
-export LLM_LESSONS_FILE="$PWD/auto_feedback/lessons/LESSONS_FOR_LLM.md"
-
 python3 get_signal_json.py --model "$MODEL" --params "$PARAMS" "${args[@]}" \
 | tee "$run_log" \
 | tee -a logs/last_signal.log \

@@ -1,0 +1,39 @@
+{
+  "schema": "v1",
+  "signal_id": "20251021_074300",
+  "pair": "LINK/USDT",
+  "datetime": "2025-10-21T10:50:00+03:00",
+  "side": "long",
+  "result": "win",
+  "exit_reason": "tp2",
+  "planned": {
+    "entry_min": 17.75,
+    "entry_max": 17.88,
+    "sl": 17.67,
+    "tp1": 18.06,
+    "tp2": 18.25,
+    "rr_planned": 2.1
+  },
+  "actual": {
+    "entry": 17.75,
+    "exit": 18.95,
+    "filled": "full",
+    "time_entry": "2025-10-21T07:43:00+03:00",
+    "time_exit": "2025-10-21T10:45:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": 2.5,
+    "pct": 2.8,
+    "note": "Обе цели достигнуты, движение чистое."
+  },
+  "issues": [],
+  "fixes": [],
+  "context": [
+    "risk_off",
+    "ema20_retest",
+    "volume_confirmed"
+  ],
+  "comment": "Идеальная отработка паттерна: вход от EMA20, импульс без аритмии, фиксация по TP2.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

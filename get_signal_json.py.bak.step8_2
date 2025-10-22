@@ -7,41 +7,6 @@ from openai import OpenAI
 import ccxt
 import subprocess
 
-# --- LESSONS loader (runtime, robust) ---
-import pathlib as _pl
-
-def _resolve_lessons_path():
-    _env_path = os.getenv("LLM_LESSONS_FILE")
-    if not _env_path:
-        return None
-    q = _pl.Path(_env_path)
-    if not q.is_absolute():
-        q = (_pl.Path(__file__).resolve().parent / q).resolve()
-    return q
-
-def load_lessons():
-    """
-    Возвращает (text, count, path_str):
-    - text: готовый блок для промпта (включая заголовок "# [LESSONS]" и перевод строки), либо "".
-    - count: число НЕпустых строк, не начинающихся с '#'.
-    - path_str: строка с абсолютным путём (если известен), иначе "".
-    """
-    q = _resolve_lessons_path()
-    if not q:
-        return ("", 0, "")
-    try:
-        if not q.exists():
-            return ("", 0, str(q))
-        raw = q.read_text(encoding="utf-8")
-    except Exception:
-        return ("", 0, str(q))
-    lines = [ln for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    body = "\n".join(lines).strip()
-    if not body:
-        return ("", 0, str(q))
-    text = "\n# [LESSONS]\n" + body + "\n"
-    return (text, len(lines), str(q))
-# ------------------------------------------
 # ---------------- Helpers ----------------
 
 def snapshot_from_status() -> str:
@@ -135,9 +100,7 @@ def build_news_focus(symbol: str, news_block: str) -> str:
 
 # ---------------- Bootstrap ----------------
 
-from pathlib import Path
-BASE = Path(__file__).resolve().parent
-load_dotenv(BASE/".env")
+load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     print("ERROR: OPENAI_API_KEY not set (put it in .env)", file=sys.stderr)
@@ -193,53 +156,15 @@ if args.multi:
     print("\n=== [SNAPSHOT ДЛЯ LLM] ===\n" + snapshot + "\n==========================\n")
 
     # user_prompt + NEWS + NEWS_FOCUS
-
     news_block = get_news_block(12)
-
-
-
-    # LESSONS: загружаем и печатаем факт подключения
-
-    lessons_text, lessons_count, lessons_path = load_lessons()
-    from pathlib import Path as _P
-
-    _auto = (BASE/"auto_feedback/lessons/Auto_Lessons_v1.6.md")
-
-    if _auto.exists():
-
-        _auto_txt = _auto.read_text(encoding="utf-8").strip()
-
-        if _auto_txt:
-
-            lessons_text = (lessons_text + "\n" if lessons_text else "") + _auto_txt + "\n"
-
-            lessons_count += len([ln for ln in _auto_txt.splitlines() if ln.strip() and not ln.lstrip().startswith("#")])
-
-
-    print("[LESSONS] " + (f"included from {lessons_path} ({lessons_count} lines)" if lessons_count else "not available"))
-
-
-
-    # финальный user_prompt для MULTI
-
     user_prompt = (
-
-        ((lessons_text + "\n") if lessons_text else "") +
-
         snapshot + btc_eth_line + "\n"
-
-        + "Требования к описанию BTC/ETH: опирайся только на last и change_24h; не указывай числовые уровни/диапазоны, которых нет во входе. "
-
-        + "Оцени общий фон (risk-on/нейтрально/risk-off) исходя из снапшота. "
-
-        + "Сначала выдай свободный аналитический обзор по пулу (4–6 абзацев). "
-
-        + "В конце — чистый JSON-блок сигнала по указанной схеме (без текста вокруг)."
-
+        "Требования к описанию BTC/ETH: опирайся только на last и change_24h; не указывай числовые уровни/диапазоны, которых нет во входе. "
+        "Оцени общий фон (risk-on/нейтрально/risk-off) исходя из снапшота. "
+        "Сначала выдай свободный аналитический обзор по пулу (4–6 абзацев). "
+        "В конце — чистый JSON-блок сигнала по указанной схеме (без текста вокруг)."
         + news_block
-
     )
-
 
     # Строгий стиль для блоков + формат symbol/time_msk
     user_prompt += (
@@ -294,8 +219,7 @@ if args.symbol:
     payload["hints"]["symbol"] = args.symbol
 payload["hints"].setdefault("time_msk", current_msk())
 
-lessons_text, _ln, _lp = load_lessons()
-user_prompt = (lessons_text + "\n" + 
+user_prompt = (
     "Сгенерируй один JSON по заданной схеме. "
     "Используй hints как обязательные значения; constraints — как жёсткие ограничения. "
     f"Поле time_msk установи РОВНО в это значение: {payload['hints']['time_msk']}. "
@@ -305,49 +229,8 @@ user_prompt = (lessons_text + "\n" +
 )
 
 # NEWS → в user_prompt; NEWS_FOCUS → по символу из payload.hints.symbol
-# базовый user_prompt без LESSONS
-
-base_user_prompt = (
-
-    "Сгенерируй один JSON по заданной схеме. "
-
-    "Используй hints как обязательные значения; constraints — как жёсткие ограничения. "
-
-    f"Поле time_msk установи РОВНО в это значение: {payload['hints']['time_msk']}. "
-
-    "Поле price, если задано, используй РОВНО как задано. "
-
-    "Если явных новостей нет (hints.news нет) — верни \"news_context\": [].\n"
-
-    "Входные данные:\n" + json.dumps(payload, ensure_ascii=False)
-
-)
-
-
-
-# NEWS → в prompt
-
 news_block = get_news_block(12)
-
-
-
-# LESSONS → перед base_user_prompt, если есть
-
-lessons_text, _ln, _lp = load_lessons()
-
-
-
-# финальный user_prompt для SINGLE
-
-user_prompt = (
-
-    ((lessons_text + "\n") if lessons_text else "")
-
-    + base_user_prompt
-
-    + news_block
-
-)
+user_prompt = user_prompt + news_block
 
 # стиль + формат symbol/time_msk
 user_prompt += (

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-import os, time, subprocess, pathlib, re, html as htmllib
+import os, time, subprocess, pathlib, re, html as htmllib, json
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
 
+# ===== базовая инициализация =====
 BASE = pathlib.Path(__file__).resolve().parent
 load_dotenv(BASE/".env.tg")
 
@@ -65,6 +66,44 @@ def is_allowed(uid: int) -> bool:
     # если список пуст — блокируем всех (явная безопасность)
     return (uid in ALLOWED_UIDS) if ALLOWED_UIDS else False
 
+# ===== импорт сохранения сниппетов =====
+try:
+    from feedback_writer import save_feedback  # ожидается файл feedback_writer.py в том же каталоге
+    FEEDBACK_AVAILABLE = True
+except Exception as _e:
+    save_feedback = None
+    FEEDBACK_AVAILABLE = False
+
+# ===== утилита парсинга JSON из текста команды =====
+def extract_json_from_text(text: str) -> str | None:
+    """
+    Принимает текст сообщения (может быть: /feedback {...} или с тройными кавычками/бэктиками).
+    Возвращает чистый JSON-строку или None.
+    """
+    if not text:
+        return None
+    # убираем префикс "/feedback"
+    text = re.sub(r'^\s*/feedback\s*', '', text, flags=re.I).strip()
+    if not text:
+        return None
+
+    # срезаем Markdown-кодблоки ```json ... ```
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, flags=re.S|re.I)
+    if fence:
+        return fence.group(1).strip()
+
+    # срезаем возможные одинарные бэктики `...`
+    inline = re.search(r"`\s*(\{.+\})\s*`", text, flags=re.S)
+    if inline:
+        return inline.group(1).strip()
+
+    # или это уже чистый JSON
+    if text.lstrip().startswith("{") and text.rstrip().endswith("}"):
+        return text.strip()
+
+    return None
+
+# ===== handlers =====
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(
@@ -79,7 +118,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(uid):
         await update.message.reply_text("Доступ запрещён.")
         return
-    kb = [[InlineKeyboardButton("🔍 FULL анализ (пул)", callback_data="run_full")]]
+    kb = [
+        [InlineKeyboardButton("🔍 FULL анализ (пул)", callback_data="run_full")],
+        [InlineKeyboardButton("📝 Добавить feedback", callback_data="feedback_howto")]
+    ]
     await update.message.reply_text("Выбери действие:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def run_full_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,13 +161,98 @@ async def run_full_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for chunk in parts[1:]:
             await context.bot.send_message(chat_id=CHANNEL, text=chunk, parse_mode=ParseMode.HTML)
 
+async def feedback_howto_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показываем инструкцию как отправить сниппет."""
+    query = update.callback_query
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_allowed(uid):
+        await query.answer("Нет доступа", show_alert=True); return
+    await query.answer()
+    if not FEEDBACK_AVAILABLE:
+        await query.message.reply_text("❌ feedback_writer.py не найден. Добавь файл и перезапусти бота.")
+        return
+
+    example = (
+        "/feedback ```json\n"
+        "{\n"
+        '  "signal_id": "20251021_152045",\n'
+        '  "pair": "LINK/USDT",\n'
+        '  "side": "long",\n'
+        '  "result": "win",\n'
+        '  "exit_reason": "tp2",\n'
+        '  "issues": [],\n'
+        '  "fixes": [],\n'
+        '  "comment": "идеальный вход после EMA20",\n'
+        '  "reviewer": "Anya"\n'
+        "}\n"
+        "```"
+    )
+    await query.message.reply_text(
+        "Ок, пришли JSON сниппет командой /feedback.\n\n"
+        "Пример:\n" + example
+    )
+
+async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимаем JSON, сохраняем через feedback_writer.save_feedback."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_allowed(uid):
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    if not FEEDBACK_AVAILABLE:
+        await update.message.reply_text("❌ feedback_writer.py не найден. Добавь файл и перезапусти бота.")
+        return
+
+    raw = update.message.text or ""
+    payload = extract_json_from_text(raw)
+    if not payload:
+        await update.message.reply_text(
+            "Не нашёл JSON в сообщении.\n"
+            "Пришли в формате:\n"
+            "/feedback {\"signal_id\":\"...\",\"pair\":\"LINK/USDT\",...}\n"
+            "или в блоке ```json ... ```"
+        )
+        return
+
+    try:
+        data = json.loads(payload)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка JSON: {e}")
+        return
+
+    # Минимальная проверка ключей (мягкая)
+    required = ["pair", "result"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        await update.message.reply_text(f"❌ Не хватает полей: {', '.join(missing)}")
+        return
+
+    try:
+        path_saved = save_feedback(data)  # ожидание: функция вернёт путь сохранённого файла или None
+    except TypeError:
+        # если save_feedback ничего не возвращает — просто вызвали
+        save_feedback(data)
+        path_saved = None
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка сохранения: {e}")
+        return
+
+    suffix = f"\n📁 {path_saved}" if path_saved else ""
+    await update.message.reply_text("✅ Feedback сохранён." + suffix)
+
+# ===== main =====
 def main():
     if not BOT_TOKEN or not CHANNEL:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_TARGET_CHANNEL in .env.tg")
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(run_full_cb, pattern="^run_full$"))
+
+    # feedback: кнопка-инструкция и команда для JSON
+    app.add_handler(CallbackQueryHandler(feedback_howto_cb, pattern="^feedback_howto$"))
+    app.add_handler(CommandHandler("feedback", feedback_cmd))
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

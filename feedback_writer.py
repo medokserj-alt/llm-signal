@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+import json, os, datetime
+from pathlib import Path
+
+# === Параметры ===
+BASE = Path(__file__).resolve().parent
+AF_DIR = BASE / "auto_feedback"
+LESSONS_DIR = AF_DIR / "lessons"
+ROLLING_PATH = LESSONS_DIR / "rolling.jsonl"
+LESSONS_MD   = LESSONS_DIR / "LESSONS_FOR_LLM.md"
+# лимиты
+ROLLING_MAX  = 10000   # safety cap, чтобы файл бесконечно не рос
+LESSONS_MAX  = 200     # сколько строк включаем в Markdown
+
+AF_DIR.mkdir(exist_ok=True, parents=True)
+LESSONS_DIR.mkdir(exist_ok=True, parents=True)
+
+# --- валидация данных сниппета ---
+RESULT_OK = {"win", "loss", "breakeven", "skip"}
+EXIT_OK   = {"tp1","tp2","sl","breakeven","no_entry","cancel","manual","timeout"}
+
+def validate(d: dict) -> dict:
+    # обязательные поля (минимум для v1)
+    for k in ("pair","result"):
+        if k not in d:
+            raise ValueError(f"missing field: {k}")
+    if d["result"] not in RESULT_OK:
+        raise ValueError("result must be one of {'breakeven','loss','skip','win'}")
+    if "exit_reason" in d and d["exit_reason"] and d["exit_reason"] not in EXIT_OK:
+        raise ValueError("wrong exit_reason")
+
+    # нормализуем datetime в ISO если нет
+    if not d.get("datetime"):
+        d["datetime"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return d
+
+def _month_dir(dt: datetime.datetime) -> Path:
+    month = dt.strftime("%Y-%m")
+    p = AF_DIR / month
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _safe_pair(pair: str) -> str:
+    return (pair or "UNKNOWN").replace("/","_").replace(" ","")
+
+def rebuild_lessons_md():
+    """Пересобирает LESSONS_FOR_LLM.md из rolling.jsonl с дедупликацией и лимитом."""
+    if not ROLLING_PATH.exists():
+        # Если базы ещё нет — создаём пустой MD
+        header = "# [LESSONS]\nУчитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):\n\n"
+        LESSONS_MD.write_text(header, encoding="utf-8")
+        return 0
+        # --- Auto_Lessons_v1.6.md injection ---
+        from pathlib import Path
+        auto_extra = Path("auto_feedback/lessons/Auto_Lessons_v1.6.md")
+        if auto_extra.exists():
+            with open(auto_extra, "r", encoding="utf-8") as f:
+                text += "\n" + f.read().strip() + "\n"
+        # ----------------------------------------
+
+    # читаем все строки
+    lines = ROLLING_PATH.read_text(encoding="utf-8").splitlines()
+    items = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: 
+            continue
+        try:
+            items.append(json.loads(ln))
+        except Exception:
+            continue
+
+    # дедуп по ключу (signal_id|pair|datetime) — оставляем последнее вхождение
+    dedup = {}
+    for d in items:
+        key = f"{d.get('signal_id')}|{d.get('pair')}|{d.get('datetime')}"
+        dedup[key] = d
+    records = list(dedup.values())
+
+    # берем последние LESSONS_MAX по порядку появления
+    if len(records) > LESSONS_MAX:
+        records = records[-LESSONS_MAX:]
+
+    def row(d):
+        issues = d.get("issues") or ["none"]
+        fixes  = d.get("fixes")  or ["none"]
+        note   = (d.get("pnl",{}).get("note") or d.get("comment") or "").strip()
+        return f"- {d.get('datetime')} • {d.get('pair')} • result={d.get('result')}; issues=[{', '.join(issues)}]; fixes=[{', '.join(fixes)}]; note: {note}"
+
+    header = "# [LESSONS]\nУчитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):\n\n"
+    body = "\n".join(row(d) for d in records)
+    LESSONS_MD.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
+    return len(records)
+
+def _cap_rolling_if_needed():
+    """Поддерживаем размер rolling.jsonl в разумных границах."""
+    try:
+        lines = ROLLING_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    if len(lines) <= ROLLING_MAX:
+        return
+    # оставляем последние ROLLING_MAX строк
+    ROLLING_PATH.write_text("\n".join(lines[-ROLLING_MAX:])+"\n", encoding="utf-8")
+
+def save_feedback(data: dict) -> str:
+    d = validate(dict(data))  # копия и валидация
+
+    # вычисляем имя файла
+    now = datetime.datetime.now(datetime.timezone.utc)
+    monthdir = _month_dir(now)
+    pair = _safe_pair(d.get("pair"))
+    # предпочитаем signal_id в имени, иначе текущий штамп
+    sid = (d.get("signal_id") or now.strftime("%Y%m%d_%H%M%S"))
+    json_path = monthdir / f"feedback_{pair}_{sid}.json"
+
+    # сохраняем сам сниппет (красиво)
+    json_path.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # добавляем в rolling.jsonl (одной строкой)
+    with ROLLING_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+    # ограничим размер rolling на всякий
+    _cap_rolling_if_needed()
+
+    # пересоберём LESSONS_FOR_LLM.md
+    n = rebuild_lessons_md()
+
+    print(f"✅ Feedback saved: {json_path}")
+    print(f"🔁 LESSONS rebuilt: {LESSONS_MD} ({n} items)")
+    return str(json_path)
+
+if __name__ == "__main__":
+    import sys
+    import fileinput
+    try:
+        # читаем JSON из stdin или первого аргумента-файла
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+            data = json.loads(raw)
+        else:
+            if len(sys.argv) < 2:
+                raise SystemExit("Usage: feedback_writer.py < file.json")
+            with open(sys.argv[1], "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        save_feedback(data)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)

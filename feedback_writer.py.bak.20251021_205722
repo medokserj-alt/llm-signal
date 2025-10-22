@@ -1,0 +1,58 @@
+# /root/llm-signal/feedback_writer.py
+import os, json, datetime, pathlib
+BASE = pathlib.Path(os.getenv("AUTO_FEEDBACK_DIR", "/root/llm-signal/auto_feedback"))
+LESSONS_MAX = int(os.getenv("LESSONS_MAX", "200"))
+REQUIRED = {"pair","result"}
+ALLOWED_RESULT = {"win","loss","breakeven","skip"}
+ALLOWED_SIDE = {"long","short"}
+ALLOWED_EXIT = {"tp1","tp2","sl","manual","timeout","invalidated"}
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+def _ym():
+    return datetime.datetime.now().strftime("%Y-%m")
+
+def validate(d):
+    if not isinstance(d, dict): raise ValueError("payload must be JSON object")
+    for k in REQUIRED:
+        if k not in d: raise ValueError(f"incomplete field: {k}")
+    if "result" in d and d["result"] not in ALLOWED_RESULT:
+        raise ValueError(f"result must be one of {ALLOWED_RESULT}")
+    if "side" in d and d["side"] not in ALLOWED_SIDE:
+        raise ValueError("side must be long&short")
+    if "exit_reason" in d and d["exit_reason"] not in ALLOWED_EXIT:
+        raise ValueError("wrong exit_reason")
+    d.setdefault("datetime", _now_iso())
+    d.setdefault("issues", []); d.setdefault("fixes", [])
+    d.setdefault("comment",""); d.setdefault("reviewer","")
+    d.setdefault("context", []); d.setdefault("signal_id","")
+    return d
+
+def save_feedback(d):
+    d = validate(d)
+    ym = _ym()
+    out_dir = BASE / ym
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pair_tag = str(d["pair"]).replace("/","_")
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = out_dir / f"feedback_{pair_tag}_{ts}.json"
+    out.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+    lessons_dir = BASE / "lessons"
+    lessons_dir.mkdir(parents=True, exist_ok=True)
+    roll = lessons_dir / "rolling.jsonl"
+    with roll.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+    try:
+        lines = roll.read_text(encoding="utf-8").splitlines()
+        if len(lines) > LESSONS_MAX:
+            roll.write_text("\n".join(lines[-LESSONS_MAX:]) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return out
+
+if __name__ == "__main__":
+    import sys
+    payload = sys.stdin.read().strip()
+    d = json.loads(payload)
+    p = save_feedback(d)
+    print(f"[OK] Feedback saved: {p}")

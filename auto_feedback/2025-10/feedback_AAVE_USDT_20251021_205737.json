@@ -1,0 +1,41 @@
+{
+  "schema": "v1",
+  "signal_id": "20251021_173100",
+  "pair": "AAVE/USDT",
+  "datetime": "2025-10-21T20:30:00+03:00",
+  "side": "long",
+  "result": "skip",
+  "exit_reason": "no_entry",
+  "planned": {
+    "entry_min": 224.3,
+    "entry_max": 226.19,
+    "sl": 224.08,
+    "tp1": 226.42,
+    "tp2": 228.53,
+    "rr_planned": 2.12
+  },
+  "actual": {
+    "entry": null,
+    "exit": null,
+    "filled": "none",
+    "time_entry": null,
+    "time_exit": null
+  },
+  "pnl": {
+    "r_multiple": 0.0,
+    "pct": 0.0,
+    "note": "Цена не вернулась в диапазон входа, сделка не активировалась."
+  },
+  "issues": [],
+  "fixes": [
+    "respect_cancel_rules"
+  ],
+  "context": [
+    "risk_off",
+    "defi_sector",
+    "ema20_retest"
+  ],
+  "comment": "Сетап подтверждён, но без безопасной точки входа. Пропуск корректный и дисциплинированный.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

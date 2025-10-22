@@ -1,0 +1,46 @@
+{
+  "schema": "v1",
+  "signal_id": "20251021_001700",
+  "pair": "LINK/USDT",
+  "datetime": "2025-10-22T01:15:00+03:00",
+  "side": "long",
+  "result": "loss",
+  "exit_reason": "sl",
+  "planned": {
+    "entry_min": 17.92,
+    "entry_max": 18.01,
+    "sl": 17.95,
+    "tp1": 18.19,
+    "tp2": 18.37,
+    "rr_planned": 2.04
+  },
+  "actual": {
+    "entry": 17.92,
+    "exit": 17.7,
+    "filled": "full",
+    "time_entry": "2025-10-22T00:17:00+03:00",
+    "time_exit": "2025-10-22T01:15:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": -1.0,
+    "pct": -1.55,
+    "note": "Stop-loss без подтверждения объёма, RSI слабый"
+  },
+  "issues": [
+    "ema_touch_no_volume",
+    "weak_rsi",
+    "btc_context_ignored"
+  ],
+  "fixes": [
+    "require_m15_volume",
+    "wait_for_rsi>50",
+    "btc_context_check"
+  ],
+  "context": [
+    "risk_off",
+    "ema20_retest"
+  ],
+  "comment": "Вход от нижней границы 17.92 без свечи-объёма и при RSI<45, SL сработал сразу.",
+  "reviewer": "Anya",
+  "source": "auto"
+}
