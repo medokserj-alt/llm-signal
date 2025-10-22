@@ -1,0 +1,38 @@
+{
+  "schema": "v1",
+  "signal_id": "20251022_124000",
+  "pair": "APT/USDT",
+  "datetime": "2025-10-22T12:40:00+03:00",
+  "side": "long",
+  "result": "win",
+  "exit_reason": "tp2",
+  "planned": {
+    "entry_min": 3.2,
+    "entry_max": 3.22,
+    "sl": 3.16,
+    "tp1": 3.25,
+    "tp2": 3.28,
+    "rr_planned": 2.07
+  },
+  "actual": {
+    "entry": 3.21,
+    "exit": 3.28,
+    "filled": "full",
+    "time_entry": "2025-10-22T12:43:00+03:00",
+    "time_exit": "2025-10-22T13:50:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": 2.0,
+    "pct": 2.4,
+    "note": "TP2 достигнут, импульс подтверждён объёмом."
+  },
+  "issues": [],
+  "fixes": [],
+  "context": [
+    "ema20_retest",
+    "volume_confirmed"
+  ],
+  "comment": "Образцовая сделка по strict v5, чистая структура и R:R ≈ 2.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

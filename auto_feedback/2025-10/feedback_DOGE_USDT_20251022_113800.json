@@ -1,0 +1,44 @@
+{
+  "schema": "v1",
+  "signal_id": "20251022_113800",
+  "pair": "DOGE/USDT",
+  "datetime": "2025-10-22T11:38:00+03:00",
+  "side": "long",
+  "result": "loss",
+  "exit_reason": "sl",
+  "planned": {
+    "entry_min": 0.1909,
+    "entry_max": 0.1915,
+    "sl": 0.1898,
+    "tp1": 0.1934,
+    "tp2": 0.1953,
+    "rr_planned": 2.06
+  },
+  "actual": {
+    "entry": 0.191,
+    "exit": 0.1898,
+    "filled": "full",
+    "time_entry": "2025-10-22T11:40:00+03:00",
+    "time_exit": "2025-10-22T12:10:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": -1.0,
+    "pct": -0.63,
+    "note": "Стоп-лосс по свечному пробою вниз."
+  },
+  "issues": [
+    "no_retest",
+    "early_entry"
+  ],
+  "fixes": [
+    "wait_for_pullback",
+    "require_confirmed_retest"
+  ],
+  "context": [
+    "neutral_btc",
+    "fake_breakdown"
+  ],
+  "comment": "Ошибка сигнала — вход на свечу-пробой без ретеста EMA20.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

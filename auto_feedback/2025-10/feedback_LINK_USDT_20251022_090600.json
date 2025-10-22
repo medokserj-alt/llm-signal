@@ -1,0 +1,42 @@
+{
+  "schema": "v1",
+  "signal_id": "20251022_090600",
+  "pair": "LINK/USDT",
+  "datetime": "2025-10-22T09:06:00+03:00",
+  "side": "long",
+  "result": "breakeven",
+  "exit_reason": "breakeven",
+  "planned": {
+    "entry_min": 17.48,
+    "entry_max": 17.58,
+    "sl": 17.35,
+    "tp1": 17.76,
+    "tp2": 17.93,
+    "rr_planned": 2.0
+  },
+  "actual": {
+    "entry": 17.52,
+    "exit": 17.55,
+    "filled": "partial",
+    "time_entry": "2025-10-22T09:12:00+03:00",
+    "time_exit": "2025-10-22T10:00:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": 0.0,
+    "pct": 0.0,
+    "note": "Импульс без продолжения, выход в ноль."
+  },
+  "issues": [
+    "weak_volume"
+  ],
+  "fixes": [
+    "require_m15_volume"
+  ],
+  "context": [
+    "neutral_btc",
+    "ema20_retest"
+  ],
+  "comment": "Чистый сетап, но рынок не дал импульса — выход в BU.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

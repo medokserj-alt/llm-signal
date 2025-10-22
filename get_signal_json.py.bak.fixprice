@@ -293,24 +293,45 @@ payload.setdefault("hints", {})
 if args.symbol:
     payload["hints"]["symbol"] = args.symbol
     # inject live last price for single-mode to avoid hallucinated numbers
+
     _sym = payload["hints"]["symbol"]
+
     try:
+
         _last = get_pair_ticker(_sym).get("last")
+
     except Exception:
+
         _last = None
+
     if _last is not None:
+
         try:
+
             _val = float(_last)
+
             _prec = 4 if _val < 1 else (3 if _val < 10 else 2)
+
             payload["hints"]["price"] = round(_val, _prec)
+
             payload["hints"]["price_source"] = "live"
+
         except Exception:
+
             pass
 
+            pass
+_prec = 4 if _val < 1 else (3 if _val < 10 else 2)\n
+payload["hints"]["price"] = round(_val, _prec)\n
+payload["hints"]["price_source"] = "live"
+
+        except Exception:
+
+            pass
 payload["hints"].setdefault("time_msk", current_msk())
 
-# базовый user_prompt
-base_user_prompt = (
+lessons_text, _ln, _lp = load_lessons()
+user_prompt = (lessons_text + "\n" + 
     "Сгенерируй один JSON по заданной схеме. "
     "Используй hints как обязательные значения; constraints — как жёсткие ограничения. "
     f"Поле time_msk установи РОВНО в это значение: {payload['hints']['time_msk']}. "
@@ -319,17 +340,49 @@ base_user_prompt = (
     "Входные данные:\n" + json.dumps(payload, ensure_ascii=False)
 )
 
+# NEWS → в user_prompt; NEWS_FOCUS → по символу из payload.hints.symbol
+# базовый user_prompt без LESSONS
+
+base_user_prompt = (
+
+    "Сгенерируй один JSON по заданной схеме. "
+
+    "Используй hints как обязательные значения; constraints — как жёсткие ограничения. "
+
+    f"Поле time_msk установи РОВНО в это значение: {payload['hints']['time_msk']}. "
+
+    "Поле price, если задано, используй РОВНО как задано. "
+
+    "Если явных новостей нет (hints.news нет) — верни \"news_context\": [].\n"
+
+    "Входные данные:\n" + json.dumps(payload, ensure_ascii=False)
+
+)
+
+
+
 # NEWS → в prompt
+
 news_block = get_news_block(12)
 
+
+
 # LESSONS → перед base_user_prompt, если есть
+
 lessons_text, _ln, _lp = load_lessons()
 
+
+
 # финальный user_prompt для SINGLE
+
 user_prompt = (
+
     ((lessons_text + "\n") if lessons_text else "")
+
     + base_user_prompt
+
     + news_block
+
 )
 
 # стиль + формат symbol/time_msk
