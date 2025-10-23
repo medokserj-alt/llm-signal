@@ -68,8 +68,8 @@ def rebuild_lessons_md():
 
     ROLLING_PATH = Path("auto_feedback/lessons/rolling.jsonl")
     OUT_PATH     = Path("auto_feedback/lessons/LESSONS_FOR_LLM.md")
-    AUTO_18      = Path("auto_feedback/lessons/Auto_Lessons.md")
-    AUTO_16      = Path("auto_feedback/lessons/Auto_Lessons.md")
+    AUTO_18      = Path("auto_feedback/lessons/Auto_Lessons_v1.8.md")
+    AUTO_16      = Path("auto_feedback/lessons/Auto_Lessons_v1.6.md")
 
     header = "# [LESSONS]\nУчитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):\n\n"
 

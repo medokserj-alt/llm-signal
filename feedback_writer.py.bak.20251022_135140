@@ -56,61 +56,58 @@ def _safe_pair(pair: str) -> str:
             text += "\n" + f.read().strip() + "\n"
 
 def rebuild_lessons_md():
-    """
-    Сборка авто-уроков:
-    - читает auto_feedback/lessons/rolling.jsonl (feedback-сниппеты)
-    - рендерит краткие строки
-    - ДОБАВЛЯЕТ в конец AUTO-блок (v1.8 приоритетно, иначе v1.6), если он существует
-    Возвращает число feedback-элементов (без AUTO-блока).
-    """
-    import json
+    """Пересобирает LESSONS_FOR_LLM.md из rolling.jsonl с дедупликацией и лимитом."""
+    if not ROLLING_PATH.exists():
+        # Если базы ещё нет — создаём пустой MD
+        header = "# [LESSONS]\nУчитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):\n\n"
+        LESSONS_MD.write_text(header, encoding="utf-8")
+        return 0
     from pathlib import Path
+    if auto_extra.exists():
+        with open(auto_extra, "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
 
-    ROLLING_PATH = Path("auto_feedback/lessons/rolling.jsonl")
-    OUT_PATH     = Path("auto_feedback/lessons/LESSONS_FOR_LLM.md")
-    AUTO_18      = Path("auto_feedback/lessons/Auto_Lessons.md")
-    AUTO_16      = Path("auto_feedback/lessons/Auto_Lessons.md")
+    # читаем все строки
+    lines = ROLLING_PATH.read_text(encoding="utf-8").splitlines()
+    items = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: 
+            continue
+        try:
+            items.append(json.loads(ln))
+        except Exception:
+            continue
+
+    # дедуп по ключу (signal_id|pair|datetime) — оставляем последнее вхождение
+    dedup = {}
+    for d in items:
+        key = f"{d.get('signal_id')}|{d.get('pair')}|{d.get('datetime')}"
+        dedup[key] = d
+    records = list(dedup.values())
+
+    # берем последние LESSONS_MAX по порядку появления
+    if len(records) > LESSONS_MAX:
+        records = records[-LESSONS_MAX:]
+
+    def row(d):
+        issues = d.get("issues") or ["none"]
+        fixes  = d.get("fixes")  or ["none"]
+        note   = (d.get("pnl",{}).get("note") or d.get("comment") or "").strip()
+        return f"- {d.get('datetime')} • {d.get('pair')} • result={d.get('result')}; issues=[{', '.join(issues)}]; fixes=[{', '.join(fixes)}]; note: {note}"
+    from pathlib import Path
+    if auto_extra.exists():
+        with open(auto_extra, "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
 
     header = "# [LESSONS]\nУчитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):\n\n"
-
-    items = []
-    if ROLLING_PATH.exists():
-        for ln in ROLLING_PATH.read_text(encoding="utf-8").splitlines():
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                d = json.loads(ln)
-            except Exception:
-                continue
-            dt    = d.get("datetime") or d.get("ts") or ""
-            pair  = d.get("pair", "")
-            res   = d.get("result", "")
-            issues= d.get("issues") or []
-            fixes = d.get("fixes")  or []
-            if not isinstance(issues, list): issues = []
-            if not isinstance(fixes, list):  fixes  = []
-            issues_str = ", ".join(issues) if issues else "none"
-            fixes_str  = ", ".join(fixes)  if fixes  else "none"
-            note = (d.get("pnl") or {}).get("note") if isinstance(d.get("pnl"), dict) else ""
-            if not note:
-                note = d.get("comment", "") or "—"
-            items.append(f"- {dt} • {pair} • result={res}; issues=[{issues_str}]; fixes=[{fixes_str}]; note: {note}")
-
-    # ограничим хвостом, чтобы промпт не раздувался
-    text = header + "\n".join(items[-20:]) + "\n"
-
-    # приклеиваем AUTO (v1.8 > v1.6)
-    for auto_path in (AUTO_18, AUTO_16):
-        if auto_path.exists():
-            auto_txt = auto_path.read_text(encoding="utf-8").strip()
-            if auto_txt:
-                text += "\n" + auto_txt + "\n"
-                break
-
-    OUT_PATH.write_text(text, encoding="utf-8")
-    return len(items)
-
+    body = "\n".join(row(d) for d in records)
+    LESSONS_MD.write_text(header + body + ("\n" if body else ""), encoding="utf-8")
+    return len(records)
+    from pathlib import Path
+    if auto_extra.exists():
+        with open(auto_extra, "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
 
 def _cap_rolling_if_needed():
     """Поддерживаем размер rolling.jsonl в разумных границах."""

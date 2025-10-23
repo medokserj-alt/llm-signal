@@ -198,9 +198,27 @@ if args.multi:
 
 
 
-    # LESSONS: загружаем и печатаем факт подключения (clean)
+    # LESSONS: загружаем и печатаем факт подключения
+
     lessons_text, lessons_count, lessons_path = load_lessons()
+    from pathlib import Path as _P
+
+
+    if _auto.exists():
+
+        _auto_txt = _auto.read_text(encoding="utf-8").strip()
+
+        if _auto_txt:
+
+            lessons_text = (lessons_text + "\n" if lessons_text else "") + _auto_txt + "\n"
+
+            lessons_count += len([ln for ln in _auto_txt.splitlines() if ln.strip() and not ln.lstrip().startswith("#")])
+
+
     print("[LESSONS] " + (f"included from {lessons_path} ({lessons_count} lines)" if lessons_count else "not available"))
+
+
+
     # финальный user_prompt для MULTI
 
     user_prompt = (
