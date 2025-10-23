@@ -40,21 +40,7 @@ def load_lessons():
     if not body:
         return ("", 0, str(q))
     text = "\n# [LESSONS]\n" + body + "\n"
-    # --- Fallback: если в собранном LESSONS нет маркера AUTO, добавим Auto_Lessons.md ---
-    try:
-        if "AUTO_LESSONS" not in raw:
-            from pathlib import Path as _P
-            _ap = (_pl.Path(__file__).resolve().parent / "auto_feedback/lessons/Auto_Lessons.md").resolve()
-            if _ap.exists():
-                _auto = _ap.read_text(encoding="utf-8").strip()
-                if _auto:
-                    body2 = (body + "\n" + _auto).strip()
-                    text  = "\n# [LESSONS]\n" + body2 + "\n"
-                    lines = [ln for ln in body2.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-                    return (text, len(lines), str(q))
-    except Exception:
-        pass
-        return (text, len(lines), str(q))
+    return (text, len(lines), str(q))
 # ------------------------------------------
 # ---------------- Helpers ----------------
 

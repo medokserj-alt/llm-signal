@@ -1,23 +1,8 @@
 # [LESSONS]
 Учитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):
 
-- 2025-10-21T19:23:44+00:00 • DOGE/USDT • result=win; issues=[none]; fixes=[none]; note: чистый отскок от EMA20, идеальный RR
-- 2025-10-21T10:50:00+03:00 • LINK/USDT • result=win; issues=[none]; fixes=[none]; note: Обе цели достигнуты, движение чистое.
-- 2025-10-21T20:30:00+03:00 • AAVE/USDT • result=skip; issues=[none]; fixes=[respect_cancel_rules]; note: Цена не вернулась в диапазон входа, сделка не активировалась.
-- 2025-10-21T20:30:00+03:00 • AAVE/USDT • result=skip; issues=[none]; fixes=[respect_cancel_rules]; note: Цена не вернулась в диапазон входа, сделка не активировалась.
-- 2025-10-21T10:30:00+03:00 • LINK/USDT • result=breakeven; issues=[btc_flip_ignored]; fixes=[btc_context_check]; note: Контртрендовый вход, TP1 почти достигнут, корректный выход в breakeven.
-- 2025-10-22T01:15:00+03:00 • LINK/USDT • result=loss; issues=[ema_touch_no_volume, weak_rsi, btc_context_ignored]; fixes=[require_m15_volume, wait_for_rsi>50, btc_context_check]; note: Stop-loss без подтверждения объёма, RSI слабый
-- 2025-10-22T09:30:00+03:00 • SUI/USDT • result=loss; issues=[counter_trend_entry, early_entry, no_htf_confirmation]; fixes=[restrict_counter_trend, wait_for_htf_volume, cancel_if_rsi<45]; note: Цена пробила EMA20 и ушла по тренду вниз, SL выполнен полностью
-- 2025-10-22T09:06:00+03:00 • LINK/USDT • result=breakeven; issues=[weak_volume]; fixes=[require_m15_volume]; note: Импульс без продолжения, выход в ноль.
-- 2025-10-22T11:38:00+03:00 • DOGE/USDT • result=loss; issues=[no_retest, early_entry]; fixes=[wait_for_pullback, require_confirmed_retest]; note: Стоп-лосс по свечному пробою вниз.
-- 2025-10-22T12:40:00+03:00 • APT/USDT • result=win; issues=[none]; fixes=[none]; note: TP2 достигнут, импульс подтверждён объёмом.
-
-AUTO_LESSONS v1.8
-- Trend Consistency Filter (soft): если на H4 цена < EMA60 или на H1 цена < EMA60 — пометь risk=Low и добавь флаг counter_trend в risk_flags (вход не запрещён).
-- RSI Trend Alignment (soft): если RSI(H1) < 45 — пометь risk=Low и добавь флаг weak_htf_rsi.
-- Volume Pre-Confirmation (soft): вход после закрытия свечи над EMA20(M15) с объёмом ≥ 1.2× среднего (20 свечей); иначе risk=Low и флаг no_m15_volume.
-- Multi-TF EMA Check (soft): M15 и H1 EMA-фаны должны совпадать по направлению; при расхождении — risk=Low и флаг htf_conflict.
-- Итоговая маркировка риска (не меняя JSON-схему): В начале поля "technical_rationale" добавляй префикс: "risk=<High|Medium|Low>; flags=[flag1,flag2] — ".
-
-# Update 2025-10-23T10:47:16Z
-- Soft-guard: не входить в long при RSI(H1)<45 без объёмного подтверждения на M15.
+- 2025-10-22T01:15:00+03:00 • LINK/USDT • result=loss; issues=[ema_touch_no_volume, weak_rsi, btc_context_ignored]; fixes=[require_m15_volume, wait_for_rsi>50, btc_context_check]; note: Вход от нижней границы 17.92 без свечи-объёма и при RSI<45, SL сработал сразу.
+- 2025-10-22T09:30:00+03:00 • SUI/USDT • result=loss; issues=[counter_trend_entry, early_entry, no_htf_confirmation]; fixes=[restrict_counter_trend, wait_for_htf_volume, cancel_if_rsi<45]; note: Вход против локального тренда без подтверждения объёмом. RSI и старшие ТФ не подтверждали разворот. Стоп сработал быстро.
+- 2025-10-22T09:06:00+03:00 • LINK/USDT • result=breakeven; issues=[weak_volume]; fixes=[require_m15_volume]; note: Чистый сетап, но рынок не дал импульса — выход в BU.
+- 2025-10-22T11:38:00+03:00 • DOGE/USDT • result=loss; issues=[no_retest, early_entry]; fixes=[wait_for_pullback, require_confirmed_retest]; note: Ошибка сигнала — вход на свечу-пробой без ретеста EMA20.
+- 2025-10-22T12:40:00+03:00 • APT/USDT • result=win; issues=[none]; fixes=[none]; note: Образцовая сделка по strict v5, чистая структура и R:R ≈ 2.
