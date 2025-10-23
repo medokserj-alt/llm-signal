@@ -105,19 +105,3 @@
 
 # GUARDRAILS
 ПРИОРИТЕТ ПРАВИЛ: (1) этот system-промпт; (2) снапшот и [BTC_ETH_24H]; (3) [LESSONS]. [LESSONS] — только эвристика (подсказки). При любом конфликте — игнорируй [LESSONS]. Не выдумывай числа, следуй входным данным.
-
-### DYNAMIC ENTRY POLICY (MULTI JSON в конце)
-В финальном JSON-блоке ОБЯЗАТЕЛЬНО включай:
-- "entry_mode": "now" | "limit" | "wait_confirm"
-- "confidence": "High" | "Medium" | "Low"
-- По необходимости: "confirmation_rules" (≤120 симв) и "alt_entry_range" (объект с min/max).
-Правила те же: now — подтверждённый сетап; limit — аккуратный вход от ретеста; wait_confirm — требуется подтверждение объёма/RSI/HTF.
-
-### REQUIRED JSON KEYS (override — обязательно, MULTI)
-В финальном JSON-блоке ВСЕГДА включай:
-- "entry_mode": "now" | "limit" | "wait_confirm"
-- "confidence": "High" | "Medium" | "Low"
-- "confirmation_rules": строка (может быть "" если не требуется)
-- "alt_entry_range": {"min": <num>, "max": <num>} (если нет альтернативы — дублируй entry_range)
-
-Придерживайся той же логики выбора режимов, что в SINGLE.
