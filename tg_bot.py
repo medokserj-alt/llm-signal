@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-import os, time, subprocess, pathlib, re, html as htmllib, json
+import os, time, subprocess, re, html as htmllib, json
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from pathlib import Path
 from dotenv import load_dotenv
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ===== базовая инициализация =====
-BASE = pathlib.Path(__file__).resolve().parent
-load_dotenv(BASE/".env.tg")
+BASE = Path(__file__).resolve().parent
+load_dotenv(BASE / ".env.tg")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL   = os.getenv("TELEGRAM_TARGET_CHANNEL")
+CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL")
 
 def parse_allowed_ids() -> list[int]:
     ids = []
@@ -20,41 +21,47 @@ def parse_allowed_ids() -> list[int]:
     for raw in (raw_multi, raw_legacy):
         for x in raw.replace(";", ",").split(","):
             x = x.strip()
-            if x and (x.lstrip("-").isdigit()):
-                try:
-                    ids.append(int(x))
-                except:  # noqa
-                    pass
-    # убираем дубли
+            if x and x.lstrip("-").isdigit():
+                ids.append(int(x))
     return list(dict.fromkeys(ids))
 
 ALLOWED_UIDS = parse_allowed_ids()
+
+
+# ===== список тикеров для single =====
+try:
+    _pool = json.load(open(BASE/"pool.json","r",encoding="utf-8"))["pool"]
+    SYMBOLS = [s.split("/")[0] for s in _pool]
+except Exception:
+    SYMBOLS = ["BTC","ETH","SOL","AVAX","APT","AAVE","LINK","TON","ARB"]
+SYMBOLS_SET = set(SYMBOLS)
+
+GREETINGS = {
+    87017886: "Привет, Ирина! 👋",
+}
+
+def make_header(title: str) -> str:
+    """Единый формат заголовков, чтобы не было ошибок кавычек."""
+    return f"{title} • {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+
+def is_allowed(uid: int) -> bool:
+    return (uid in ALLOWED_UIDS) if ALLOWED_UIDS else False
 
 def latest(pattern: str):
     files = list(BASE.glob(pattern))
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
-def html_file_to_tg_text(p: pathlib.Path, max_len=4000):
+def html_file_to_tg_text(p: Path, max_len=4000):
     s = p.read_text(encoding="utf-8")
-    m = re.search(r'<body[^>]*>(.*?)</body>', s, flags=re.S|re.I)
-    s = m.group(1) if m else s
-    s = re.sub(r'<\s*(strong)\s*>', '<b>', s, flags=re.I)
-    s = re.sub(r'<\s*/\s*(strong)\s*>', '</b>', s, flags=re.I)
-    s = re.sub(r'<\s*(em)\s*>', '<i>', s, flags=re.I)
-    s = re.sub(r'<\s*/\s*(em)\s*>', '</i>', s, flags=re.I)
-    s = re.sub(r'<\s*br\s*/?>', '\n', s, flags=re.I)
-    s = re.sub(r'</\s*p\s*>', '\n\n', s, flags=re.I)
-    s = re.sub(r'<\s*p[^>]*>', '', s, flags=re.I)
-    s = re.sub(r'<[^>]+>', '', s)
-    s = htmllib.unescape(s)
-    s = re.sub(r'[ \t]+\n', '\n', s).strip()
+    s = re.sub(r"<[^>]+>", "", s)
+    s = htmllib.unescape(s).strip()
     chunks = []
     while s:
         chunks.append(s[:max_len])
         s = s[max_len:]
     return chunks
 
-def md_file_to_chunks(p: pathlib.Path, max_len=4000):
+def md_file_to_chunks(p: Path, max_len=4000):
     s = p.read_text(encoding="utf-8").strip()
     chunks = []
     while s:
@@ -62,98 +69,102 @@ def md_file_to_chunks(p: pathlib.Path, max_len=4000):
         s = s[max_len:]
     return chunks
 
-def is_allowed(uid: int) -> bool:
-    # если список пуст — блокируем всех (явная безопасность)
-    return (uid in ALLOWED_UIDS) if ALLOWED_UIDS else False
+# ===== меню =====
+def main_menu_kb():
+    kb = [[KeyboardButton("📊 Сигнал")], [KeyboardButton("📈 Анализ")]]
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-# ===== импорт сохранения сниппетов =====
-try:
-    from feedback_writer import save_feedback  # ожидается файл feedback_writer.py в том же каталоге
-    FEEDBACK_AVAILABLE = True
-except Exception as _e:
-    save_feedback = None
-    FEEDBACK_AVAILABLE = False
-
-# ===== утилита парсинга JSON из текста команды =====
-def extract_json_from_text(text: str) -> str | None:
-    """
-    Принимает текст сообщения (может быть: /feedback {...} или с тройными кавычками/бэктиками).
-    Возвращает чистый JSON-строку или None.
-    """
-    if not text:
-        return None
-    # убираем префикс "/feedback"
-    text = re.sub(r'^\s*/feedback\s*', '', text, flags=re.I).strip()
-    if not text:
-        return None
-
-    # срезаем Markdown-кодблоки ```json ... ```
-    fence = re.search(r"```(?:json)?\s*(.+?)```", text, flags=re.S|re.I)
-    if fence:
-        return fence.group(1).strip()
-
-    # срезаем возможные одинарные бэктики `...`
-    inline = re.search(r"`\s*(\{.+\})\s*`", text, flags=re.S)
-    if inline:
-        return inline.group(1).strip()
-
-    # или это уже чистый JSON
-    if text.lstrip().startswith("{") and text.rstrip().endswith("}"):
-        return text.strip()
-
-    return None
+def signal_menu_kb():
+    try:
+        pool = json.load(open(BASE / "pool.json", "r", encoding="utf-8"))["pool"]
+    except Exception:
+        pool = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT", "APT/USDT", "AAVE/USDT", "LINK/USDT", "TON/USDT", "ARB/USDT"]
+    short = [s.split("/")[0] for s in pool]
+    rows = [[KeyboardButton("🤖 Auto (FULL)")]]
+    for i in range(0, len(short), 3):
+        rows.append([KeyboardButton(x) for x in short[i:i+3]])
+    rows.append([KeyboardButton("⬅️ Назад")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 # ===== handlers =====
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    await update.message.reply_text(
-        "whoami\n"
-        f"- your id: {uid}\n"
-        f"- allowed: {ALLOWED_UIDS}\n"
-        f"- channel: {CHANNEL}"
-    )
+    await update.message.reply_text(f"whoami\n- your id: {uid}\n- allowed: {ALLOWED_UIDS}\n- channel: {CHANNEL}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     if not is_allowed(uid):
         await update.message.reply_text("Доступ запрещён.")
         return
-    kb = [
-        [InlineKeyboardButton("🔍 FULL анализ (пул)", callback_data="run_full")],
-        [InlineKeyboardButton("📝 Добавить feedback", callback_data="feedback_howto")]
-    ]
-    await update.message.reply_text("Выбери действие:", reply_markup=InlineKeyboardMarkup(kb))
+    first = (update.effective_user.first_name or "").strip()
+    hello = GREETINGS.get(uid) or (f"Привет, {first}!" if first else "Привет!")
+    await update.message.reply_text(hello)
+    await update.message.reply_text("📋 Главное меню", reply_markup=main_menu_kb())
 
-async def run_full_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📋 Главное меню", reply_markup=main_menu_kb())
+
+async def handle_signal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери актив или режим:", reply_markup=signal_menu_kb())
+
+async def handle_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    header = make_header("📝 LLM Full анализ")
     uid = update.effective_user.id if update.effective_user else 0
     if not is_allowed(uid):
-        await query.answer("Нет доступа", show_alert=True); return
-    await query.answer()
-    msg = await query.message.reply_text("Запускаю FULL анализ… это займёт немного времени.")
-
-    t0 = time.time()
-    proc = subprocess.run(
-        ["bash","-lc","cd ~/llm-signal && ./signal full"],
-        capture_output=True, text=True, timeout=900
-    )
-    t1 = time.time()
-
-    tail = "\n".join(proc.stdout.strip().splitlines()[-20:])
-    safe_tail = htmllib.escape(tail)
-    await msg.edit_text(f"Готово за {t1-t0:.1f}s\n<b>Хвост лога:</b>\n<pre>{safe_tail}</pre>",
-                        parse_mode=ParseMode.HTML)
-
+        await update.message.reply_text("Нет доступа.")
+        return
+    msg = await update.message.reply_text("Запускаю FULL анализ… это займёт немного времени.")
+    proc = subprocess.run(["bash", "-lc", "cd ~/llm-signal && ./signal full"], capture_output=True, text=True, timeout=900)
     analysis = latest("analysis_*.md")
     sig_html = latest("signal_*.html")
-
     if analysis:
-        header = f"📝 LLM Full анализ • {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-        parts = md_file_to_chunks(analysis)
-        await context.bot.send_message(chat_id=CHANNEL, text=header + parts[0])
-        for chunk in parts[1:]:
-            await context.bot.send_message(chat_id=CHANNEL, text=chunk)
+        text = Path(analysis).read_text(encoding="utf-8").split("2️⃣ Сетап")[0].strip()
+        await context.bot.send_message(chat_id=CHANNEL, text=header + "\n\n" + text)
+    if sig_html:
+        parts = html_file_to_tg_text(Path(sig_html))
+        await context.bot.send_message(chat_id=CHANNEL, text="📣 Сигнал\n\n" + parts[0], parse_mode=ParseMode.HTML)
 
+async def handle_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    header = make_header("📝 LLM Анализ")
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_allowed(uid):
+        await update.message.reply_text("Доступ запрещён.")
+        return
+    msg = await update.message.reply_text("Запускаю анализ рынка… это займёт немного времени.")
+    proc = subprocess.run(["bash", "-lc", "cd ~/llm-signal && ./signal full"], capture_output=True, text=True, timeout=900)
+    analysis = latest("analysis_*.md")
+    if not analysis:
+        await msg.edit_text("Не удалось сформировать анализ.")
+        return
+    text = Path(analysis).read_text(encoding="utf-8").split("2️⃣ Сетап")[0].strip()
+    await context.bot.send_message(chat_id=CHANNEL, text=header + "\n" + text)
+    safe_tail = htmllib.escape("\n".join(proc.stdout.splitlines()[-20:]) or "(лог пуст)")
+    await msg.edit_text(f"Готово\n<pre>{safe_tail}</pre>", parse_mode=ParseMode.HTML)
+
+# ===== main =====
+
+async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_allowed(uid):
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    sym_text = (update.message.text or "").strip().upper()
+    if sym_text not in SYMBOLS_SET:
+        await update.message.reply_text("Не распознал символ. Выбери из меню.")
+        return
+    symbol = f"{sym_text}/USDT"
+
+    msg = await update.message.reply_text(f"Готовлю сигнал по {symbol}…")
+
+    import subprocess, json, html as _html
+    proc = subprocess.run(
+        ["bash","-lc", f"cd ~/llm-signal && ./signal --symbol '{symbol}'"],
+        capture_output=True, text=True, timeout=600
+    )
+
+    # Отправляем полный сигнал в канал
+    sig_html = latest("signal_*.html")
     if sig_html:
         parts = html_file_to_tg_text(sig_html)
         parts[0] = "📣 Сигнал\n\n" + parts[0]
@@ -161,99 +172,52 @@ async def run_full_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for chunk in parts[1:]:
             await context.bot.send_message(chat_id=CHANNEL, text=chunk, parse_mode=ParseMode.HTML)
 
-async def feedback_howto_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показываем инструкцию как отправить сниппет."""
-    query = update.callback_query
-    uid = update.effective_user.id if update.effective_user else 0
-    if not is_allowed(uid):
-        await query.answer("Нет доступа", show_alert=True); return
-    await query.answer()
-    if not FEEDBACK_AVAILABLE:
-        await query.message.reply_text("❌ feedback_writer.py не найден. Добавь файл и перезапусти бота.")
-        return
-
-    example = (
-        "/feedback ```json\n"
-        "{\n"
-        '  "signal_id": "20251021_152045",\n'
-        '  "pair": "LINK/USDT",\n'
-        '  "side": "long",\n'
-        '  "result": "win",\n'
-        '  "exit_reason": "tp2",\n'
-        '  "issues": [],\n'
-        '  "fixes": [],\n'
-        '  "comment": "идеальный вход после EMA20",\n'
-        '  "reviewer": "Anya"\n'
-        "}\n"
-        "```"
-    )
-    await query.message.reply_text(
-        "Ок, пришли JSON сниппет командой /feedback.\n\n"
-        "Пример:\n" + example
-    )
-
-async def feedback_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимаем JSON, сохраняем через feedback_writer.save_feedback."""
-    uid = update.effective_user.id if update.effective_user else 0
-    if not is_allowed(uid):
-        await update.message.reply_text("Доступ запрещён.")
-        return
-    if not FEEDBACK_AVAILABLE:
-        await update.message.reply_text("❌ feedback_writer.py не найден. Добавь файл и перезапусти бота.")
-        return
-
-    raw = update.message.text or ""
-    payload = extract_json_from_text(raw)
-    if not payload:
-        await update.message.reply_text(
-            "Не нашёл JSON в сообщении.\n"
-            "Пришли в формате:\n"
-            "/feedback {\"signal_id\":\"...\",\"pair\":\"LINK/USDT\",...}\n"
-            "или в блоке ```json ... ```"
-        )
-        return
-
+    # Мини-блок с диапазоном входа / режимом / уверенностью / подтверждением
     try:
-        data = json.loads(payload)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка JSON: {e}")
-        return
+        last_raw = latest("logs/last.raw.json")
+        if last_raw:
+            data = json.loads(Path(last_raw).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                sym = data.get("symbol") or symbol
+                er = (data.get("entry_range") or {})
+                er_min = er.get("min") if er.get("min") is not None else "—"
+                er_max = er.get("max") if er.get("max") is not None else "—"
+                entry_mode = (data.get("entry_mode") or "limit")
+                confidence = (data.get("confidence") or "Medium")
+                confirm = data.get("confirmation_rules") or data.get("break_even_rule") or ""
+                confirm = (confirm or "—").strip()
+                mini = (
+                    "📊 " + str(sym) + "\n"
+                    "🎯 " + str(er_min) + "–" + str(er_max) + "  |  " + entry_mode + "  |  " + confidence + "\n"
+                    "☑ " + confirm
+                )
+                await context.bot.send_message(chat_id=CHANNEL, text=mini)
+    except Exception:
+        pass
 
-    # Минимальная проверка ключей (мягкая)
-    required = ["pair", "result"]
-    missing = [k for k in required if k not in data]
-    if missing:
-        await update.message.reply_text(f"❌ Не хватает полей: {', '.join(missing)}")
-        return
+    # Хвост лога пользователю
+    tail = "\n".join((proc.stdout or "").strip().splitlines()[-20:])
+    await msg.edit_text("Готово\n<pre>" + _html.escape(tail or "(лог пуст)") + "</pre>", parse_mode=ParseMode.HTML)
 
-    try:
-        path_saved = save_feedback(data)  # ожидание: функция вернёт путь сохранённого файла или None
-    except TypeError:
-        # если save_feedback ничего не возвращает — просто вызвали
-        save_feedback(data)
-        path_saved = None
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка сохранения: {e}")
-        return
 
-    suffix = f"\n📁 {path_saved}" if path_saved else ""
-    await update.message.reply_text("✅ Feedback сохранён." + suffix)
+def register_text_handlers(app: Application):
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Сигнал$"), handle_signal_menu))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Анализ$"), handle_analysis))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🤖 Auto \\(FULL\\)$"), handle_full))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⬅️ Назад$"), handle_back))
+    sym_regex = "^(" + "|".join(sorted(SYMBOLS_SET)) + ")$"
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(sym_regex), handle_symbol))
 
-# ===== main =====
 def main():
     if not BOT_TOKEN or not CHANNEL:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_TARGET_CHANNEL in .env.tg")
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(run_full_cb, pattern="^run_full$"))
-
-    # feedback: кнопка-инструкция и команда для JSON
-    app.add_handler(CallbackQueryHandler(feedback_howto_cb, pattern="^feedback_howto$"))
-    app.add_handler(CommandHandler("feedback", feedback_cmd))
-
+    register_text_handlers(app)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+
+
