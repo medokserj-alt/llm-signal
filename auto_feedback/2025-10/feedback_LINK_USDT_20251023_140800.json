@@ -1,0 +1,44 @@
+{
+  "schema": "v1",
+  "signal_id": "20251023_140800",
+  "pair": "LINK/USDT",
+  "datetime": "2025-10-23T16:20:00+03:00",
+  "side": "long",
+  "result": "breakeven",
+  "exit_reason": "breakeven",
+  "planned": {
+    "entry_min": 17.33,
+    "entry_max": 17.4,
+    "sl": 17.19,
+    "tp1": 17.54,
+    "tp2": 17.71,
+    "rr_planned": 2.12
+  },
+  "actual": {
+    "entry": 17.34,
+    "exit": 17.34,
+    "filled": "full",
+    "time_entry": "2025-10-23T14:15:00+03:00",
+    "time_exit": "2025-10-23T15:45:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": 0.0,
+    "pct": 0.0,
+    "note": "Импульс не подтвердился, выход по безубытку"
+  },
+  "issues": [
+    "early_entry",
+    "weak_volume"
+  ],
+  "fixes": [
+    "wait_second_touch",
+    "require_m15_volume"
+  ],
+  "context": [
+    "btc_neutral",
+    "late_impulse_start"
+  ],
+  "comment": "Импульс стартовал после сброса SL, тайминг входа преждевременный.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

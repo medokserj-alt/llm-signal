@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+import sys, re, os, json
+from datetime import datetime, timezone
+from pathlib import Path
+
+def _canon_block_from_json(json_path="logs/last.json"):
+    try:
+        d = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    lines = []
+    em = d.get("entry_mode")
+    cf = d.get("confidence")
+    if em: lines.append(f"💡 Режим входа: {em}")
+    if cf: lines.append(f"🎯 Уверенность: {cf}")
+    conf = d.get("confirmation_rules")
+    if conf:
+        conf = " ".join(str(conf).split())
+        lines.append(f"☑ Подтверждение: {conf}")
+    return ("\n".join(lines) + "\n") if lines else ""
+
+def _section_bounds(text, head_pat):
+    """Найдём границы секции '2️⃣ Сетап' от заголовка до следующего нумерованного заголовка (3️⃣ ...)."""
+    m = re.search(head_pat, text, flags=re.M)
+    if not m:
+        return None
+    start = m.start()
+    # ищем следующий заголовок вида '3️⃣ ' или любой следующей секции '3️⃣'..'9️⃣'
+    nxt = re.search(r'(?m)^[3-9]️⃣[^\n]*\n', text[m.end():])
+    end = m.end() + (nxt.start() if nxt else 0)
+    return (start, end if nxt else len(text))
+
+def main():
+    data = sys.stdin.read()
+
+    # 1) Обрежем всё после первого JSON-блока
+    cut_idx = data.find("\n{")
+    if cut_idx != -1:
+        analysis = data[:cut_idx]
+    else:
+        m = re.search(r'(?m)^\s*\{', data)
+        analysis = data[:m.start()] if m else data
+
+    # 2) Чистим code fences
+    analysis = re.sub(r'```+\w*\s*\n?', '', analysis)
+
+    # 3) Сжимаем пустые строки
+    analysis = re.sub(r'\n{3,}', '\n\n', analysis).strip() + "\n"
+
+    canon = _canon_block_from_json()
+
+    # 4) Обработка секции «2️⃣ Сетап»: удалить заголовок, выпилить старые 💡/🎯/☑/🔁 и ДОБАВИТЬ канон в КОНЕЦ секции
+    bounds = _section_bounds(analysis, r'(?m)^2️⃣[^\n]*Сетап[^\n]*\n')
+    if bounds and canon:
+        s, e = bounds
+        before = analysis[:s]
+        section = analysis[s:e]
+        after = analysis[e:]
+
+        # убираем сам заголовок
+        section = re.sub(r'(?m)^2️⃣[^\n]*Сетап[^\n]*\n', '', section)
+
+        # выпиливаем любые строки 💡/🎯/☑/🔁 внутри секции
+        section = re.sub(r'(?m)^\s*[💡🎯☑🔁][^\n]*\n', '', section)
+
+        # добавим канон в КОНЕЦ секции (с пустой строкой перед ним)
+        if not section.endswith("\n"):
+            section += "\n"
+        if not section.endswith("\n\n"):
+            section += "\n"
+        section = section + canon
+
+        analysis = before + section + after
+    else:
+        # На всякий — если секции не нашли, просто прицепим канон в конец всего текста
+        if canon:
+            if not analysis.endswith("\n"):
+                analysis += "\n"
+            analysis += "\n" + canon
+
+    # 5) Глобально удалим любые оставшиеся строки «🔁 Альтернативный вход …»
+    analysis = re.sub(r'(?m)^\s*🔁[^\n]*\n', '', analysis)
+
+    # 6) Финальная чистка пустых строк
+    analysis = re.sub(r'\n{3,}', '\n\n', analysis).rstrip() + "\n"
+
+    # 7) Сохраняем
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"analysis_{ts}.md"
+    Path(fname).write_text(analysis, encoding="utf-8")
+    print(f"[OK] ANALYSIS: {fname}")
+
+if __name__ == "__main__":
+    main()

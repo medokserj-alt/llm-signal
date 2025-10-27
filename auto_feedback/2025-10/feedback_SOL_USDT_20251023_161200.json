@@ -1,0 +1,42 @@
+{
+  "schema": "v1",
+  "signal_id": "20251023_161200",
+  "pair": "SOL/USDT",
+  "datetime": "2025-10-23T19:45:00+03:00",
+  "side": "long",
+  "result": "win",
+  "exit_reason": "tp2",
+  "planned": {
+    "entry_min": 188.4,
+    "entry_max": 188.9,
+    "sl": 187.65,
+    "tp1": 189.85,
+    "tp2": 191.73,
+    "rr_planned": 2.12
+  },
+  "actual": {
+    "entry": 188.6,
+    "exit": 191.5,
+    "filled": "full",
+    "time_entry": "2025-10-23T16:25:00+03:00",
+    "time_exit": "2025-10-23T18:40:00+03:00"
+  },
+  "pnl": {
+    "r_multiple": 2.2,
+    "pct": 2.8,
+    "note": "Чистое движение по плану, обе цели выполнены"
+  },
+  "issues": [],
+  "fixes": [
+    "confirm_entry_volume",
+    "auto_entry_trigger"
+  ],
+  "context": [
+    "btc_neutral",
+    "ema20_retest",
+    "strong_risk_on"
+  ],
+  "comment": "Отличная отработка EMA20(M15); импульс подтверждён объёмом и фазой восстановления.",
+  "reviewer": "Anya",
+  "source": "auto"
+}

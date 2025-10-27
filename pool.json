@@ -1,1 +1,13 @@
-{ "pool": ["SOL/USDT","AVAX/USDT","SUI/USDT","APT/USDT","AAVE/USDT","UNI/USDT","DOGE/USDT","PEPE/USDT","GALA/USDT","LINK/USDT"] }
+{
+  "pool": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "AVAX/USDT",
+    "APT/USDT",
+    "AAVE/USDT",
+    "LINK/USDT",
+    "TON/USDT",
+    "ARB/USDT"
+  ]
+}

@@ -73,6 +73,15 @@ def main():
     if break_even_rule:
         lines.append(f"**BE:** {break_even_rule}")
     lines.append("")
+    # --- Market warning banner ---
+    warnings = data.get("warnings") or []
+    if "market_entry_high_conf" in warnings:
+        lines.append("⚠️ <b>Market entry</b>: высокая уверенность, но повышенный риск — используйте меньший размер позиции и ждите EMA подтверждения.")
+    elif "market_downgraded_to_limit" in warnings:
+        lines.append("⚠️ <b>Market→Limit</b>: из-за перегрева или слабого HTF сигнал снижен до лимитного входа.")
+    elif data.get("entry_mode") in ("market","now") and not warnings:
+        lines.append("⚠️ <b>Market entry</b>: применяйте осторожность, контроль объёма обязателен.")
+
     lines.append("3️⃣ Картина по таймфреймам")
     tf_order = ["m5","m15","h1","h4","d1"]
     tf_parts = []
@@ -103,6 +112,9 @@ def main():
     lines.append("⚠️ Дисклеймер")
     lines.append(disclaimer)
 
+    # Market-entry предупреждение
+    if (data.get("entry_mode") in ("market","now")) or ("warnings" in data and "market_entry_high_conf" in data["warnings"]):
+        lines.append("⚠️ <b>Market-entry</b>: повышенный риск; используйте сниженный размер позиции.")
     text_out = trim_all_numbers("\n".join(lines))
 
     # HTML-пост (тот же контент, но с <b> вместо **)

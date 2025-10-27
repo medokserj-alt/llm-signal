@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import json, os, datetime
+from pathlib import Path
+
+# === Параметры ===
+BASE = Path(__file__).resolve().parent
+AF_DIR = BASE / "auto_feedback"
+LESSONS_DIR = AF_DIR / "lessons"
+ROLLING_PATH = LESSONS_DIR / "rolling.jsonl"
+LESSONS_MD   = LESSONS_DIR / "LESSONS_FOR_LLM.md"
+# лимиты
+ROLLING_MAX  = 10000   # safety cap, чтобы файл бесконечно не рос
+LESSONS_MAX  = 200     # сколько строк включаем в Markdown
+
+AF_DIR.mkdir(exist_ok=True, parents=True)
+LESSONS_DIR.mkdir(exist_ok=True, parents=True)
+
+# --- валидация данных сниппета ---
+RESULT_OK = {"win", "loss", "breakeven", "skip"}
+EXIT_OK   = {"tp1","tp2","sl","breakeven","no_entry","cancel","manual","timeout"}
+
+def validate(d: dict) -> dict:
+    # обязательные поля (минимум для v1)
+    for k in ("pair","result"):
+        if k not in d:
+            raise ValueError(f"missing field: {k}")
+    if d["result"] not in RESULT_OK:
+        raise ValueError("result must be one of {'breakeven','loss','skip','win'}")
+    if "exit_reason" in d and d["exit_reason"] and d["exit_reason"] not in EXIT_OK:
+        raise ValueError("wrong exit_reason")
+
+    # нормализуем datetime в ISO если нет
+    if not d.get("datetime"):
+        d["datetime"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return d
+    from pathlib import Path
+    if Path("auto_feedback/lessons/Auto_Lessons.md").exists():
+        with open(Path("auto_feedback/lessons/Auto_Lessons.md"), "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
+
+def _month_dir(dt: datetime.datetime) -> Path:
+    month = dt.strftime("%Y-%m")
+    p = AF_DIR / month
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+    from pathlib import Path
+    if Path("auto_feedback/lessons/Auto_Lessons.md").exists():
+        with open(Path("auto_feedback/lessons/Auto_Lessons.md"), "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
+
+def _safe_pair(pair: str) -> str:
+    return (pair or "UNKNOWN").replace("/","_").replace(" ","")
+    from pathlib import Path
+    if Path("auto_feedback/lessons/Auto_Lessons.md").exists():
+        with open(Path("auto_feedback/lessons/Auto_Lessons.md"), "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
+
+def rebuild_lessons_md():
+    from pathlib import Path  # safe local import
+    """
+    Сборка авто-уроков:
+    - читает auto_feedback/lessons/rolling.jsonl (feedback-сниппеты)
+    - рендерит краткие строки
+    - ДОБАВЛЯЕТ в конец AUTO-блок (v1.8 приоритетно, иначе v1.6), если он существует
+    Возвращает число feedback-элементов (без AUTO-блока).
+    """
+    import json
+    from pathlib import Path
+
+    ROLLING_PATH = Path("auto_feedback/lessons/rolling.jsonl")
+    OUT_PATH     = Path("auto_feedback/lessons/LESSONS_FOR_LLM.md")
+    AUTO_18      = Path("auto_feedback/lessons/Auto_Lessons.md")
+    AUTO_16      = Path("auto_feedback/lessons/Auto_Lessons.md")
+
+    header = "# [LESSONS]\nУчитывай повторяющиеся ошибки и принятые фиксы при генерации сигнала. Ниже последние случаи (свежие внизу):\n\n"
+
+    items = []
+    if ROLLING_PATH.exists():
+        for ln in ROLLING_PATH.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            dt    = d.get("datetime") or d.get("ts") or ""
+            pair  = d.get("pair", "")
+            res   = d.get("result", "")
+            issues= d.get("issues") or []
+            fixes = d.get("fixes")  or []
+            if not isinstance(issues, list): issues = []
+            if not isinstance(fixes, list):  fixes  = []
+            issues_str = ", ".join(issues) if issues else "none"
+            fixes_str  = ", ".join(fixes)  if fixes  else "none"
+            note = (d.get("pnl") or {}).get("note") if isinstance(d.get("pnl"), dict) else ""
+            if not note:
+                note = d.get("comment", "") or "—"
+            items.append(f"- {dt} • {pair} • result={res}; issues=[{issues_str}]; fixes=[{fixes_str}]; note: {note}")
+
+    # ограничим хвостом, чтобы промпт не раздувался
+    text = header + "\n".join(items[-20:]) + "\n"
+
+    # приклеиваем AUTO (v1.8 > v1.6)
+    for auto_path in (AUTO_18, AUTO_16):
+        if auto_path.exists():
+            auto_txt = auto_path.read_text(encoding="utf-8").strip()
+            if auto_txt:
+                text += "\n" + auto_txt + "\n"
+                break
+
+    OUT_PATH.write_text(text, encoding="utf-8")
+    return len(items)
+
+
+def _cap_rolling_if_needed():
+    """Поддерживаем размер rolling.jsonl в разумных границах."""
+    try:
+        lines = ROLLING_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    from pathlib import Path
+    if Path("auto_feedback/lessons/Auto_Lessons.md").exists():
+        with open(Path("auto_feedback/lessons/Auto_Lessons.md"), "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
+    if len(lines) <= ROLLING_MAX:
+        return
+    from pathlib import Path
+    if Path("auto_feedback/lessons/Auto_Lessons.md").exists():
+        with open(Path("auto_feedback/lessons/Auto_Lessons.md"), "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
+    # оставляем последние ROLLING_MAX строк
+    ROLLING_PATH.write_text("\n".join(lines[-ROLLING_MAX:])+"\n", encoding="utf-8")
+
+def save_feedback(data: dict) -> str:
+    d = validate(dict(data))  # копия и валидация
+
+    # вычисляем имя файла
+    now = datetime.datetime.now(datetime.timezone.utc)
+    monthdir = _month_dir(now)
+    pair = _safe_pair(d.get("pair"))
+    # предпочитаем signal_id в имени, иначе текущий штамп
+    sid = (d.get("signal_id") or now.strftime("%Y%m%d_%H%M%S"))
+    json_path = monthdir / f"feedback_{pair}_{sid}.json"
+
+    # сохраняем сам сниппет (красиво)
+    json_path.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # добавляем в rolling.jsonl (одной строкой)
+    with ROLLING_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+    # ограничим размер rolling на всякий
+    _cap_rolling_if_needed()
+
+    # пересоберём LESSONS_FOR_LLM.md
+    n = rebuild_lessons_md()
+
+    print(f"✅ Feedback saved: {json_path}")
+    print(f"🔁 LESSONS rebuilt: {LESSONS_MD} ({n} items)")
+    return str(json_path)
+    from pathlib import Path
+    if Path("auto_feedback/lessons/Auto_Lessons.md").exists():
+        with open(Path("auto_feedback/lessons/Auto_Lessons.md"), "r", encoding="utf-8") as f:
+            text += "\n" + f.read().strip() + "\n"
+
+if __name__ == "__main__":
+    import sys
+    import fileinput
+    try:
+        # читаем JSON из stdin или первого аргумента-файла
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+            data = json.loads(raw)
+        else:
+            if len(sys.argv) < 2:
+                raise SystemExit("Usage: feedback_writer.py < file.json")
+            with open(sys.argv[1], "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        save_feedback(data)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)

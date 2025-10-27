@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+def load_lessons(max_lines: int = 0):
+    """
+    Возвращает тройку:
+      (text_with_header, non_comment_lines_count, path_str)
+
+    Логика:
+    - читаем LESSONS_FOR_LLM.md;
+    - если нет маркера AUTO_LESSONS — аккуратно подмешиваем Auto_Lessons.md;
+    - считаем только некомментные строки (не пустые и не начинающиеся с '#');
+    - ограничиваем хвостом max_lines для экономии токенов;
+    - строим текст с заголовком '# [LESSONS]'.
+    """
+    base = Path(__file__).resolve().parent
+    md_path = base / "auto_feedback/lessons/LESSONS_FOR_LLM.md"
+    auto_path = base / "auto_feedback/lessons/Auto_Lessons.md"
+
+    raw = ""
+    if md_path.exists():
+        raw = md_path.read_text(encoding="utf-8").strip()
+
+    # Если в LESSONS нет AUTO-блока — добавим (мягкий фоллбэк)
+    if "AUTO_LESSONS" not in raw and auto_path.exists():
+        auto_txt = auto_path.read_text(encoding="utf-8").strip()
+        if auto_txt:
+            raw = (raw + ("\n" if raw and not raw.endswith("\n") else "" ) + auto_txt).strip()
+
+    # Считаем некомментные строки
+    lines = [ln for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+    # Ограничим хвост (оставим последние max_lines), но при этом сохраним ровно эти строки
+    if max_lines and len(lines) > max_lines:
+        keep = lines[-max_lines:]
+        raw = "\n".join(keep)
+        lines = keep
+
+    text = "\n# [LESSONS]\n" + raw + "\n"
+    return (text, len(lines), str(md_path))

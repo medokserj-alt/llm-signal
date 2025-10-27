@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+from pathlib import Path
+
+def load_lessons(max_lines: int = 0):
+    """
+    Возвращает (text_with_header, non_comment_lines_count, path_str).
+    - Читает LESSONS_FOR_LLM.md (историю/фидбеки).
+    - ВСЕГДА добавляет содержимое Auto_Lessons.md в КОНЕЦ (как правила).
+    - Не ограничивает длину (max_lines=0 => без капа).
+    """
+    base = Path(__file__).resolve().parent
+    md_path   = base / "auto_feedback/lessons/LESSONS_FOR_LLM.md"
+    auto_path = base / "auto_feedback/lessons/Auto_Lessons.md"
+
+    raw = md_path.read_text(encoding="utf-8").strip() if md_path.exists() else ""
+
+    auto_txt = auto_path.read_text(encoding="utf-8").strip() if auto_path.exists() else ""
+    if auto_txt:
+        # отделим пустой строкой и приклеим в конец
+        if raw and not raw.endswith("\n"):
+            raw += "\n"
+        raw += auto_txt
+
+    # считаем неккоментные строки
+    lines = [ln for ln in raw.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+    # если явно задан лимит >0 — применим, по умолчанию без лимита
+    if max_lines and len(lines) > max_lines:
+        keep = lines[-max_lines:]
+        raw = "\n".join(keep)
+        lines = keep
+
+    text = "\n# [LESSONS]\n" + raw + "\n"
+    return (text, len(lines), str(md_path))

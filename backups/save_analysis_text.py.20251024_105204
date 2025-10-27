@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+from lessons_block import load_lessons  # (оставим, не мешает)
+import sys, re, os, json
+from datetime import datetime, timezone
+
+def _canon_block_from_json(json_path="logs/last.json"):
+    try:
+        d = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    except Exception:
+        return ""  # нет json — ничего не меняем
+
+    lines = []
+    em = d.get("entry_mode")
+    cf = d.get("confidence")
+    if em: lines.append(f"💡 Режим входа: {em}")
+    if cf: lines.append(f"🎯 Уверенность: {cf}")
+
+    conf = d.get("confirmation_rules")
+    if conf:
+        # Уберём возможные переводы строк
+        conf = " ".join(str(conf).split())
+        lines.append(f"☑ Подтверждение: {conf}")
+
+    alt = d.get("alt_entry_range")
+    if isinstance(alt, dict) and "min" in alt and "max" in alt:
+        lines.append(f"🔁 Альтернативный вход: {alt['min']:.2f}–{alt['max']:.2f}")
+
+    return ("\n".join(lines) + "\n") if lines else ""
+
+def _dedup_setup_blocks(text):
+    # Удаляем точные повторные блоки «Режим/Уверенность/…» подряд
+    pattern = r"(?:^|\n)(💡 Режим входа:[^\n]*\n🎯 Уверенность:[^\n]*(?:\n☑ Подтверждение:[^\n]*)?(?:\n🔁 Альтернативный вход:[^\n]*)?\n)"
+    def repl(m):
+        # Оставляем один экземпляр; потом схлопнем повторы
+        return "\n" + m.group(1)
+    # Схлопнем повторяющиеся подряд одинаковые блоки
+    while True:
+        new = re.sub(pattern + r"\s*" + pattern, r"\n\1", text, flags=re.M)
+        if new == text:
+            break
+        text = new
+    return text
+
+def main():
+    data = sys.stdin.read()
+
+    # 1) Обрезаем всё, что идёт после первого JSON-блока
+    cut_idx = data.find("\n{")
+    if cut_idx != -1:
+        analysis = data[:cut_idx]
+    else:
+        m = re.search(r'(?m)^\s*\{', data)
+        analysis = data[:m.start()] if m else data
+
+    # 2) Чистим code fences
+    analysis = re.sub(r'```+\w*\s*\n?', '', analysis)
+
+    # 3) Сжимаем пустые строки
+    analysis = re.sub(r'\n{3,}', '\n\n', analysis).strip() + "\n"
+
+    # 4) Формируем канонический блок по JSON
+    canon = _canon_block_from_json()
+
+    if canon:
+        # Найдём начало «2️⃣ Сетап»
+        m = re.search(r'(?m)^2️⃣[^\n]*Сетап[^\n]*\n', analysis)
+        if m:
+            start = m.end()
+            # Заменим любые строки с нашими маркерами на канон
+            # Вырежем текущие блоки маркеров
+            after = analysis[start:]
+            after = re.sub(r'(?m)^(💡|🎯|☑|🔁)[^\n]*\n', '', after)
+            # Вставим канонический блок сразу под заголовок
+            analysis = analysis[:start] + canon + after
+        else:
+            # Если блока «Сетап» нет (на всякий) — просто добавим в начало
+            analysis = canon + "\n" + analysis
+
+        # 5) Схлопнем повторные идентичные блоки (если модель продублировала)
+        analysis = _dedup_setup_blocks(analysis)
+
+    # 6) Сохраняем
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"analysis_{ts}.md"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(analysis)
+
+    print(f"[OK] ANALYSIS: {fname}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+from lessons_block import load_lessons
+import sys, re, os
+from datetime import datetime, timezone
+
+LESSONS_RE = re.compile(r'\[LESSONS\][\s\S]*?(?=\n\s*\n|\Z)', re.MULTILINE)
+
+def replace_lessons_block(text: str) -> str:
+    try:
+        lessons_text, _, _ = load_lessons(0)  # без лимита + AUTO_LESSONS
+        # убираем лишние пустые строки вокруг
+        return LESSONS_RE.sub(lessons_text.strip(), text)
+    except Exception:
+        return text
+
+def main():
+    data = sys.stdin.read()
+
+    # 1) Обрезаем всё, что идёт после первого JSON-блока
+    cut_idx = data.find("\n{")
+    if cut_idx != -1:
+        analysis = data[:cut_idx]
+    else:
+        # иногда модель ставит ```json перед { — обрежем по первой строке начинающейся с {
+        m = re.search(r'(?m)^\s*\{', data)
+        analysis = data[:m.start()] if m else data
+
+    # 2) Удаляем markdown-кодфенсы (```json / ``` / ```anything)
+    analysis = re.sub(r'```+\w*\s*\n?', '', analysis)
+
+    # 3) Убираем возможные хвосты повторного SNAPSHOT/дубликаты JSON-меток
+    analysis = re.sub(r'(?m)^\s*JSON-сигнал:\s*$', '', analysis)
+
+    # 4) Сжимаем избыточные пустые строки
+    analysis = re.sub(r'\n{3,}', '\n\n', analysis).strip() + "\n"
+
+    # 5) Подмена [LESSONS] на полный текст из lessons_block
+    analysis = replace_lessons_block(analysis)
+
+    # 6) Сохраняем с меткой времени (UTC)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = f"analysis_{ts}.md"
+    
+    # === INJECT FULL LESSONS BLOCK =========================================
+    try:
+        full_lessons_text, _cnt, _path = load_lessons(0)  # без лимита
+        # Нормализуем заголовок: хотим ВИДЕТЬ явный [LESSONS], без #, чтобы grep/сед не путался
+        full_lessons_text = re.sub(r'^\s*#\s*\[LESSONS\]\s*$', '[LESSONS]', full_lessons_text, flags=re.M)
+
+        # 1) Случай "заглушки" вида: [LESSONS] included from ... (13 lines)
+        analysis = re.sub(r'\n(?ms)\n^           # начало строки\n\\[\\s*LESSONS\\s*\\]  # метка [LESSONS]\n.*?$        # любая приписка (included from ... (13 lines)) до конца строки\n(?:\\n(?!\\s*\\S).*?$)?  # опционально пустая строка\n', full_lessons_text + "\n", analysis, count=1, flags=re.VERBOSE)
+
+        # 2) Если в тексте встречается «короткий блок» после строки [LESSONS] — заменим его целиком.
+        #    Возьмём всё от строки [LESSONS] до первой пустой строки/конца и заменим на полный.
+        analysis = re.sub(r'(?ms)^\[LESSONS\].*?(?:\n\s*\n|$)', full_lessons_text + "\n\n", analysis, count=1)
+        # 3) На всякий — вариант с заголовком "# [LESSONS]" (если где-то так осталось)
+        analysis = re.sub(r'(?ms)^#\s*\[LESSONS\].*?(?:\n\s*\n|$)', full_lessons_text + "\n\n", analysis, count=1)
+
+    except Exception as _e:
+        # Ничего страшного — оставим как есть, но без падения
+        pass
+    # =======================================================================
+
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(analysis)
+
+    print(f"[OK] ANALYSIS: {fname}")
+
+if __name__ == "__main__":
+    main()
