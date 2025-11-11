@@ -16,3 +16,9 @@ backups/
 local_backups/
 analysis_*.md
 signal_*.html
+.venv/
+.codexrc
+.marker_*
+.run_marker
+backup_beginning_full_*/ 
+backup_final_clean_*/
