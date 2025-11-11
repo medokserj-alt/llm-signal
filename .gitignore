@@ -1,5 +1,4 @@
 __pycache__/
-.venv/
 logs/
 reports/
 *.tmp
@@ -12,7 +11,8 @@ snapshot.txt
 .env*
 dev/
 prompts/
+auto_feedback/
+backups/
+local_backups/
 analysis_*.md
 signal_*.html
-backup_*/
-backup_*.tgz
