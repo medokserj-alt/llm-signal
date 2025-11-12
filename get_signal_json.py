@@ -435,6 +435,13 @@ try:
                 get_ema20_m15(_sym) if _sym else None)
     except Exception:
         pass
+    try:
+        if 'ema20_m15' not in data or not data['ema20_m15']:
+            _sym = payload.get('hints', {}).get('symbol') or data.get('symbol')
+            data['ema20_m15'] = payload.get('hints', {}).get('ema20_m15') or (
+                get_ema20_m15(_sym) if _sym else None)
+    except Exception:
+        pass
 
 except Exception:
     print(content)
