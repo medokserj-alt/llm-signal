@@ -7,6 +7,29 @@ from openai import OpenAI
 import ccxt
 import subprocess
 
+# ---- EMA20(M15) helpers ----
+def _ema(vals, period=20):
+    if not vals or len(vals) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    ema = float(vals[-period])
+    for v in vals[-period+1:]:
+        ema = float(v)*k + ema*(1.0 - k)
+    return round(ema, 6)
+
+def get_ema20_m15(symbol: str):
+    for ex in (ccxt.bybit(), ccxt.binance()):
+        try:
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe='15m', limit=25)
+            closes = [c[4] for c in ohlcv]
+            e = _ema(closes, 20)
+            if e:
+                return float(e)
+        except Exception:
+            pass
+    return None
+
+
 def ensure_defaults(d: dict) -> dict:
     """Нормализация полей side и entry_mode перед выводом JSON."""
     em = (d.get("entry_mode") or "").strip().lower()
@@ -344,6 +367,11 @@ if args.symbol:
 # time hint
 payload["hints"]["time_msk"] = current_msk()
 
+    # EMA20(M15) для выбранного символа (если есть)
+    _sym = payload['hints'].get('symbol')
+    payload['hints']['ema20_m15'] = get_ema20_m15(_sym) if _sym else None
+
+
 # базовый user_prompt
 base_user_prompt = (
     "Сгенерируй один JSON по заданной схеме. "
@@ -399,6 +427,15 @@ content = resp.choices[0].message.content
 # Разбор JSON
 try:
     _data = json.loads(content)
+    # lift ema20_m15 из hints (или досчитать при необходимости)
+    try:
+        if 'ema20_m15' not in data or not data['ema20_m15']:
+            _sym = payload.get('hints', {}).get('symbol') or data.get('symbol')
+            data['ema20_m15'] = payload.get('hints', {}).get('ema20_m15') or (
+                get_ema20_m15(_sym) if _sym else None)
+    except Exception:
+        pass
+
 except Exception:
     print(content)
     sys.exit(0)
