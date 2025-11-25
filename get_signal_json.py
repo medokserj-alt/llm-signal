@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import ccxt
 import subprocess
+from pathlib import Path
 
 # ---- EMA20(M15) helpers ----
 def _ema(vals, period=20):
@@ -14,7 +15,7 @@ def _ema(vals, period=20):
     k = 2.0 / (period + 1.0)
     ema = float(vals[-period])
     for v in vals[-period+1:]:
-        ema = float(v)*k + ema*(1.0 - k)
+        ema = float(v) * k + ema * (1.0 - k)
     return round(ema, 6)
 
 def get_ema20_m15(symbol: str):
@@ -25,11 +26,11 @@ def get_ema20_m15(symbol: str):
             e = _ema(closes, 20)
             if e:
                 return float(e)
-    except Exception:
+        except Exception:
             pass
     return None
 
-
+# ---------- utils ----------
 def ensure_defaults(d: dict) -> dict:
     """Нормализация полей side и entry_mode перед выводом JSON."""
     em = (d.get("entry_mode") or "").strip().lower()
@@ -40,9 +41,6 @@ def ensure_defaults(d: dict) -> dict:
         d["entry_mode"] = "market"
     return d
 
-
-
-
 # --- LESSONS loader (runtime, robust) ---
 import pathlib as _pl
 
@@ -52,7 +50,6 @@ def _normalize_side(d: dict) -> None:
     if raw in m:
         d["side"] = m[raw]
         return
-    # Хрупкий резерв: попробуем вытащить из пояснений
     tr = (d.get("technical_rationale") or "").lower()
     if " short" in tr and " long" not in tr:
         d["side"] = "short"
@@ -61,26 +58,21 @@ def _normalize_side(d: dict) -> None:
 
 def _normalize_entry_mode(d: dict) -> None:
     em = (d.get("entry_mode") or "").strip().lower()
-    # Нормализуем синонимы
     if em in {"market","now","mkt"}:
-        # Если высокий риск перегрева/HTF-слабость — мягкий откат в limit
         flags = [f.lower() for f in (d.get("risk_flags") or [])]
         overbought_hint = any(k in (d.get("technical_rationale","").lower()) for k in ["перекуп", "overbought"])
         weak_htf = any("weak_htf_rsi" in f or "htf" in f for f in flags)
         high_conf = (d.get("confidence") == "High")
         if high_conf and not (overbought_hint or weak_htf):
-            # Разрешаем рыночный, оставим "now"
             d["entry_mode"] = "now"
             d.setdefault("warnings", []).append("market_entry_high_conf")
         else:
-            # Уходим в limit как более безопасный
             d["entry_mode"] = "limit"
             d.setdefault("warnings", []).append("market_downgraded_to_limit")
     elif em in {"wait_confirm","wait-confirm","confirm","wc"}:
         d["entry_mode"] = "wait_confirm"
     elif em in {"limit","lim","lmt"}:
         d["entry_mode"] = "limit"
-    # иначе оставляем как есть
 
 def _resolve_lessons_path():
     _env_path = os.getenv("LLM_LESSONS_FILE")
@@ -93,10 +85,7 @@ def _resolve_lessons_path():
 
 def load_lessons_old():
     """
-    Возвращает (text, count, path_str):
-    - text: готовый блок для промпта (включая заголовок "# [LESSONS]" и перевод строки), либо "".
-    - count: число НЕпустых строк, не начинающихся с '#'.
-    - path_str: строка с абсолютным путём (если известен), иначе "".
+    Возвращает (text, count, path_str)
     """
     q = _resolve_lessons_path()
     if not q:
@@ -112,10 +101,8 @@ def load_lessons_old():
     if not body:
         return ("", 0, str(q))
     text = "\n# [LESSONS]\n" + body + "\n"
-    # --- Fallback: если в собранном LESSONS нет маркера AUTO, добавим Auto_Lessons.md ---
     try:
         if "AUTO_LESSONS" not in raw:
-            from pathlib import Path as _P
             _ap = (_pl.Path(__file__).resolve().parent / "auto_feedback/lessons/Auto_Lessons.md").resolve()
             if _ap.exists():
                 _auto = _ap.read_text(encoding="utf-8").strip()
@@ -126,14 +113,11 @@ def load_lessons_old():
                     return (text, len(lines), str(q))
     except Exception:
         pass
-        return (text, len(lines), str(q))
-# ------------------------------------------
-# ---------------- Helpers ----------------
+    return (text, len(lines), str(q))
 
+# ---------------- Helpers ----------------
 def snapshot_from_status() -> str:
-    """
-    Возвращаем текст от ./status (или ./status --for-llm), без падений при ошибке.
-    """
+    """Возвращаем текст от ./status (или ./status --for-llm), без падений при ошибке."""
     try:
         cmd = 'cd ~/llm-signal && ./status --for-llm 2>/dev/null || ./status 2>/dev/null'
         res = subprocess.run(["bash","-lc",cmd], capture_output=True, text=True, timeout=30)
@@ -149,7 +133,6 @@ def current_msk() -> str:
     return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y, %H:%M")
 
 # ---- тикеры с last и 24h % (на всякий) ----
-
 def _fetch_ticker(ex, sym):
     t = ex.fetch_ticker(sym)
     last = t.get("last")
@@ -167,7 +150,7 @@ def get_pair_ticker(sym: str):
             last, change = _fetch_ticker(ex, sym)
             if last is not None:
                 return {"last": last, "change": change}
-    except Exception:
+        except Exception:
             pass
     return {"last": None, "change": None}
 
@@ -180,14 +163,11 @@ def get_pool_snapshot() -> dict:
     return out
 
 # ----- NEWS helpers -----
-
 def get_news_block(hours: int = 12) -> str:
-    """
-    Возвращает текстовый блок NEWS из news_snapshot.py (без падений при ошибке).
-    """
+    """Возвращает текстовый блок NEWS из локального news_snapshot.py (без падений при ошибке)."""
     try:
         news_txt = subprocess.run(
-            ["bash","-lc",f"cd ~/llm-signal && ./news_snapshot.py {hours}"],
+            ["bash","-lc",f"./news_snapshot.py {hours}"],
             capture_output=True, text=True, timeout=30
         ).stdout.strip()
     except Exception:
@@ -201,27 +181,19 @@ def get_news_block(hours: int = 12) -> str:
     )
 
 def build_news_focus(symbol: str, news_block: str) -> str:
-    """
-    Из общего NEWS блока вытаскиваем максимум 3 релевантных строки:
-    - с упоминанием тикера (SOL, AAVE, LINK и т.д.) или названия проекта,
-    - либо обще-рыночные (ETF, SEC, macro, liquidation).
-    Возвращаем как маркированный список (или пустую строку).
-    """
+    """Фильтрация до 3 строк по тикеру/макро-триггерам."""
     symbol_root = symbol.split("/")[0].upper() if symbol else ""
     lines = [ln.strip("- ").strip() for ln in news_block.splitlines() if ln.strip().startswith("- ")]
-    key = symbol_root
     picked = []
     for ln in lines:
         u = ln.upper()
-        if (key and key in u) or any(k in u for k in ("ETF","SEC","FED","MACRO","INFLATION","LIQUIDATION","LIQUIDATIONS")):
+        if (symbol_root and symbol_root in u) or any(k in u for k in ("ETF","SEC","FED","MACRO","INFLATION","LIQUIDATION","LIQUIDATIONS")):
             picked.append(ln)
         if len(picked) >= 3:
             break
     return "\n".join(picked)
 
 # ---------------- Bootstrap ----------------
-
-from pathlib import Path
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE/".env")
 api_key = os.getenv("OPENAI_API_KEY")
@@ -238,12 +210,9 @@ ap.add_argument("--multi", action="store_true", help="Мульти-анализ 
 args = ap.parse_args()
 
 # ================= MULTI MODE =================
-# ================= MULTI MODE =================
 if args.multi:
-    # --- MULTI MODE: свободный анализ Ани + JSON в конце ---
-    system_prompt = read_file("prompt_analysis.txt")  # Аня v7.x (мульти-пул)
+    system_prompt = read_file("prompt_analysis.txt")
 
-    # Снимок из ./status — источник истины
     snapshot = snapshot_from_status()
     if not snapshot:
         btc  = get_pair_ticker("BTC/USDT")
@@ -261,7 +230,6 @@ if args.multi:
             ctx.append(f"{k}: last={v['last']}, change_24h={v['change']}%")
         snapshot = "\n".join(ctx)
 
-    # Добавим строку с 24h% BTC/ETH — модель ОБЯЗАНА её использовать в market_context
     btc_info = get_pair_ticker("BTC/USDT")
     eth_info = get_pair_ticker("ETH/USDT")
     btc_eth_line = (
@@ -270,7 +238,6 @@ if args.multi:
         f"(используй РОВНО эти проценты в поле market_context)\n"
     )
 
-    # Логируем снапшот в stdout (как и раньше)
     try:
         with open("snapshot.txt", "w", encoding="utf-8") as f:
             f.write(snapshot + "\n")
@@ -278,13 +245,9 @@ if args.multi:
         pass
     print("\n=== [SNAPSHOT ДЛЯ LLM] ===\n" + snapshot + "\n==========================\n")
 
-    # NEWS-блок
     news_block = get_news_block(12)
-
-    # LESSONS отключены по новой политике (ничего не печатаем)
     lessons_text, lessons_count, lessons_path = ("", 0, "")
 
-    # Итоговый user prompt для MULTI
     user_prompt = (
         ((lessons_text + "\n") if lessons_text else "")
         + snapshot + btc_eth_line + "\n"
@@ -295,7 +258,6 @@ if args.multi:
         + news_block
     )
 
-    # Стиль/форматы
     user_prompt += (
         "\n\n=== OUTPUT STYLE REQUIREMENTS ===\n"
         "- symbol: строго в формате TICKER/USDT из пула (например, LINK/USDT; НЕ LINKUSDT).\n"
@@ -303,38 +265,27 @@ if args.multi:
         "- news_context: выдай 1–3 пункта из [NEWS]/NEWS_FOCUS. Каждый пункт в формате: "
         "\"- [impact:+/−/neutral] краткий заголовок — зачем это важно для выбранного актива (≤15 слов)\". "
         "Используй только факты из [NEWS], не придумывай уровни/цифры.\n"
-        "- market_context: используй блок [BTC_ETH_24H] с процента́ми КАК ЕСТЬ. Строка вида: "
-        "\"BTC change_24h=<..>%, ETH change_24h=<..>% — risk-on/neutral/risk-off\" + 1 короткое заключение, "
-        "как это влияет на выбранный актив.\n"
-        "- Если по выбранному активу нет прямых новостей, бери макро/секторные из [NEWS], но поясни релевантность.\n"
-        "- Избегай общих фраз; делай вывод конкретным: что именно меняет новость/контекст в сетапе.\n"
+        "- market_context: используй блок [BTC_ETH_24H] с процента́ми КАК ЕСТЬ.\n"
     )
 
-    # NEWS_FOCUS (без фильтра по тикеру)
     focus = build_news_focus("", news_block)
     if focus:
         user_prompt += "\nNEWS_FOCUS (top-3):\n" + focus + "\n"
 
-    # Вызов LLM (MULTI)
     resp = client.chat.completions.create(
-        model=args.model,
+        model="gpt-5.1",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
-        temperature=0.85,
-        top_p=0.95,
-        presence_penalty=0.4,
-        frequency_penalty=0.2,
-        seed=7,
+        temperature=0.85, top_p=0.95, seed=7,
     )
     print(resp.choices[0].message.content)
     sys.exit(0)
 
 # ================= SINGLE MODE =================
-# --- SINGLE MODE: строгий JSON по одному активу ---
-system_prompt = read_file("prompt_system.txt")  # строгий JSON-контракт
-anna_prompt   = read_file("prompt_anna.txt")    # мозг Ани (single)
+system_prompt = read_file("prompt_system.txt")
+anna_prompt   = read_file("prompt_anna.txt")
 
 payload = {}
 if os.path.exists(args.params):
@@ -345,7 +296,6 @@ if os.path.exists(args.params):
             print("ERROR: params.json is not valid JSON", file=sys.stderr)
             sys.exit(1)
 
-# enforce hints
 payload.setdefault("hints", {})
 if args.symbol:
     payload["hints"]["symbol"] = args.symbol
@@ -361,16 +311,15 @@ if args.symbol:
             _prec = 4 if _val < 1 else (3 if _val < 10 else 2)
             payload["hints"]["price"] = round(_val, _prec)
             payload["hints"]["price_source"] = "live"
-    except Exception:
+        except Exception:
             pass
 
 # time hint
 payload["hints"]["time_msk"] = current_msk()
 
-    # EMA20(M15) для выбранного символа (если есть)
-    _sym = payload['hints'].get('symbol')
-    payload['hints']['ema20_m15'] = get_ema20_m15(_sym) if _sym else None
-
+# EMA20(M15) для выбранного символа (если есть)
+_sym = payload["hints"].get("symbol")
+payload["hints"]["ema20_m15"] = get_ema20_m15(_sym) if _sym else None
 
 # базовый user_prompt
 base_user_prompt = (
@@ -412,7 +361,7 @@ if focus:
 
 # === LLM вызов (SINGLE) ===
 resp = client.chat.completions.create(
-    model=args.model,
+    model="gpt-5.1",
     response_format={"type": "json_object"},
     messages=[
         {"role": "system", "content": system_prompt},
@@ -426,37 +375,30 @@ content = resp.choices[0].message.content
 
 # Разбор JSON
 try:
-    _data = json.loads(content)
+    data = json.loads(content)
+
     # lift ema20_m15 из hints (или досчитать при необходимости)
     try:
-    if 'ema20_m15' not in data or not data['ema20_m15']:
-            _sym = payload.get('hints', {}).get('symbol') or data.get('symbol')
-    data['ema20_m15'] = payload.get('hints', {}).get('ema20_m15') or (
-    get_ema20_m15(_sym) if _sym else None)
-    except Exception:
-        pass
-    try:
-    if 'ema20_m15' not in data or not data['ema20_m15']:
-            _sym = payload.get('hints', {}).get('symbol') or data.get('symbol')
-    data['ema20_m15'] = payload.get('hints', {}).get('ema20_m15') or (
-    get_ema20_m15(_sym) if _sym else None)
+        if 'ema20_m15' not in data or not data['ema20_m15']:
+            sym_for_ema = payload.get('hints', {}).get('symbol') or data.get('symbol')
+            data['ema20_m15'] = payload.get('hints', {}).get('ema20_m15') or (get_ema20_m15(sym_for_ema) if sym_for_ema else None)
     except Exception:
         pass
 
-    except Exception:
+except Exception:
     print(content)
     sys.exit(0)
 
 # Переписываем ключи из hints (гарантии)
 _h = payload.get("hints", {})
 if _h.get("symbol"):
-    _data["symbol"] = _h["symbol"]
+    data["symbol"] = _h["symbol"]
 if _h.get("time_msk"):
-    _data["time_msk"] = _h["time_msk"]
+    data["time_msk"] = _h["time_msk"]
 if "price" in _h and _h["price"] is not None:
-    _data["price"] = _h["price"]
+    data["price"] = _h["price"]
 
-# Нормализация side/entry_mode
+# Нормализация SINGLE
 def _normalize_side_local(d: dict) -> None:
     raw = (d.get("side") or d.get("direction") or "").strip().lower()
     m = {"buy": "long", "sell": "short", "long": "long", "short": "short", "l":"long", "s":"short"}
@@ -490,8 +432,8 @@ def _normalize_entry_mode_local(d: dict) -> None:
     else:
         d.setdefault("entry_mode", "limit")
 
-_normalize_side_local(_data)
-_normalize_entry_mode_local(_data)
+_normalize_side_local(data)
+_normalize_entry_mode_local(data)
 
-print(json.dumps(_data, ensure_ascii=False))
+print(json.dumps(data, ensure_ascii=False))
 sys.exit(0)

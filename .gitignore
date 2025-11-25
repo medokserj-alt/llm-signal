@@ -22,3 +22,8 @@ signal_*.html
 .run_marker
 backup_beginning_full_*/ 
 backup_final_clean_*/
+# --- AI Agent ---
+ai-agent/.venv/
+ai-agent/logs/
+ai-agent/__pycache__/
+ai-agent/app/**/__pycache__/

@@ -85,3 +85,20 @@ __PREV_MID__
 
 ### DAY — ENTRY SANITY
 — Если день волатильный (длинные свечи M5/M15, масштабные «прокаты»), входы только от EMA20(M15) с wait_confirm; entry_range не уже, чем MAX(0.35%, 0.25×ATR-аппрокс). Запрещено «догонять» импульс.
+
+### MACRO CONTEXT PRIORITY (DAY)
+- При разборе [NEWS] выделяй отдельно макро-темы:
+  * shutdown / government shutdown
+  * CPI, inflation, PCE, NFP, unemployment
+  * FOMC, Fed, rates, Treasury, UST yields, bond market
+  * stimulus, checks, credit, liquidity, repo/RRP
+- Если в [NEWS] есть такие пункты, трактуй их как MACRO-драйвер и используй ИХ
+  как основу для блока «1️⃣ Макрофон и ликвидность».
+- Даже если крипто-новости слабые или разрозненные, но MACRO-фон явный
+  (например, завершение shutdown, важный CPI/Fed-сигнал):
+  * задавай market_context исходя из MACRO;
+  * явно пиши, как это влияет на appetite to risk (risk-on / pre-off / risk-off)
+    и на альты.
+- Новость уровня «аналитика/мнение» (may/could/targets без фактов) = trust:low
+  → можно упомянуть, но НЕ использовать как основной драйвер сетапа.
+

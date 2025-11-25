@@ -59,7 +59,6 @@ def build_trade_report(signal_id: str) -> Dict[str, Any]:
     reason = result.get("reason")
     hit_level = result.get("hit_level")
 
-    # Простые текстовые шаблоны
     if outcome == "NO_DATA":
         summary = (
             f"Сигнал {signal_id} по {symbol} ({direction}).\n"
@@ -92,3 +91,56 @@ def build_trade_report(signal_id: str) -> Dict[str, Any]:
     base["status"] = "ok"
     base["summary"] = summary
     return base
+
+
+def build_daily_summary(window_hours: int = 24) -> Dict[str, Any]:
+    """
+    Сводка по сделкам за последние window_hours часов.
+    Сейчас работает даже с NO_DATA — считает только по исходам.
+    """
+    now = time.time()
+    since = now - window_hours * 3600
+
+    journal = _load_journal()
+    results: List[Dict[str, Any]] = []
+
+    for rec in journal:
+        if rec.get("kind") != "trade_result":
+            continue
+        ts = rec.get("ts")
+        if ts is None or ts < since:
+            continue
+        results.append(rec.get("event", {}))
+
+    total = len(results)
+    by_outcome: Dict[str, int] = {}
+    symbols: Dict[str, int] = {}
+
+    for r in results:
+        outcome = r.get("outcome") or "UNKNOWN"
+        by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+        symbol = r.get("symbol") or "UNKNOWN"
+        symbols[symbol] = symbols.get(symbol, 0) + 1
+
+    summary_lines = []
+    summary_lines.append(f"Сводка по сделкам за последние {window_hours}ч:")
+    summary_lines.append(f"Всего оценённых сигналов: {total}.")
+
+    if total == 0:
+        summary_lines.append("За этот период нет ни одной оценённой сделки.")
+    else:
+        out_parts = [f"{k}: {v}" for k, v in by_outcome.items()]
+        summary_lines.append("Исходы по сделкам: " + ", ".join(out_parts))
+        sym_parts = [f"{k}: {v}" for k, v in symbols.items()]
+        summary_lines.append("Активы (по количеству сделок): " + ", ".join(sym_parts))
+
+    summary_text = "\n".join(summary_lines)
+
+    return {
+        "ok": True,
+        "window_hours": window_hours,
+        "total_trades": total,
+        "by_outcome": by_outcome,
+        "by_symbol": symbols,
+        "summary": summary_text,
+    }
