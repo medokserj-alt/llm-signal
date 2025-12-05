@@ -1,0 +1,30 @@
+{
+  "users": {
+    "6308066297": {
+      "name": "Enzo",
+      "role": "owner",
+      "channels": {
+        "main_chat_id": -1003318512813
+      },
+      "limits": {
+        "min_interval_sec": 60
+      }
+    },
+
+    "672885732": {
+      "name": "Dima",
+      "role": "trader",
+      "channels": {
+        "main_chat_id": -1003036407084
+      },
+      "limits": {
+        "min_interval_sec": 60
+      }
+    }
+  },
+
+  "settings": {
+    "lock_timeout_sec": 120,
+    "no_signal_replies_enabled": true
+  }
+}

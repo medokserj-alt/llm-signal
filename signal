@@ -7,7 +7,7 @@ mkdir -p logs
 MODEL="gpt-4.1"
 PARAMS="params.json"
 
-# Разбор: "./signal full" | "./signal LINK"
+# Разбор аргументов: "./signal full" | "./signal LINK"
 args=()
 if [[ $# -gt 0 ]]; then
   if [[ "$1" == "full" ]]; then
@@ -25,28 +25,25 @@ run_log="logs/signal_${ts}.log"
 
 # 1) Генерация + запись логов (сырой поток)
 # --- Step8: refresh LESSONS and export path ---
-
 ./lessons_block.py >/dev/null 2>&1 || true
-
 export LLM_LESSONS_FILE="$PWD/auto_feedback/lessons/LESSONS_FOR_LLM.md"
 
 python3 get_signal_json.py --model "$MODEL" --params "$PARAMS" "${args[@]}" \
-| tee "$run_log" \
-| tee -a logs/last_signal.log \
-> logs/stream.tmp
+  | tee "$run_log" \
+  | tee -a logs/last_signal.log \
+  > logs/stream.tmp
 
 # 2) Извлечь ПОСЛЕДНИЙ валидный JSON из лога (баланс скобок, игнорируя строки и экранирования)
-python3 - <<'PY'
+python3 - << 'PY'
 import json, re, pathlib, sys
 
 def sanitize(s: str) -> str:
     # убрать код-фенсы и BOM/CR
-    s = s.replace("\ufeff","")
-    s = s.replace("\r","")
-    s = re.sub(r'^\s*```json\s*', '', s, flags=re.IGNORECASE|re.MULTILINE)
+    s = s.replace("\ufeff", "")
+    s = s.replace("\r", "")
+    s = re.sub(r'^\s*```json\s*', '', s, flags=re.IGNORECASE | re.MULTILINE)
     s = re.sub(r'\s*```\s*$', '', s)
     # вылечить висячие запятые перед } ]
-    # повторим несколько проходов, но мягко
     for _ in range(5):
         s2 = re.sub(r',\s*([}\]])', r'\1', s)
         if s2 == s:
@@ -85,7 +82,7 @@ def find_json_candidates(text: str):
                         if depth == 0:
                             # кандидат найден
                             candidates.append(text[i:j+1])
-                            i = j  # ускоряем
+                            i = j
                             break
                 j += 1
         i += 1
@@ -120,7 +117,7 @@ for chunk in reversed(cands):  # берём последний валидный
             ok = (data, s2)
             break
         except Exception as e2:
-            errors.append((e, s[:120] + ('...' if len(s)>120 else '')))
+            errors.append((e, s[:120] + ('...' if len(s) > 120 else '')))
 
 if ok is None:
     pathlib.Path("logs/last.raw.json").write_text(raw, encoding="utf-8")
@@ -136,7 +133,14 @@ PY
 
 # --- генерируем артефакты для бота (MD + HTML) ---
 last_json="logs/last.json"
+
+# Анализ (MD) поверх логов
 python3 save_analysis_text.py < "$run_log" | tee -a "$run_log" || true
+
+# Прогоняем JSON через v2-постобработку (EMA/H1 + DAY/MID + ADX + три входа)
+python3 postprocess_full_last.py >> "$run_log" 2>&1 || echo "[WARN] postprocess_full_last failed" >> "$run_log"
+
+# HTML-сигнал из v2 JSON
 python3 render_strict.py < "$last_json" | tee -a "$run_log" || true
 
 echo "----------------------------------------"

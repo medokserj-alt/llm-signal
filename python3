@@ -1,0 +1,3 @@
+usage: postprocess_full_last.py [-h] [--model MODEL] [--params PARAMS]
+                                [--symbol SYMBOL] [--multi]
+postprocess_full_last.py: error: unrecognized arguments: save_analysis_text.py

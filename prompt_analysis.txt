@@ -10,22 +10,71 @@
 
 ### ФОРМАТ ВЫХОДА (FULL mode)
 1) 4–6 абзацев: обзор пула (EMA/RSI/объём), контекст BTC/ETH, почему выбран актив, риски/альтернатива.
-2) В КОНЦЕ — **чистый JSON** строго со схемой:
+2) В КОНЦЕ — **чистый JSON** строго по схеме:
 {
   "time_msk": string,
   "symbol": string,
   "price": number,
   "direction": "long" | "short",
-  "entry_range": { "min": number, "max": number },
-  "sl": number, "tp1": number, "tp2": number, "rr": number,
-  "take_profit_rules": string, "break_even_rule": string,
-  "multi_tf_view": { "m5": string, "m15": string, "h1": string, "h4": string, "d1": string },
-  "why_asset": string, "news_context": string[], "market_context": string,
-  "validity_minutes": 90, "cancel_condition": string,
-  "technical_rationale": string, "disclaimer": string,
+
+  "entry_range": { "min": number, "max": number },   // нейтральный вход
+  "sl": number,
+  "tp1": number,
+  "tp2": number,
+  "rr": number,
+  "take_profit_rules": string,
+  "break_even_rule": string,
+
+  "multi_tf_view": {
+    "m5": string,
+    "m15": string,
+    "h1": string,
+    "h4": string,
+    "d1": string
+  },
+
+  "why_asset": string,
+  "news_context": string[],
+  "market_context": string,
+
+  "validity_minutes": 90,
+  "cancel_condition": string,
+  "technical_rationale": string,
+  "disclaimer": string,
+
   "entry_mode": "now" | "limit" | "wait_confirm",
   "confidence": "High" | "Medium" | "Low",
-  "confirmation_rules": string, "alt_entry_range": {"min": number, "max": number}
+  "confirmation_rules": string,
+  "alt_entry_range": { "min": number, "max": number },
+
+  "entries": {
+    "aggressive": {
+      "enabled": true | false,
+      "range": { "min": number, "max": number },
+      "entry_mode": "market" | "limit" | "market_or_limit" | "wait_confirm",
+      "position_size_hint": string,
+      "comment": string
+    },
+    "neutral": {
+      "enabled": true | false,
+      "range": { "min": number, "max": number },
+      "entry_mode": "limit" | "wait_confirm",
+      "position_size_hint": "1.0x",
+      "comment": "Основной рабочий вход"
+    },
+    "conservative": {
+      "enabled": true | false,
+      "range": { "min": number, "max": number },
+      "entry_mode": "limit",
+      "position_size_hint": "0.75x",
+      "comment": "Глубокий откат, безопаснее"
+    }
+  },
+
+  "no_trade": true | false,
+  "no_trade_reasons": string[],
+  "no_trade_hint": string,
+  "max_valid_minutes": 90
 }
 
 ### LEVEL RULES (HARD)
