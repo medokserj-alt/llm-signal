@@ -8,6 +8,37 @@ from get_signal_json import get_ema20_m15, get_ema20_h1
 
 BASE = Path(__file__).resolve().parent
 
+def _drop_time_window_mentions(data: dict) -> dict:
+    def has_tw(s: str) -> bool:
+        return "time_window" in s
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k in list(x.keys()):
+                v = x[k]
+                if k == "no_trade_reasons" and isinstance(v, list):
+                    x[k] = [it for it in v if not (isinstance(it, str) and has_tw(it))]
+                    continue
+                if k == "warnings" and isinstance(v, list):
+                    x[k] = [it for it in v if not (isinstance(it, str) and has_tw(it))]
+                    continue
+                if k in ("no_trade_hint", "comments") and isinstance(v, str) and has_tw(v):
+                    x[k] = ""
+                    continue
+                if k == "comment" and isinstance(v, str) and has_tw(v):
+                    x[k] = ""
+                    continue
+                walk(v)
+        elif isinstance(x, list):
+            for it in x:
+                walk(it)
+
+    try:
+        walk(data)
+    except Exception:
+        pass
+    return data
+
 def read_latest_report_text(root_dir: str, limit_chars: int = 2000):
     """
     Читает последний analysis_*.md из reports/day или reports/mid.
@@ -76,6 +107,7 @@ def main():
 
     # 3) прогоняем общий v2-процессор
     data = pp_process(data, day_context, mid_context)
+    data = _drop_time_window_mentions(data)
 
     # 4) сохраняем обратно
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

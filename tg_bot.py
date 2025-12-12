@@ -168,12 +168,21 @@ def main_menu_kb():
 def signal_menu_kb():
     rows = [
         [KeyboardButton("🤖 Auto (FULL)")],
-        [KeyboardButton("🗓 DAY"), KeyboardButton("📰 MID")],
     ]
     for i in range(0,len(SYMBOLS),3):
         rows.append([KeyboardButton(x) for x in SYMBOLS[i:i+3]])
     rows.append([KeyboardButton("⬅️ Назад")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def analysis_menu_kb():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📈 Current")],
+            [KeyboardButton("🗓 DAY"), KeyboardButton("📰 MID")],
+            [KeyboardButton("⬅️ Назад")],
+        ],
+        resize_keyboard=True
+    )
 
 def mode_menu_kb():
     return ReplyKeyboardMarkup(
@@ -268,6 +277,9 @@ async def handle_back(update,context):
 
 async def handle_signal_menu(update,context):
     await update.message.reply_text("Выбери актив или режим:", reply_markup=signal_menu_kb())
+
+async def handle_analysis_menu(update,context):
+    await update.message.reply_text("Выбери тип анализа:", reply_markup=analysis_menu_kb())
 
 async def handle_mode_menu(update,context):
     uid = update.effective_user.id
@@ -365,7 +377,7 @@ async def handle_full(update,context):
         release_gen_lock()
 
 # ---------- ANALYSIS ----------
-async def handle_analysis(update,context):
+async def handle_current_analysis(update,context):
     uid = update.effective_user.id
     if not is_allowed(uid):
         await update.message.reply_text("Нет доступа.")
@@ -410,6 +422,9 @@ async def handle_analysis(update,context):
         )
     finally:
         release_gen_lock()
+
+async def handle_analysis(update,context):
+    await handle_current_analysis(update,context)
 
 # ---------- SINGLE ----------
 async def handle_symbol(update,context):
@@ -540,7 +555,8 @@ async def handle_mid(update,context):
 
 def register_text_handlers(app:Application):
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Сигнал$"), handle_signal_menu))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Анализ$"), handle_analysis))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Анализ$"), handle_analysis_menu))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Current$"), handle_current_analysis))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⚙️ Режим$"), handle_mode_menu))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟥 Агрессивный$"), handle_mode_aggressive))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟨 Нейтральный$"), handle_mode_neutral))

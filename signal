@@ -133,6 +133,39 @@ if ok is None:
     sys.exit(2)
 
 data, clean = ok
+
+def _drop_time_window_mentions(obj):
+    def has_tw(s: str) -> bool:
+        return "time_window" in s
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k in list(x.keys()):
+                v = x[k]
+                if k == "no_trade_reasons" and isinstance(v, list):
+                    x[k] = [it for it in v if not (isinstance(it, str) and has_tw(it))]
+                    continue
+                if k == "warnings" and isinstance(v, list):
+                    x[k] = [it for it in v if not (isinstance(it, str) and has_tw(it))]
+                    continue
+                if k in ("no_trade_hint", "comments") and isinstance(v, str) and has_tw(v):
+                    x[k] = ""
+                    continue
+                if k == "comment" and isinstance(v, str) and has_tw(v):
+                    x[k] = ""
+                    continue
+                walk(v)
+        elif isinstance(x, list):
+            for it in x:
+                walk(it)
+
+    try:
+        walk(obj)
+    except Exception:
+        pass
+    return obj
+
+data = _drop_time_window_mentions(data)
 pathlib.Path("logs/last.raw.json").write_text(clean, encoding="utf-8")
 pathlib.Path("logs/last.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 print("[OK] extracted + validated JSON -> logs/last.json")
