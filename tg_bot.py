@@ -37,6 +37,7 @@ ALLOWED_UIDS = parse_allowed_ids()
 USER_CHANNELS_PATH = PROJECT_ROOT / "user_channels.json"
 USER_CONFIG = {}
 GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
+VALID_MODES = {"aggressive", "neutral", "conservative"}
 
 def load_user_channels():
     global USER_CONFIG, GLOBAL_SETTINGS
@@ -71,6 +72,44 @@ def get_min_interval(uid:int) -> int:
         if isinstance(v,int):
             return v
     return 0
+
+def get_user_mode(uid:int) -> str:
+    cfg = get_user_cfg(uid)
+    mode = None
+    if cfg:
+        m = cfg.get("mode")
+        if m in VALID_MODES:
+            mode = m
+    return mode or "neutral"
+
+def set_user_mode(uid:int, mode:str):
+    if mode not in VALID_MODES:
+        raise ValueError(f"Unknown mode: {mode}")
+    uid_str = str(uid)
+    data = {}
+    if USER_CHANNELS_PATH.exists():
+        try:
+            data = json.loads(USER_CHANNELS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+
+    users = data.get("users")
+    if not isinstance(users, dict):
+        users = {}
+    user_cfg = users.get(uid_str)
+    if not isinstance(user_cfg, dict):
+        user_cfg = {}
+
+    user_cfg["mode"] = mode
+    users[uid_str] = user_cfg
+    data["users"] = users
+
+    USER_CONFIG[uid_str] = user_cfg
+
+    USER_CHANNELS_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
 def is_allowed(uid:int) -> bool:
     if ALLOWED_UIDS and uid in ALLOWED_UIDS:
@@ -121,6 +160,7 @@ def main_menu_kb():
         [
             [KeyboardButton("📊 Сигнал")],
             [KeyboardButton("📈 Анализ")],
+            [KeyboardButton("⚙️ Режим")],
         ],
         resize_keyboard=True
     )
@@ -134,6 +174,29 @@ def signal_menu_kb():
         rows.append([KeyboardButton(x) for x in SYMBOLS[i:i+3]])
     rows.append([KeyboardButton("⬅️ Назад")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def mode_menu_kb():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🟥 Агрессивный")],
+            [KeyboardButton("🟨 Нейтральный")],
+            [KeyboardButton("🟩 Консервативный")],
+            [KeyboardButton("⬅️ Назад")],
+        ],
+        resize_keyboard=True
+    )
+
+MODE_LABELS = {
+    "aggressive": "Агрессивный",
+    "neutral": "Нейтральный",
+    "conservative": "Консервативный",
+}
+
+MODE_DESCRIPTIONS = {
+    "aggressive": "🟥 Агрессивный — максимум сигналов, мягкие фильтры риска.",
+    "neutral": "🟨 Нейтральный — баланс сигнальных фильтров и частоты входов.",
+    "conservative": "🟩 Консервативный — меньше сигналов, строгие фильтры.",
+}
 
 # ============== RATE / LOCK =================
 
@@ -188,7 +251,7 @@ async def whoami(update:Update, context:ContextTypes.DEFAULT_TYPE):
     cfg = get_user_cfg(uid)
     ch  = get_main_chat_id(uid)
     await update.message.reply_text(
-        f"whoami\nuid: {uid}\nallowed(env): {ALLOWED_UIDS}\nin JSON: {bool(cfg)}\nchannel: {ch}"
+        f"whoami\nuid: {uid}\nallowed(env): {ALLOWED_UIDS}\nin JSON: {bool(cfg)}\nchannel: {ch}\nmode: {get_user_mode(uid)}"
     )
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -205,6 +268,48 @@ async def handle_back(update,context):
 
 async def handle_signal_menu(update,context):
     await update.message.reply_text("Выбери актив или режим:", reply_markup=signal_menu_kb())
+
+async def handle_mode_menu(update,context):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        await update.message.reply_text("Нет доступа.")
+        return
+    mode = get_user_mode(uid)
+    current_line = MODE_DESCRIPTIONS.get(mode, MODE_DESCRIPTIONS["neutral"]).split(" — ")[0]
+    desc = "\n".join((
+        MODE_DESCRIPTIONS["aggressive"],
+        MODE_DESCRIPTIONS["neutral"],
+        MODE_DESCRIPTIONS["conservative"],
+    ))
+    await update.message.reply_text(
+        f"Текущий режим: {current_line}\n\nРежимы:\n{desc}",
+        reply_markup=mode_menu_kb()
+    )
+
+async def _handle_mode_choice(update, context, mode_key:str):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        await update.message.reply_text("Нет доступа.")
+        return
+    set_user_mode(uid, mode_key)
+    desc = MODE_DESCRIPTIONS.get(mode_key, MODE_DESCRIPTIONS["neutral"])
+    if " — " in desc:
+        _, tail = desc.split(" — ", 1)
+    else:
+        tail = desc
+    await update.message.reply_text(
+        f"Режим установлен: {MODE_LABELS.get(mode_key,'Нейтральный')} — {tail}",
+        reply_markup=mode_menu_kb()
+    )
+
+async def handle_mode_aggressive(update,context):
+    await _handle_mode_choice(update, context, "aggressive")
+
+async def handle_mode_neutral(update,context):
+    await _handle_mode_choice(update, context, "neutral")
+
+async def handle_mode_conservative(update,context):
+    await _handle_mode_choice(update, context, "conservative")
 
 # ---------- FULL ----------
 async def handle_full(update,context):
@@ -436,6 +541,10 @@ async def handle_mid(update,context):
 def register_text_handlers(app:Application):
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Сигнал$"), handle_signal_menu))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Анализ$"), handle_analysis))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⚙️ Режим$"), handle_mode_menu))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟥 Агрессивный$"), handle_mode_aggressive))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟨 Нейтральный$"), handle_mode_neutral))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟩 Консервативный$"), handle_mode_conservative))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🤖 Auto \\(FULL\\)$"), handle_full))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🗓 DAY$"), handle_day))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📰 MID$"), handle_mid))

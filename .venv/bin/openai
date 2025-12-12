@@ -1,4 +1,4 @@
-#!/root/llm-signal/.venv/bin/python
+#!/root/llm-signal-next/.venv/bin/python3.12
 import sys
 from openai.cli import main
 if __name__ == '__main__':

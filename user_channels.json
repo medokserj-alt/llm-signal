@@ -1,28 +1,26 @@
 {
   "users": {
     "6308066297": {
-      "name": "Enzo",
-      "role": "owner",
+      "name": "Enzo Bellanti",
       "channels": {
-        "main_chat_id": -1003318512813
+        "main_chat_id": -1003492385200
       },
       "limits": {
         "min_interval_sec": 60
-      }
+      },
+      "mode": "neutral"
     },
-
     "672885732": {
-      "name": "Dima",
-      "role": "trader",
+      "name": "Dima X10",
       "channels": {
-        "main_chat_id": -1003036407084
+        "main_chat_id": -1003493070625
       },
       "limits": {
         "min_interval_sec": 60
-      }
+      },
+      "mode": "conservative"
     }
   },
-
   "settings": {
     "lock_timeout_sec": 120,
     "no_signal_replies_enabled": true

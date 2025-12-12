@@ -27,3 +27,15 @@ ai-agent/.venv/
 ai-agent/logs/
 ai-agent/__pycache__/
 ai-agent/app/**/__pycache__/
+
+# --- local runtime ---
+.venv/
+__pycache__/
+logs/
+snapshot.txt
+analysis_*.md
+signal_*.html
+*.tgz
+*.tar.gz
+/tmp/
+codex_tasks/

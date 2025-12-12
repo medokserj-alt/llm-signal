@@ -17,6 +17,7 @@
 # You should have received a copy of the GNU Lesser Public License
 # along with this program.  If not, see [http://www.gnu.org/licenses/].
 """This module contains the classes that represent Telegram InlineQueryResultPhoto."""
+
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
@@ -53,7 +54,7 @@ class InlineQueryResultPhoto(InlineQueryResult):
 
             .. versionadded:: 20.2
 
-            ..versionchanged:: 20.5
+            .. versionchanged:: 20.5
               |thumbnail_url_mandatory|
 
         photo_width (:obj:`int`, optional): Width of the photo.

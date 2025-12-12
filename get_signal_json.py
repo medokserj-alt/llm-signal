@@ -12,6 +12,8 @@ import subprocess
 from pathlib import Path
 import pathlib as _pl
 
+VALID_MODES = {"aggressive", "neutral", "conservative"}
+
 # ---- EMA20 helpers ----
 def _ema(vals, period=20):
     if not vals or len(vals) < period:
@@ -59,6 +61,14 @@ def ensure_defaults(d: dict) -> dict:
         d.setdefault("warnings", []).append("market_entry_high_conf")
         d["entry_mode"] = "market"
     return d
+
+
+def normalize_mode(mode_val) -> str:
+    try:
+        m = (mode_val or "").strip().lower()
+    except Exception:
+        m = ""
+    return m if m in VALID_MODES else "neutral"
 
 
 def _normalize_side(d: dict) -> None:
@@ -247,7 +257,7 @@ def build_news_focus(symbol: str, news_block: str) -> str:
     """Фильтрация до 3 строк по тикеру/макро-триггерам."""
     symbol_root = symbol.split("/")[0].upper() if symbol else ""
     lines = [
-        ln.strip("- ").strip()
+        ln.lstrip("- ").strip()
         for ln in news_block.splitlines()
         if ln.strip().startswith("- ")
     ]
@@ -436,6 +446,46 @@ def _round_price(val):
     return round(v, prec)
 
 
+def apply_direction_guard(d: dict) -> None:
+    """
+    Мягкий guard направления по EMA20(M15/H1): добавляет предупреждения,
+    но не меняет side/direction.
+    """
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return
+
+    emode = (d.get("entry_mode") or "").strip().lower()
+    if emode in ("now", "market"):
+        return
+
+    try:
+        price = float(d.get("price") or 0.0)
+    except Exception:
+        return
+
+    em15 = d.get("ema20_m15")
+    em1h = d.get("ema20_h1")
+
+    # если нет чисел — ничего не делаем
+    if not (
+        price
+        and isinstance(em15, (int, float))
+        and isinstance(em1h, (int, float))
+    ):
+        return
+
+    if price < em15 and price < em1h and side == "long":
+        warnings = d.setdefault("warnings", [])
+        if "dir_guard_forced_short_by_ema" not in warnings:
+            warnings.append("dir_guard_forced_short_by_ema")
+        ema_guard = d.get("ema_guard")
+        if isinstance(ema_guard, dict):
+            note = ema_guard.get("note") or ema_guard.get("comment")
+            if not note:
+                ema_guard["comment"] = "long_against_ema_downtrend"
+
+
 def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool = True) -> dict:
     hints = hints or {}
     d = data or {}
@@ -446,6 +496,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         d["time_msk"] = hints["time_msk"]
     if "price" in hints and hints["price"] is not None:
         d["price"] = hints["price"]
+    d["mode"] = normalize_mode(hints.get("mode"))
 
     d.setdefault("warnings", [])
     if not d.get("time_msk"):
@@ -507,6 +558,8 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
                 "state": "unknown",
             },
         )
+
+    apply_direction_guard(d)
 
     d.setdefault(
         "day_mid_context",
@@ -584,6 +637,18 @@ if args.multi:
     system_prompt = read_file("prompt_analysis.txt")
     time_str = current_msk()
 
+    params_payload = {}
+    multi_hints = {}
+    if os.path.exists(args.params):
+        try:
+            with open(args.params, "r", encoding="utf-8") as f:
+                params_payload = json.load(f)
+                multi_hints = params_payload.get("hints", {}) or {}
+        except Exception:
+            multi_hints = {}
+    mode_raw = multi_hints.get("mode")
+    mode = normalize_mode(mode_raw)
+
     pool_snapshot = get_pool_snapshot()
     snapshot = snapshot_from_status().strip()
     time_line = f"Время (МСК): {time_str}"
@@ -610,6 +675,39 @@ if args.multi:
         f"\n[BTC_ETH_24H]\n"
         f"BTC change_24h={btc_info['change']}%, ETH change_24h={eth_info['change']}% "
         f"(используй РОВНО эти проценты в поле market_context)\n"
+    )
+
+    btc_ch = btc_info.get("change")
+    eth_ch = eth_info.get("change")
+    risk_off = (
+        btc_ch is not None
+        and eth_ch is not None
+        and btc_ch <= -2.5
+        and eth_ch <= -3.0
+    )
+
+    risk_mode_hint = (
+        "\n=== RISK MODE ===\n"
+        "Сейчас строгий RISK-OFF: direction по умолчанию 'short'; "
+        "лонг допускается лишь как редкий контртренд при явном развороте структуры (EMA/RSI/объём); "
+        "если short-сетапа нет — лучше вернуть no_trade=true.\n"
+        if risk_off
+        else "\n=== RISK MODE ===\n"
+        "Режим не risk-off: можно выбирать long/short, но избегай контртренда без подтверждения объёмом.\n"
+    )
+    mode_line = (
+        f"Текущий режим: {mode}."
+        if mode_raw in VALID_MODES
+        else "Текущий режим: режим по умолчанию: neutral."
+    )
+    mode_block = (
+        "=== TRADING MODE ===\n"
+        f"{mode_line}\n"
+        "- aggressive: больше входов, допускается контртренд, RR ≥ 1:1.\n"
+        "- neutral: баланс фильтров и частоты, rare контртренд, RR ≥ 1:1.5.\n"
+        "- conservative: только по тренду, строгие фильтры, RR ≥ 1:2.\n"
+        "Выбор актива и сценария должен уважать режим: aggressive может допускать более рискованные идеи; "
+        "conservative — только по тренду и с жёстким RR.\n"
     )
 
     try:
@@ -640,7 +738,8 @@ if args.multi:
     }
 
     schema_hint = (
-        "\n=== JSON OUTPUT FORMAT (STRICT) ===\n"
+        risk_mode_hint
+        + "\n=== JSON OUTPUT FORMAT (STRICT) ===\n"
         "Верни ОДИН JSON c двумя ключами: overview (list of paragraphs) и signal (объект).\n"
         "overview: 4–6 абзацев обзора по пулу, каждый абзац отдельной строкой массива.\n"
         "signal: объект с полями time_msk, symbol, price, direction, entry_range, sl, tp1, tp2, rr, "
@@ -648,7 +747,10 @@ if args.multi:
         "validity_minutes, cancel_condition, technical_rationale, disclaimer, entry_mode, confidence, "
         "confirmation_rules, alt_entry_range, entries, no_trade, no_trade_reasons, no_trade_hint, "
         "max_valid_minutes, ema20_m15, ema20_h1, ema_guard, day_mid_context, adx_guard.\n"
-        "news_context: используй 1–3 строки из блока NEWS/NEWS_FOCUS в формате \"- [impact:+/−/neutral] ...\".\n"
+        "news_context: выбери 1–3 строки ПРЯМО из блока [NEWS] или NEWS_FOCUS и вставь их БЕЗ ИЗМЕНЕНИЙ, "
+        "сохраняя префикс времени вида \"[YYYY-MM-DD HH:MM МСК]\" и тег [impact:…]. Нельзя удалять/менять "
+        "timestamp/impact или переписывать заголовок. Допускается добавить пояснение только в конце через "
+        "\" — ...\" после исходной строки.\n"
         f"symbol выбирай ТОЛЬКО из списка: {', '.join(pool_symbols)}.\n"
         f"time_msk установи ровно в это значение: {time_msk}.\n"
         "market_context ссылайся на проценты из блока [BTC_ETH_24H] как есть.\n"
@@ -657,7 +759,8 @@ if args.multi:
     focus = build_news_focus("", news_block)
 
     user_prompt = (
-        "Работаешь в режиме MULTI/FULL. Сделай обзор по всему пулу (risk-on/off, лидеры/аутсайдеры), "
+        mode_block
+        + "Работаешь в режиме MULTI/FULL. Сделай обзор по всему пулу (risk-on/off, лидеры/аутсайдеры), "
         "затем выбери один лучший актив для сигнала (вариант A).\n"
         "Сначала опиши пул (overview), затем составь signal по схеме. Не выдумывай уровни вне снапшота.\n"
         + btc_eth_line
@@ -713,7 +816,7 @@ if args.multi:
         print(content)
         sys.exit(1)
 
-    hints = {"time_msk": time_msk}
+    hints = {"time_msk": time_msk, "mode": mode}
     signal = finalize_signal(signal_raw, hints)
     signal["time_msk"] = time_msk
 
@@ -764,9 +867,41 @@ _sym = payload["hints"].get("symbol")
 payload["hints"]["ema20_m15"] = get_ema20_m15(_sym) if _sym else None
 payload["hints"]["ema20_h1"] = get_ema20_h1(_sym) if _sym else None
 
+btc_info = get_pair_ticker("BTC/USDT")
+eth_info = get_pair_ticker("ETH/USDT")
+btc_ch = btc_info.get("change")
+eth_ch = eth_info.get("change")
+risk_off = (
+    btc_ch is not None
+    and eth_ch is not None
+    and btc_ch <= -2.5
+    and eth_ch <= -3.0
+)
+risk_hint = (
+    "СЕЙЧАС строгий RISK-OFF: BTC_change_24h и ETH_change_24h ≤ порогов. "
+    'По умолчанию выбирай direction="short". '
+    "Лонг допустим ТОЛЬКО как редкий контртренд от сильной поддержки при развороте EMA/RSI/объёма; "
+    "если берёшь такой лонг — явно пометь countertrend=true и честно опиши риск. "
+    "Если чистого short-сетапа нет — верни no_trade=true и объясни почему.\n"
+    if risk_off
+    else ""
+)
+mode_raw = payload["hints"].get("mode")
+mode = normalize_mode(mode_raw)
+payload["hints"]["mode"] = mode
+mode_block = (
+    "=== TRADING MODE ===\n"
+    f"Текущий режим: {mode}.\n"
+    "- aggressive: больше входов, допускается контртренд, RR ≥ 1:1.\n"
+    "- neutral: баланс фильтров и частоты, rare контртренд, RR ≥ 1:1.5.\n"
+    "- conservative: только по тренду, строгие фильтры, RR ≥ 1:2.\n"
+)
+
 # базовый user_prompt
 base_user_prompt = (
-    "Сгенерируй один JSON по заданной схеме. "
+    mode_block
+    + risk_hint
+    + "Сгенерируй один JSON по заданной схеме. "
     "Используй hints как обязательные значения; constraints — как жёсткие ограничения. "
     f"Поле time_msk установи РОВНО в это значение: {payload['hints']['time_msk']}. "
     "Поле price, если задано, используй РОВНО как задано. "
@@ -780,17 +915,61 @@ news_block = get_news_block(12)
 # LESSONS отключены
 lessons_text = ""
 
+schema_single = (
+    "\n=== JSON OUTPUT FORMAT (STRICT SINGLE) ===\n"
+    "Верни ОДИН JSON-объект со следующими полями:\n"
+    "- time_msk: строка 'dd.mm.yyyy, HH:MM' по МСК\n"
+    "- symbol: строка вида 'TICKER/USDT'\n"
+    "- price: число (текущая цена, не выдумывать)\n"
+    "- direction: 'long' или 'short'\n"
+    "- entry_range: {\"min\": number, \"max\": number} — диапазон входа по EMA20(M15)\n"
+    "- sl: число (stop-loss)\n"
+    "- tp1: число (первая цель)\n"
+    "- tp2: число (вторая цель)\n"
+    "- rr: число (отношение риск/прибыль по TP2)\n"
+    "- take_profit_rules: строка с логикой фиксации прибыли\n"
+    "- break_even_rule: строка с правилом перевода в безубыток\n"
+    "- multi_tf_view: объект с ключами m5, m15, h1, h4, d1 — каждое значение короткая строка-описание структуры\n"
+    "- why_asset: строка — почему выбран актив\n"
+    "- news_context: массив строк из блока [NEWS]/NEWS_FOCUS (уже с префиксом даты и impact), без изменения текста\n"
+    "- market_context: строка с использованием [BTC_ETH_24H]\n"
+    "- validity_minutes: число (например, 90)\n"
+    "- cancel_condition: строка — при каких условиях сетап отменяется\n"
+    "- technical_rationale: строка — связное обоснование сетапа (можно длинное)\n"
+    "- disclaimer: строка с дисклеймером\n"
+    "- entry_mode: 'limit', 'now' или 'wait_confirm'\n"
+    "- confidence: 'High' | 'Medium' | 'Low'\n"
+    "- confirmation_rules: строка или массив строк с чек-листом подтверждения\n"
+    "- alt_entry_range: {\"min\": number, \"max\": number} — альтернативная зона входа\n"
+    "- entries: объект с тремя профилями входа (aggressive/neutral/conservative), как уже описано в коде\n"
+    "- no_trade: true/false — разрешён ли вход\n"
+    "- no_trade_reasons: список строк причин отказа\n"
+    "- no_trade_hint: строка с кратким пояснением отказа, если no_trade=true\n"
+    "- max_valid_minutes: число (обычно 90)\n"
+    "- ema20_m15: число (если известно)\n"
+    "- ema20_h1: число (если известно)\n"
+    "- ema_guard: объект с EMA-контекстом (как в finalize_signal)\n"
+    "- day_mid_context: объект с полями day_bias, mid_bias, notes\n"
+    "- adx_guard: объект для силы тренда (может быть заглушкой)\n"
+    "Все поля должны быть заполнены; если данных нет — используй осмысленное значение (например, пустой массив/строку), но ключ обязательно присутствует.\n"
+)
+
 # финальный user_prompt для SINGLE
-user_prompt = ((lessons_text + "\n") if lessons_text else "") + base_user_prompt + news_block
+user_prompt = (
+    schema_single
+    + "\n"
+    + (((lessons_text + "\n") if lessons_text else "") + base_user_prompt + news_block)
+)
 
 # стиль + формат symbol/time_msk
 user_prompt += (
     "\n\n=== OUTPUT STYLE REQUIREMENTS ===\n"
     "- symbol: строго в формате TICKER/USDT из пула (например, LINK/USDT; НЕ LINKUSDT).\n"
     "- time_msk: формат ровно 'dd.mm.yyyy, HH:MM' по МСК.\n"
-    "- news_context: выдай 1–3 пункта из [NEWS]/NEWS_FOCUS. Каждый пункт в формате: "
-    "\"- [impact:+/−/neutral] краткий заголовок — зачем это важно для выбранного актива (≤15 слов)\". "
-    "Используй только факты из [NEWS], не придумывай уровни/цифры.\n"
+    "- news_context: выбери 1–3 строки прямо из блока [NEWS] или NEWS_FOCUS и вставь их БЕЗ ИЗМЕНЕНИЙ, "
+    "сохранив timestamp вида \"[YYYY-MM-DD HH:MM МСК]\" и тег [impact:…]. Нельзя удалять/менять "
+    "timestamp/impact или переписывать заголовок. Если нужно пояснение — добавь его только после "
+    "исходной строки через \" — ...\". Используй только факты из [NEWS], не придумывай уровни/цифры.\n"
 )
 
 # NEWS_FOCUS c учётом тикера

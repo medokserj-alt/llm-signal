@@ -2,6 +2,8 @@
 import sys
 import time
 import re
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import feedparser
 
 # ---------------------------
@@ -96,9 +98,11 @@ def fetch_items(hours: int) -> list[dict]:
 
             published_parsed = getattr(e, "published_parsed", None) \
                                or getattr(e, "updated_parsed", None)
+            ts_value = None
             if published_parsed:
                 ts = time.mktime(published_parsed)
                 age_hours = (now - ts) / 3600.0
+                ts_value = ts
             else:
                 # нет даты — считаем очень свежей
                 age_hours = 0.0
@@ -108,12 +112,24 @@ def fetch_items(hours: int) -> list[dict]:
 
             is_macro = _is_macro_item(title, summary, link, tag_macro)
             impact = _guess_impact(title)
+
+            ts_prefix = ""
+            if ts_value is not None:
+                try:
+                    dt_msk = datetime.fromtimestamp(
+                        ts_value, tz=timezone.utc
+                    ).astimezone(ZoneInfo("Europe/Moscow"))
+                    ts_str = dt_msk.strftime("%Y-%m-%d %H:%M")
+                    ts_prefix = f"[{ts_str} МСК] "
+                except Exception:
+                    ts_prefix = ""
+
+            body = f"[impact:{impact}] {title}"
             if link:
-                line = f"- [impact:{impact}] {title} — {link}"
-            else:
-                line = f"- [impact:{impact}] {title}"
+                body = f"{body} — {link}"
+            line = f"- {ts_prefix}{body}".rstrip()
             items.append({
-                "when": now - age_hours * 3600.0,
+                "when": ts_value if ts_value is not None else now - age_hours * 3600.0,
                 "line": line,
                 "is_macro": is_macro,
             })
