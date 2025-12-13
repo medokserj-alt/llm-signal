@@ -8,7 +8,7 @@
       "limits": {
         "min_interval_sec": 60
       },
-      "mode": "neutral"
+      "mode": "aggressive"
     },
     "672885732": {
       "name": "Dima X10",
