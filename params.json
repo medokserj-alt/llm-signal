@@ -2,7 +2,8 @@
   "hints": {
     "symbol": "SOL/USDT",
     "price": 184.81,
-    "time_msk": "17.10.2025, 00:37"
+    "time_msk": "17.10.2025, 00:37",
+    "mode": "conservative"
   },
   "constraints": {
     "validity_minutes": 90

@@ -4,40 +4,109 @@ from datetime import datetime
 from pathlib import Path
 
 from postprocess import process as pp_process
-from get_signal_json import get_ema20_m15, get_ema20_h1, apply_ema_exhale_filter
+from get_signal_json import (
+    get_ema20_m15,
+    get_ema20_h1,
+    apply_ema_exhale_filter,
+    normalize_no_trade,
+    validate_or_fallback_tvh_by_mode,
+)
 
 BASE = Path(__file__).resolve().parent
 
-def _drop_time_window_mentions(data: dict) -> dict:
-    def has_tw(s: str) -> bool:
-        return "time_window" in s
+VALID_MODES = ("aggressive", "neutral", "conservative")
 
-    def walk(x):
-        if isinstance(x, dict):
-            for k in list(x.keys()):
-                v = x[k]
-                if k == "no_trade_reasons" and isinstance(v, list):
-                    x[k] = [it for it in v if not (isinstance(it, str) and has_tw(it))]
-                    continue
-                if k == "warnings" and isinstance(v, list):
-                    x[k] = [it for it in v if not (isinstance(it, str) and has_tw(it))]
-                    continue
-                if k in ("no_trade_hint", "comments") and isinstance(v, str) and has_tw(v):
-                    x[k] = ""
-                    continue
-                if k == "comment" and isinstance(v, str) and has_tw(v):
-                    x[k] = ""
-                    continue
-                walk(v)
-        elif isinstance(x, list):
-            for it in x:
-                walk(it)
-
+def _round_price(val):
     try:
-        walk(data)
+        v = float(val)
     except Exception:
-        pass
-    return data
+        return None
+    av = abs(v)
+    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
+    return round(v, prec)
+
+def _mid_from_range(r):
+    if isinstance(r, dict):
+        mn = r.get("min")
+        mx = r.get("max")
+        try:
+            a = float(mn)
+            b = float(mx)
+        except Exception:
+            return None
+        if b < a:
+            a, b = b, a
+        return _round_price((a + b) / 2.0)
+    if isinstance(r, (list, tuple)) and len(r) == 2:
+        try:
+            a = float(r[0])
+            b = float(r[1])
+        except Exception:
+            return None
+        if b < a:
+            a, b = b, a
+        return _round_price((a + b) / 2.0)
+    return None
+
+def _entry_price_by_mode(d: dict, mode: str):
+    k = f"entry_price_{mode}"
+    if d.get(k) is not None:
+        try:
+            return float(d.get(k))
+        except Exception:
+            pass
+
+    entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+    bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
+    mid = _mid_from_range(bucket.get("range"))
+    if mid is not None:
+        d[k] = mid
+        return float(mid)
+
+    # fallback: общий entry_range
+    mid = _mid_from_range(d.get("entry_range"))
+    if mid is not None:
+        d[k] = mid
+        return float(mid)
+
+    # last resort: текущая цена
+    try:
+        px = float(d.get("price"))
+    except Exception:
+        px = None
+    if px is not None:
+        d[k] = _round_price(px)
+        return float(px)
+    return None
+
+def _as_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def _calc_rr(entry: float, sl: float, tvh1: float) -> float | None:
+    risk = abs(entry - sl)
+    if not risk:
+        return None
+    return abs(tvh1 - entry) / risk
+
+def _is_long(d: dict) -> bool | None:
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side == "long":
+        return True
+    if side == "short":
+        return False
+    return None
+
+def _gen_tvh(entry: float, sl: float, rr_mult: float, *, is_long: bool) -> float:
+    risk = abs(entry - sl)
+    delta = rr_mult * risk
+    return entry + delta if is_long else entry - delta
+
+def _ensure_by_mode_levels(d: dict) -> dict:
+    # Backward-compatible wrapper for older callers.
+    return validate_or_fallback_tvh_by_mode(d)
 
 def read_latest_report_text(root_dir: str, limit_chars: int = 2000):
     """
@@ -107,11 +176,13 @@ def main():
 
     # 3) прогоняем общий v2-процессор
     data = pp_process(data, day_context, mid_context)
-    data = _drop_time_window_mentions(data)
     try:
         apply_ema_exhale_filter(data)
     except Exception:
         pass
+    normalize_no_trade(data)
+    _ensure_by_mode_levels(data)
+    normalize_no_trade(data)
 
     # 4) сохраняем обратно
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

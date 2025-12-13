@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import math
 import argparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -107,6 +108,76 @@ def normalize_mode(mode_val) -> str:
     except Exception:
         m = ""
     return m if m in VALID_MODES else "neutral"
+
+def normalize_no_trade(d: dict) -> dict:
+    """
+    Нормализует no_trade-ветку и чистит legacy-маркеры (time_window и тексты про ликвидность)
+    без изменения торговой логики (направление/EMA/фильтры).
+    """
+    def _has_legacy(s: str) -> bool:
+        low = (s or "").lower()
+        if "time_window" in low:
+            return True
+        # Удаляем любые явные формулировки про "пониженную ликвидность"
+        if "понижен" in low and "ликвид" in low:
+            return True
+        if "окно" in low and "ликвид" in low:
+            return True
+        return False
+
+    def _clean_str(s: str) -> str:
+        if not isinstance(s, str):
+            return ""
+        return "" if _has_legacy(s) else s.strip()
+
+    def _clean_list_str(xs) -> list[str]:
+        if not isinstance(xs, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for it in xs:
+            if not isinstance(it, str):
+                continue
+            s = it.strip()
+            if not s or _has_legacy(s):
+                continue
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def _walk(x):
+        if isinstance(x, dict):
+            for k in list(x.keys()):
+                v = x[k]
+                if k in ("no_trade_hint", "comment", "comments") and isinstance(v, str):
+                    x[k] = _clean_str(v)
+                    continue
+                if k == "no_trade_reasons":
+                    x[k] = _clean_list_str(v)
+                    continue
+                if k == "warnings":
+                    x[k] = _clean_list_str(v)
+                    continue
+                _walk(v)
+        elif isinstance(x, list):
+            for it in x:
+                _walk(it)
+
+    try:
+        _walk(d)
+    except Exception:
+        pass
+
+    # Консистентность: если no_trade == false → reasons=[], hint=""
+    if not bool(d.get("no_trade")):
+        d["no_trade_reasons"] = []
+        d["no_trade_hint"] = ""
+    else:
+        d["no_trade_reasons"] = _clean_list_str(d.get("no_trade_reasons"))
+        d["no_trade_hint"] = _clean_str(d.get("no_trade_hint") or "")
+
+    return d
 
 
 def _normalize_side(d: dict) -> None:
@@ -553,56 +624,6 @@ def apply_ema_exhale_filter(d: dict) -> None:
             cons["position_size_hint"] = "0.5x"
 
 
-def apply_time_window_notrade(d: dict) -> None:
-    """Отмечает soft time-window: без блокировки сигнала, но с предупреждением."""
-    t_str = d.get("time_msk") or ""
-    try:
-        dt = datetime.strptime(t_str, "%d.%m.%Y, %H:%M")
-    except Exception:
-        return
-    m = dt.hour * 60 + dt.minute
-    windows = [
-        (0, 120),
-        (8 * 60, 9 * 60),
-        (17 * 60 + 25, 17 * 60 + 45),
-        (18 * 60 + 55, 19 * 60 + 10),
-    ]
-    if not any(start <= m < end for start, end in windows):
-        return
-
-    reasons = d.get("no_trade_reasons") or []
-    if "time_window" not in reasons:
-        reasons.append("time_window")
-    d["no_trade_reasons"] = reasons
-
-    warnings = d.get("warnings") or []
-    if "time_window_low_liquidity" not in warnings:
-        warnings.append("time_window_low_liquidity")
-    d["warnings"] = warnings
-
-    entries = d.get("entries")
-    if isinstance(entries, dict):
-        agg = entries.get("aggressive")
-        if isinstance(agg, dict):
-            agg["enabled"] = False
-
-        cons = entries.get("conservative")
-        if isinstance(cons, dict):
-            cons["position_size_hint"] = "0.5x"
-            comment = (cons.get("comment") or "").strip()
-            extra = "Рекомендуемый вход в time_window (пониженная ликвидность)."
-            if extra not in comment:
-                cons["comment"] = (comment + " " if comment else "") + extra
-
-        d["entries"] = entries
-
-    if not (d.get("no_trade_hint") or "").strip():
-        d["no_trade_hint"] = (
-            "Сейчас окно пониженной ликвидности (открытие/закрытие сессии или смена дня). "
-            "Работайте лимитными ордерами, снижайте объём и используйте консервативный профиль."
-        )
-
-
 def _round_price(val):
     try:
         v = float(val)
@@ -754,6 +775,211 @@ def apply_entry_prices_from_ranges(d: dict) -> None:
     d["entry_price_conservative"] = _round_price(cons_mid)
 
 
+def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
+    """
+    Гарантирует наличие sl_by_mode/tp_by_mode/rr_by_mode/exit_plan_by_mode,
+    если no_trade == false. Использует LLM-значения при корректности, иначе — fallback
+    от entry_price_<mode> по фиксированным правилам.
+    """
+
+    def _as_float(x):
+        try:
+            v = float(x)
+        except Exception:
+            return None
+        if not math.isfinite(v):
+            return None
+        return v
+
+    if bool(d.get("no_trade")):
+        return d
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return d
+    is_long = side == "long"
+
+    def _entry_price_by_mode(mode: str) -> float | None:
+        k = f"entry_price_{mode}"
+        v = _as_float(d.get(k))
+        if v is not None:
+            return v
+
+        entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+        bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
+        mid = _mid_from_range(bucket.get("range"))
+        if mid is None:
+            mid = _mid_from_range(d.get("entry_range"))
+        if mid is not None:
+            d[k] = _round_price(mid)
+            return float(mid)
+
+        px = _as_float(d.get("price"))
+        if px is not None:
+            d[k] = _round_price(px)
+            return float(px)
+        return None
+
+    def _valid_sl(entry: float, sl: float) -> bool:
+        return sl < entry if is_long else sl > entry
+
+    def _valid_tvh(entry: float, tvh: float) -> bool:
+        return tvh > entry if is_long else tvh < entry
+
+    def _rr(entry: float, sl: float, target: float) -> float | None:
+        risk = abs(entry - sl)
+        if not risk:
+            return None
+        return abs(target - entry) / risk
+
+    sl_in = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+    tp_in = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+    ep_in = d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else {}
+
+    # exit plan per mode
+    plan_parts = [
+        str(d.get("take_profit_rules") or "").strip(),
+        str(d.get("break_even_rule") or "").strip(),
+    ]
+    plan_default = " ".join(p for p in plan_parts if p).strip()
+    exit_plan_by_mode: dict[str, str] = {
+        m: str(ep_in.get(m) or plan_default).strip() for m in VALID_MODES
+    }
+
+    rr_min_by_mode = {"aggressive": 1.0, "neutral": 1.5, "conservative": 2.0}
+    active_mode = normalize_mode(d.get("mode"))
+    rr_ok_for_active_mode = True
+
+    sl_by_mode: dict[str, float] = {}
+    tp_by_mode: dict[str, dict] = {}
+    rr_by_mode: dict[str, float] = {}
+
+    for mode in ("aggressive", "neutral", "conservative"):
+        entry = _entry_price_by_mode(mode)
+        if entry is None:
+            if mode == active_mode:
+                rr_ok_for_active_mode = False
+            continue
+
+        # SL
+        sl_val = _as_float(sl_in.get(mode))
+        if sl_val is None or not _valid_sl(entry, sl_val):
+            if is_long:
+                sl_val = entry * (0.985 if mode == "conservative" else 0.99)
+            else:
+                sl_val = entry * (1.015 if mode == "conservative" else 1.01)
+        sl_val = float(_round_price(sl_val) if _round_price(sl_val) is not None else sl_val)
+        sl_by_mode[mode] = sl_val
+
+        bucket_in = tp_in.get(mode)
+        bucket_in = bucket_in if isinstance(bucket_in, dict) else {}
+
+        def _pick_num(*keys: str) -> float | None:
+            for k in keys:
+                if k in bucket_in:
+                    v = _as_float(bucket_in.get(k))
+                    if v is not None:
+                        return v
+            return None
+
+        out_bucket: dict = {}
+        if mode == "aggressive":
+            tvh1 = _pick_num("tvh1", "tp1")
+            tvh2 = _pick_num("tvh2", "tp2")
+            tvh3 = _pick_num("tvh3", "tp3")
+            if tvh1 is None or not _valid_tvh(entry, tvh1):
+                tvh1 = entry * (1.005 if is_long else 0.995)
+            if tvh2 is None or not _valid_tvh(entry, tvh2):
+                tvh2 = entry * (1.01 if is_long else 0.99)
+            if tvh3 is None or not _valid_tvh(entry, tvh3):
+                tvh3 = entry * (1.02 if is_long else 0.98)
+
+            tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
+            tvh2 = float(_round_price(tvh2) if _round_price(tvh2) is not None else tvh2)
+            tvh3 = float(_round_price(tvh3) if _round_price(tvh3) is not None else tvh3)
+            if is_long and not (tvh1 < tvh2 < tvh3):
+                tvh1 = float(_round_price(entry * 1.005) or (entry * 1.005))
+                tvh2 = float(_round_price(entry * 1.01) or (entry * 1.01))
+                tvh3 = float(_round_price(entry * 1.02) or (entry * 1.02))
+            if (not is_long) and not (tvh1 > tvh2 > tvh3):
+                tvh1 = float(_round_price(entry * 0.995) or (entry * 0.995))
+                tvh2 = float(_round_price(entry * 0.99) or (entry * 0.99))
+                tvh3 = float(_round_price(entry * 0.98) or (entry * 0.98))
+            out_bucket = {"tvh1": tvh1, "tvh2": tvh2, "tvh3": tvh3}
+
+        elif mode == "neutral":
+            tvh1 = _pick_num("tvh1", "tp1")
+            tvh2 = _pick_num("tvh2", "tp2")
+            if tvh1 is None or not _valid_tvh(entry, tvh1):
+                tvh1 = entry * (1.01 if is_long else 0.99)
+            if tvh2 is None or not _valid_tvh(entry, tvh2):
+                tvh2 = entry * (1.02 if is_long else 0.98)
+            tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
+            tvh2 = float(_round_price(tvh2) if _round_price(tvh2) is not None else tvh2)
+            if is_long and not (tvh1 < tvh2):
+                tvh1 = float(_round_price(entry * 1.01) or (entry * 1.01))
+                tvh2 = float(_round_price(entry * 1.02) or (entry * 1.02))
+            if (not is_long) and not (tvh1 > tvh2):
+                tvh1 = float(_round_price(entry * 0.99) or (entry * 0.99))
+                tvh2 = float(_round_price(entry * 0.98) or (entry * 0.98))
+            out_bucket = {"tvh1": tvh1, "tvh2": tvh2}
+
+        else:  # conservative
+            tvh1 = _pick_num("tvh1", "tp1")
+            tvh2_or_trail = bucket_in.get("tvh2_or_trail")
+            if isinstance(tvh2_or_trail, str) and tvh2_or_trail.strip().lower() == "trail":
+                tvh2_or_trail = "trail"
+            else:
+                tvh2_or_trail = _as_float(tvh2_or_trail)
+                if tvh2_or_trail is not None and not _valid_tvh(entry, tvh2_or_trail):
+                    tvh2_or_trail = None
+
+            if tvh1 is None or not _valid_tvh(entry, tvh1):
+                tvh1 = entry * (1.02 if is_long else 0.98)
+            tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
+
+            if tvh2_or_trail is None:
+                tvh2_or_trail = "trail"
+            elif isinstance(tvh2_or_trail, (int, float)):
+                tvh2_or_trail = float(_round_price(tvh2_or_trail) if _round_price(tvh2_or_trail) is not None else tvh2_or_trail)
+            out_bucket = {"tvh1": tvh1, "tvh2_or_trail": tvh2_or_trail}
+
+        tp_by_mode[mode] = out_bucket
+
+        # RR per mode: на дальнюю фиксированную цель (TVH3/TVH2/TVH1)
+        rr_target = None
+        if mode == "aggressive":
+            rr_target = _as_float(out_bucket.get("tvh3")) or _as_float(out_bucket.get("tvh2")) or _as_float(out_bucket.get("tvh1"))
+        elif mode == "neutral":
+            rr_target = _as_float(out_bucket.get("tvh2")) or _as_float(out_bucket.get("tvh1"))
+        else:
+            rr_target = _as_float(out_bucket.get("tvh2_or_trail")) or _as_float(out_bucket.get("tvh1"))
+
+        rr_val = _rr(entry, sl_val, rr_target) if rr_target is not None else None
+        rr_by_mode[mode] = float(round(rr_val, 3)) if rr_val is not None else 0.0
+
+        if mode == active_mode and (rr_val is None or rr_val < rr_min_by_mode[mode]):
+            rr_ok_for_active_mode = False
+
+    d["sl_by_mode"] = sl_by_mode
+    d["tp_by_mode"] = tp_by_mode
+    d["rr_by_mode"] = rr_by_mode
+    d["exit_plan_by_mode"] = exit_plan_by_mode
+
+    if not rr_ok_for_active_mode:
+        d["no_trade"] = True
+        reasons = d.get("no_trade_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        if "недостаточный RR для входа" not in reasons:
+            reasons.append("недостаточный RR для входа")
+        d["no_trade_reasons"] = reasons
+        if not (d.get("no_trade_hint") or "").strip():
+            d["no_trade_hint"] = "недостаточный RR для входа"
+
+    return d
+
+
 def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool = True) -> dict:
     hints = hints or {}
     d = data or {}
@@ -862,7 +1088,6 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
 
     build_entries(d)
     apply_ema_exhale_filter(d)
-    apply_time_window_notrade(d)
 
     try:
         apply_ema_blocks_and_derivatives(d, sym_for_ema)
@@ -870,7 +1095,8 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     except Exception:
         pass
 
-    return d
+    validate_or_fallback_tvh_by_mode(d)
+    return normalize_no_trade(d)
 
 
 def read_latest_report_text(root_dir: str, limit_chars: int = 2000) -> str:
