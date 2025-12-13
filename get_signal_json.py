@@ -24,31 +24,69 @@ def _ema(vals, period=20):
         ema = float(v) * k + ema * (1.0 - k)
     return round(ema, 6)
 
+_CLOSES_CACHE: dict[tuple[str, str], dict] = {}
 
-def get_ema20_m15(symbol: str):
+
+def _normalize_timeframe(timeframe: str) -> str:
+    tf = (timeframe or "").strip().lower()
+    if tf in {"m15", "15m", "15"}:
+        return "15m"
+    if tf in {"h1", "1h", "60m", "60"}:
+        return "1h"
+    return tf
+
+
+def _fetch_closes(timeframe: str, *, symbol: str, limit: int) -> list[float] | None:
+    tf = _normalize_timeframe(timeframe)
+    try:
+        lim = int(limit)
+    except Exception:
+        lim = 0
+    if lim <= 0:
+        return None
+
+    cache_key = (symbol, tf)
+    cached = _CLOSES_CACHE.get(cache_key) or {}
+    cached_closes = cached.get("closes")
+    if isinstance(cached_closes, list) and len(cached_closes) >= lim:
+        return cached_closes
+
     for ex in (ccxt.bybit(), ccxt.binance()):
         try:
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe="15m", limit=25)
-            closes = [c[4] for c in ohlcv]
-            e = _ema(closes, 20)
-            if e:
-                return float(e)
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
+            closes = [float(c[4]) for c in ohlcv if len(c) >= 5 and c[4] is not None]
+            if closes:
+                _CLOSES_CACHE[cache_key] = {"closes": closes}
+                return closes
         except Exception:
             pass
     return None
+
+
+def get_ema(period: int, timeframe: str, *, symbol: str):
+    try:
+        p = int(period)
+    except Exception:
+        return None
+    if p <= 1:
+        return None
+
+    tf = _normalize_timeframe(timeframe)
+    # чуть больше минимального окна, чтобы снизить шанс нехватки данных
+    limit = max(p + 25, int(p * 1.25))
+    closes = _fetch_closes(tf, symbol=symbol, limit=limit)
+    if not closes:
+        return None
+    e = _ema(closes, p)
+    return float(e) if e is not None else None
+
+
+def get_ema20_m15(symbol: str):
+    return get_ema(20, "15m", symbol=symbol)
 
 
 def get_ema20_h1(symbol: str):
-    for ex in (ccxt.bybit(), ccxt.binance()):
-        try:
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe="1h", limit=30)
-            closes = [c[4] for c in ohlcv]
-            e = _ema(closes, 20)
-            if e:
-                return float(e)
-        except Exception:
-            pass
-    return None
+    return get_ema(20, "1h", symbol=symbol)
 
 
 # ---------- utils ----------
@@ -442,7 +480,8 @@ def _round_price(val):
         v = float(val)
     except Exception:
         return None
-    prec = 4 if v < 1 else (3 if v < 10 else 2)
+    av = abs(v)
+    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
     return round(v, prec)
 
 
@@ -486,6 +525,107 @@ def apply_direction_guard(d: dict) -> None:
                 ema_guard["comment"] = "long_against_ema_downtrend"
 
 
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float)) and x == x
+
+
+def apply_ema_blocks_and_derivatives(d: dict, symbol: str | None) -> None:
+    periods = (9, 12, 20, 50, 200)
+    if not symbol:
+        d.setdefault("ema_m15", {f"ema{p}": None for p in periods})
+        d.setdefault("ema_h1", {f"ema{p}": None for p in periods})
+        d.setdefault("ema_fan_m15_state", "mixed")
+        d.setdefault("ema_fan_h1_state", "mixed")
+        d.setdefault("pivot_ema_hint_by_mode", "ema20")
+        return
+
+    ema_m15 = d.get("ema_m15") if isinstance(d.get("ema_m15"), dict) else {}
+    ema_h1 = d.get("ema_h1") if isinstance(d.get("ema_h1"), dict) else {}
+
+    for p in periods:
+        k = f"ema{p}"
+        if k not in ema_m15 or ema_m15.get(k) is None:
+            if p == 20 and _is_num(d.get("ema20_m15")):
+                ema_m15[k] = float(d["ema20_m15"])
+            else:
+                ema_m15[k] = get_ema(p, "m15", symbol=symbol)
+        if k not in ema_h1 or ema_h1.get(k) is None:
+            if p == 20 and _is_num(d.get("ema20_h1")):
+                ema_h1[k] = float(d["ema20_h1"])
+            else:
+                ema_h1[k] = get_ema(p, "h1", symbol=symbol)
+
+    d["ema_m15"] = {f"ema{p}": ema_m15.get(f"ema{p}") for p in periods}
+    d["ema_h1"] = {f"ema{p}": ema_h1.get(f"ema{p}") for p in periods}
+
+    def fan_state(ema_block: dict) -> str:
+        e9 = ema_block.get("ema9")
+        e12 = ema_block.get("ema12")
+        e20 = ema_block.get("ema20")
+        e50 = ema_block.get("ema50")
+        if not all(_is_num(x) for x in (e9, e12, e20, e50)):
+            return "mixed"
+        if e9 > e12 > e20 > e50:
+            return "bull"
+        if e9 < e12 < e20 < e50:
+            return "bear"
+        return "mixed"
+
+    d["ema_fan_m15_state"] = fan_state(d["ema_m15"])
+    d["ema_fan_h1_state"] = fan_state(d["ema_h1"])
+
+    mode = normalize_mode(d.get("mode"))
+    d["pivot_ema_hint_by_mode"] = (
+        "ema9_or_ema12"
+        if mode == "aggressive"
+        else ("ema50" if mode == "conservative" else "ema20")
+    )
+
+
+def _mid_from_range(r):
+    if isinstance(r, dict):
+        mn = r.get("min")
+        mx = r.get("max")
+        try:
+            a = float(mn)
+            b = float(mx)
+        except Exception:
+            return None
+        if b < a:
+            a, b = b, a
+        return _round_price((a + b) / 2.0)
+    if isinstance(r, (list, tuple)) and len(r) == 2:
+        try:
+            a = float(r[0])
+            b = float(r[1])
+        except Exception:
+            return None
+        if b < a:
+            a, b = b, a
+        return _round_price((a + b) / 2.0)
+    return None
+
+
+def apply_entry_prices_from_ranges(d: dict) -> None:
+    neutral_mid = _mid_from_range(d.get("entry_range"))
+
+    entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+    agg_mid = _mid_from_range(((entries.get("aggressive") or {}).get("range")))
+    cons_mid = _mid_from_range(((entries.get("conservative") or {}).get("range")))
+
+    if neutral_mid is None:
+        neutral_mid = _mid_from_range(((entries.get("neutral") or {}).get("range")))
+
+    if agg_mid is None:
+        agg_mid = neutral_mid
+    if cons_mid is None:
+        cons_mid = neutral_mid
+
+    d["entry_price_neutral"] = _round_price(neutral_mid)
+    d["entry_price_aggressive"] = _round_price(agg_mid)
+    d["entry_price_conservative"] = _round_price(cons_mid)
+
+
 def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool = True) -> dict:
     hints = hints or {}
     d = data or {}
@@ -496,7 +636,13 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         d["time_msk"] = hints["time_msk"]
     if "price" in hints and hints["price"] is not None:
         d["price"] = hints["price"]
-    d["mode"] = normalize_mode(hints.get("mode"))
+    if "mode" in hints:
+        mode_val = hints.get("mode")
+    elif "mode" in d:
+        mode_val = d.get("mode")
+    else:
+        mode_val = "neutral"
+    d["mode"] = normalize_mode(mode_val)
 
     d.setdefault("warnings", [])
     if not d.get("time_msk"):
@@ -588,6 +734,12 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
 
     build_entries(d)
     apply_time_window_notrade(d)
+
+    try:
+        apply_ema_blocks_and_derivatives(d, sym_for_ema)
+        apply_entry_prices_from_ranges(d)
+    except Exception:
+        pass
 
     return d
 
@@ -850,14 +1002,12 @@ if args.symbol:
         _last = get_pair_ticker(_sym).get("last")
     except Exception:
         _last = None
-    if _last is not None:
-        try:
-            _val = float(_last)
-            _prec = 4 if _val < 1 else (3 if _val < 10 else 2)
-            payload["hints"]["price"] = round(_val, _prec)
-            payload["hints"]["price_source"] = "live"
-        except Exception:
-            pass
+        if _last is not None:
+            try:
+                payload["hints"]["price"] = _round_price(_last)
+                payload["hints"]["price_source"] = "live"
+            except Exception:
+                pass
 
 # time hint
 payload["hints"]["time_msk"] = current_msk()
