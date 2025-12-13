@@ -425,6 +425,134 @@ def build_entries(d: dict) -> None:
         return
 
 
+def apply_ema_exhale_filter(d: dict) -> None:
+    """
+    EMA-filter v1 (minimal):
+    - не меняет направление (long/short)
+    - не трогает RR/SL/TP
+    - только штрафует входы на пике/в дне при отсутствии «выдоха»
+    """
+    warnings = d.setdefault("warnings", [])
+
+    try:
+        price = float(d.get("price") or 0.0)
+    except Exception:
+        price = 0.0
+    if not price:
+        return
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    mode = normalize_mode(d.get("mode"))
+
+    em15 = d.get("ema20_m15")
+    em1h = d.get("ema20_h1")
+    try:
+        ema20_m15 = float(em15) if em15 is not None else None
+    except Exception:
+        ema20_m15 = None
+    try:
+        ema20_h1 = float(em1h) if em1h is not None else None
+    except Exception:
+        ema20_h1 = None
+
+    no_exhale = False
+    hot_h1 = False
+    if side in {"long", "short"} and ema20_m15 is not None:
+        dist_m15 = (price - ema20_m15) / price
+        if side == "long" and dist_m15 > 0.006:
+            no_exhale = True
+        if side == "short" and dist_m15 < -0.006:
+            no_exhale = True
+
+    if side in {"long", "short"} and ema20_h1 is not None:
+        dist_h1 = (price - ema20_h1) / price
+        if side == "long" and dist_h1 > 0.010:
+            hot_h1 = True
+        if side == "short" and dist_h1 < -0.010:
+            hot_h1 = True
+
+    overextended = no_exhale or hot_h1
+
+    if no_exhale and side in {"long", "short"}:
+        key = f"{side}_overextended_no_exhale"
+        if key not in warnings:
+            warnings.append(key)
+    if hot_h1 and side in {"long", "short"}:
+        key = f"{side}_overextended_h1"
+        if key not in warnings:
+            warnings.append(key)
+
+    between = False
+    if ema20_m15 is not None and ema20_h1 is not None:
+        lo = min(ema20_m15, ema20_h1)
+        hi = max(ema20_m15, ema20_h1)
+        if lo <= price <= hi:
+            between = True
+            if "ema_between_m15_h1" not in warnings:
+                warnings.append("ema_between_m15_h1")
+
+    try:
+        er = d.get("entry_range") or {}
+        entry_min = er.get("min")
+        entry_max = er.get("max")
+        if entry_min is not None and entry_max is not None and ema20_m15 is not None:
+            a = float(entry_min)
+            b = float(entry_max)
+            entry_mid = (a + b) / 2.0
+            if abs(entry_mid - ema20_m15) / price > 0.004:
+                if "entry_not_anchored_to_ema20_m15" not in warnings:
+                    warnings.append("entry_not_anchored_to_ema20_m15")
+    except Exception:
+        pass
+
+    entries = d.get("entries")
+    if not isinstance(entries, dict):
+        entries = None
+
+    def _disable_aggressive_entry() -> None:
+        if not entries:
+            return
+        agg = entries.get("aggressive")
+        if isinstance(agg, dict):
+            agg["enabled"] = False
+
+    if mode == "conservative":
+        if overextended:
+            d["no_trade"] = True
+            reasons = d.get("no_trade_reasons")
+            if not isinstance(reasons, list):
+                reasons = []
+            if "waiting_confirmation" not in reasons:
+                reasons.append("waiting_confirmation")
+            d["no_trade_reasons"] = reasons
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "ожидание подтверждения структуры"
+        return
+
+    if mode == "neutral":
+        if overextended:
+            d["no_trade"] = True
+            reasons = d.get("no_trade_reasons")
+            if not isinstance(reasons, list):
+                reasons = []
+            if "waiting_confirmation" not in reasons:
+                reasons.append("waiting_confirmation")
+            d["no_trade_reasons"] = reasons
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "ожидание подтверждения структуры"
+        if between:
+            _disable_aggressive_entry()
+        return
+
+    # aggressive
+    if overextended or between:
+        _disable_aggressive_entry()
+    if overextended and entries:
+        cons = entries.get("conservative")
+        if isinstance(cons, dict):
+            cons["position_size_hint"] = "0.5x"
+
+
 def apply_time_window_notrade(d: dict) -> None:
     """Отмечает soft time-window: без блокировки сигнала, но с предупреждением."""
     t_str = d.get("time_msk") or ""
@@ -733,6 +861,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     d.setdefault("max_valid_minutes", 90)
 
     build_entries(d)
+    apply_ema_exhale_filter(d)
     apply_time_window_notrade(d)
 
     try:

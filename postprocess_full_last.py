@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from postprocess import process as pp_process
-from get_signal_json import get_ema20_m15, get_ema20_h1
+from get_signal_json import get_ema20_m15, get_ema20_h1, apply_ema_exhale_filter
 
 BASE = Path(__file__).resolve().parent
 
@@ -108,6 +108,10 @@ def main():
     # 3) прогоняем общий v2-процессор
     data = pp_process(data, day_context, mid_context)
     data = _drop_time_window_mentions(data)
+    try:
+        apply_ema_exhale_filter(data)
+    except Exception:
+        pass
 
     # 4) сохраняем обратно
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
