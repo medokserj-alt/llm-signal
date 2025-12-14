@@ -526,22 +526,95 @@ def apply_ema_exhale_filter(d: dict) -> None:
     except Exception:
         ema20_h1 = None
 
-    no_exhale = False
-    hot_h1 = False
-    if side in {"long", "short"} and ema20_m15 is not None:
-        dist_m15 = (price - ema20_m15) / price
-        if side == "long" and dist_m15 > 0.006:
-            no_exhale = True
-        if side == "short" and dist_m15 < -0.006:
-            no_exhale = True
+    between = False
+    if ema20_m15 is not None and ema20_h1 is not None:
+        lo = min(ema20_m15, ema20_h1)
+        hi = max(ema20_m15, ema20_h1)
+        if lo <= price <= hi:
+            between = True
+            if "ema_between_m15_h1" not in warnings:
+                warnings.append("ema_between_m15_h1")
 
-    if side in {"long", "short"} and ema20_h1 is not None:
-        dist_h1 = (price - ema20_h1) / price
-        if side == "long" and dist_h1 > 0.010:
-            hot_h1 = True
-        if side == "short" and dist_h1 < -0.010:
-            hot_h1 = True
+    entries = d.get("entries")
+    if not isinstance(entries, dict):
+        entries = None
 
+    def _get_entry_range() -> dict:
+        er = d.get("entry_range")
+        if isinstance(er, dict) and ("min" in er or "max" in er):
+            return er
+        if entries:
+            nr = (entries.get("neutral") or {}).get("range")
+            if isinstance(nr, dict) and ("min" in nr or "max" in nr):
+                return nr
+        return {}
+
+    def _disable_aggressive_entry() -> None:
+        if not entries:
+            return
+        agg = entries.get("aggressive")
+        if isinstance(agg, dict):
+            agg["enabled"] = False
+
+    def _tighten_conservative_size_hint() -> None:
+        if not entries:
+            return
+        cons = entries.get("conservative")
+        if isinstance(cons, dict):
+            cons["position_size_hint"] = "0.5x"
+
+    try:
+        entry_ref = float(d.get("entry_price_neutral")) if d.get("entry_price_neutral") is not None else None
+    except Exception:
+        entry_ref = None
+
+    try:
+        er = _get_entry_range()
+        entry_min = er.get("min")
+        entry_max = er.get("max")
+        if (
+            (entry_ref is None)
+            and entry_min is not None
+            and entry_max is not None
+        ):
+            a = float(entry_min)
+            b = float(entry_max)
+            if b < a:
+                a, b = b, a
+            entry_mid = (a + b) / 2.0
+            if entry_mid:
+                entry_ref = entry_mid
+    except Exception:
+        pass
+
+    if entry_ref is None or not entry_ref:
+        if between:
+            _disable_aggressive_entry()
+        return
+
+    try:
+        if ema20_m15 is not None:
+            if abs(entry_ref - ema20_m15) / abs(entry_ref) > 0.004:
+                if "entry_not_anchored_to_ema20_m15" not in warnings:
+                    warnings.append("entry_not_anchored_to_ema20_m15")
+    except Exception:
+        pass
+
+    dist_entry_m15 = None
+    dist_entry_h1 = None
+    try:
+        if side in {"long", "short"} and ema20_m15 is not None:
+            dist_entry_m15 = (entry_ref - ema20_m15) / entry_ref
+    except Exception:
+        dist_entry_m15 = None
+    try:
+        if side in {"long", "short"} and ema20_h1 is not None:
+            dist_entry_h1 = (entry_ref - ema20_h1) / entry_ref
+    except Exception:
+        dist_entry_h1 = None
+
+    no_exhale = bool(dist_entry_m15 is not None and abs(dist_entry_m15) > 0.006)
+    hot_h1 = bool(dist_entry_h1 is not None and abs(dist_entry_h1) > 0.010)
     overextended = no_exhale or hot_h1
 
     if no_exhale and side in {"long", "short"}:
@@ -553,75 +626,66 @@ def apply_ema_exhale_filter(d: dict) -> None:
         if key not in warnings:
             warnings.append(key)
 
-    between = False
-    if ema20_m15 is not None and ema20_h1 is not None:
-        lo = min(ema20_m15, ema20_h1)
-        hi = max(ema20_m15, ema20_h1)
-        if lo <= price <= hi:
-            between = True
-            if "ema_between_m15_h1" not in warnings:
-                warnings.append("ema_between_m15_h1")
-
+    chasing_impulse = False
     try:
-        er = d.get("entry_range") or {}
+        er = _get_entry_range()
         entry_min = er.get("min")
         entry_max = er.get("max")
-        if entry_min is not None and entry_max is not None and ema20_m15 is not None:
+        if entry_min is not None and entry_max is not None:
             a = float(entry_min)
             b = float(entry_max)
-            entry_mid = (a + b) / 2.0
-            if abs(entry_mid - ema20_m15) / price > 0.004:
-                if "entry_not_anchored_to_ema20_m15" not in warnings:
-                    warnings.append("entry_not_anchored_to_ema20_m15")
+            if b < a:
+                a, b = b, a
+            if side == "long" and b >= price:
+                chasing_impulse = True
+            if side == "short" and a <= price:
+                chasing_impulse = True
     except Exception:
-        pass
+        chasing_impulse = False
 
-    entries = d.get("entries")
-    if not isinstance(entries, dict):
-        entries = None
+    should_block = False
+    block_hint = None
+    if mode in {"neutral", "conservative"} and side in {"long", "short"}:
+        if dist_entry_m15 is not None and abs(dist_entry_m15) <= 0.004:
+            should_block = False
+        else:
+            if (
+                dist_entry_m15 is not None
+                and dist_entry_h1 is not None
+                and abs(dist_entry_m15) > 0.006
+                and abs(dist_entry_h1) > 0.010
+            ):
+                should_block = True
+                block_hint = "ожидание подтверждения структуры"
+            elif chasing_impulse:
+                should_block = True
+                block_hint = "рынок в импульсе без отката"
 
-    def _disable_aggressive_entry() -> None:
-        if not entries:
-            return
-        agg = entries.get("aggressive")
-        if isinstance(agg, dict):
-            agg["enabled"] = False
-
-    if mode == "conservative":
-        if overextended:
-            d["no_trade"] = True
+    if should_block and mode != "aggressive":
+        was_no_trade = bool(d.get("no_trade"))
+        d["no_trade"] = True
+        if not was_no_trade:
+            d["no_trade_reasons"] = ["waiting_confirmation"]
+            d["no_trade_hint"] = block_hint or "ожидание подтверждения структуры"
+        else:
             reasons = d.get("no_trade_reasons")
             if not isinstance(reasons, list):
                 reasons = []
             if "waiting_confirmation" not in reasons:
                 reasons.append("waiting_confirmation")
             d["no_trade_reasons"] = reasons
-            if not (d.get("no_trade_hint") or "").strip():
-                d["no_trade_hint"] = "ожидание подтверждения структуры"
-        return
 
-    if mode == "neutral":
+    if mode == "aggressive":
         if overextended:
-            d["no_trade"] = True
-            reasons = d.get("no_trade_reasons")
-            if not isinstance(reasons, list):
-                reasons = []
-            if "waiting_confirmation" not in reasons:
-                reasons.append("waiting_confirmation")
-            d["no_trade_reasons"] = reasons
-            if not (d.get("no_trade_hint") or "").strip():
-                d["no_trade_hint"] = "ожидание подтверждения структуры"
-        if between:
+            _tighten_conservative_size_hint()
+        if overextended or between:
             _disable_aggressive_entry()
         return
 
-    # aggressive
-    if overextended or between:
+    # neutral/conservative: between is a warning only
+    if between:
         _disable_aggressive_entry()
-    if overextended and entries:
-        cons = entries.get("conservative")
-        if isinstance(cons, dict):
-            cons["position_size_hint"] = "0.5x"
+    return
 
 
 def _round_price(val):
@@ -1087,13 +1151,14 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     d.setdefault("max_valid_minutes", 90)
 
     build_entries(d)
-    apply_ema_exhale_filter(d)
 
     try:
         apply_ema_blocks_and_derivatives(d, sym_for_ema)
         apply_entry_prices_from_ranges(d)
     except Exception:
         pass
+
+    apply_ema_exhale_filter(d)
 
     validate_or_fallback_tvh_by_mode(d)
     return normalize_no_trade(d)

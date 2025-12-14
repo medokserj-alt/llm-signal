@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from zoneinfo import ZoneInfo
-import os, json, time, subprocess, re, html as htmllib
+import os, json, time, subprocess, re, html as htmllib, tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +35,7 @@ def parse_allowed_ids():
 ALLOWED_UIDS = parse_allowed_ids()
 
 USER_CHANNELS_PATH = PROJECT_ROOT / "user_channels.json"
+PARAMS_PATH = PROJECT_ROOT / "params.json"
 USER_CONFIG = {}
 GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
 VALID_MODES = {"aggressive", "neutral", "conservative"}
@@ -142,6 +143,50 @@ def html_file_to_tg_text(p:Path,max_len:int=4000):
         chunks.append(s[:max_len])
         s=s[max_len:]
     return chunks
+
+def set_params_mode(mode: str):
+    if mode not in VALID_MODES:
+        mode = "neutral"
+
+    params = None
+    if PARAMS_PATH.exists():
+        try:
+            params = json.loads(PARAMS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            params = None
+
+    if not isinstance(params, dict):
+        params = {"hints": {"mode": "neutral"}}
+
+    hints = params.get("hints")
+    if not isinstance(hints, dict):
+        hints = {}
+        params["hints"] = hints
+    hints["mode"] = mode
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(PARAMS_PATH.parent),
+            prefix=f"{PARAMS_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(params, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PARAMS_PATH)
+        tmp_path = None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 # ============== SYMBOLS / MENU ==============
 
@@ -348,6 +393,7 @@ async def handle_full(update,context):
         return
 
     try:
+        set_params_mode(get_user_mode(uid))
         proc = subprocess.run(
             ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
             capture_output=True, text=True, timeout=900
@@ -401,6 +447,7 @@ async def handle_current_analysis(update,context):
         return
 
     try:
+        set_params_mode(get_user_mode(uid))
         proc = subprocess.run(
             ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
             capture_output=True, text=True, timeout=900
@@ -458,6 +505,7 @@ async def handle_symbol(update,context):
         return
 
     try:
+        set_params_mode(get_user_mode(uid))
         # SINGLE-путь: один символ напрямую
         proc = subprocess.run(
             ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal '{symbol}'"],
