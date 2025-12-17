@@ -498,10 +498,11 @@ def build_entries(d: dict) -> None:
 
 def apply_ema_exhale_filter(d: dict) -> None:
     """
-    EMA-filter v1 (minimal):
-    - не меняет направление (long/short)
-    - не трогает RR/SL/TP
-    - только штрафует входы на пике/в дне при отсутствии «выдоха»
+    EMA-filter v1 (phase guard):
+    - различает фазы impulse → exhale → continuation (+ between как неопределённость)
+    - не меняет direction/side
+    - не трогает RR/SL/TP и ТВХ-валидацию
+    - работает через ограничения входов в режимах (и no_trade только там, где нужно)
     """
     warnings = d.setdefault("warnings", [])
 
@@ -509,8 +510,6 @@ def apply_ema_exhale_filter(d: dict) -> None:
         price = float(d.get("price") or 0.0)
     except Exception:
         price = 0.0
-    if not price:
-        return
 
     side = (d.get("side") or d.get("direction") or "").strip().lower()
     mode = normalize_mode(d.get("mode"))
@@ -526,14 +525,9 @@ def apply_ema_exhale_filter(d: dict) -> None:
     except Exception:
         ema20_h1 = None
 
-    between = False
-    if ema20_m15 is not None and ema20_h1 is not None:
-        lo = min(ema20_m15, ema20_h1)
-        hi = max(ema20_m15, ema20_h1)
-        if lo <= price <= hi:
-            between = True
-            if "ema_between_m15_h1" not in warnings:
-                warnings.append("ema_between_m15_h1")
+    fan_state = str(d.get("ema_fan_m15_state") or "").strip().lower()
+    if fan_state not in {"bull", "bear", "mixed"}:
+        fan_state = "unknown"
 
     entries = d.get("entries")
     if not isinstance(entries, dict):
@@ -588,8 +582,10 @@ def apply_ema_exhale_filter(d: dict) -> None:
         pass
 
     if entry_ref is None or not entry_ref:
-        if between:
+        if fan_state == "mixed":
             _disable_aggressive_entry()
+            if "phase_between" not in warnings:
+                warnings.append("phase_between")
         return
 
     try:
@@ -613,78 +609,89 @@ def apply_ema_exhale_filter(d: dict) -> None:
     except Exception:
         dist_entry_h1 = None
 
-    no_exhale = bool(dist_entry_m15 is not None and abs(dist_entry_m15) > 0.006)
-    hot_h1 = bool(dist_entry_h1 is not None and abs(dist_entry_h1) > 0.010)
-    overextended = no_exhale or hot_h1
-
-    if no_exhale and side in {"long", "short"}:
-        key = f"{side}_overextended_no_exhale"
-        if key not in warnings:
-            warnings.append(key)
-    if hot_h1 and side in {"long", "short"}:
-        key = f"{side}_overextended_h1"
-        if key not in warnings:
-            warnings.append(key)
-
     chasing_impulse = False
     try:
-        er = _get_entry_range()
-        entry_min = er.get("min")
-        entry_max = er.get("max")
-        if entry_min is not None and entry_max is not None:
-            a = float(entry_min)
-            b = float(entry_max)
-            if b < a:
-                a, b = b, a
-            if side == "long" and b >= price:
-                chasing_impulse = True
-            if side == "short" and a <= price:
-                chasing_impulse = True
+        if price:
+            er = _get_entry_range()
+            entry_min = er.get("min")
+            entry_max = er.get("max")
+            if entry_min is not None and entry_max is not None:
+                a = float(entry_min)
+                b = float(entry_max)
+                if b < a:
+                    a, b = b, a
+                # если entry_range пересекает текущую цену — это догоняющий вход → трактуем как IMPULSE
+                if side == "long" and b >= price:
+                    chasing_impulse = True
+                if side == "short" and a <= price:
+                    chasing_impulse = True
     except Exception:
         chasing_impulse = False
 
-    should_block = False
-    block_hint = None
-    if mode in {"neutral", "conservative"} and side in {"long", "short"}:
-        if dist_entry_m15 is not None and abs(dist_entry_m15) <= 0.004:
-            should_block = False
-        else:
-            if (
-                dist_entry_m15 is not None
-                and dist_entry_h1 is not None
-                and abs(dist_entry_m15) > 0.006
-                and abs(dist_entry_h1) > 0.010
-            ):
-                should_block = True
-                block_hint = "ожидание подтверждения структуры"
-            elif chasing_impulse:
-                should_block = True
-                block_hint = "рынок в импульсе без отката"
+    is_exhale = bool(dist_entry_m15 is not None and abs(dist_entry_m15) <= 0.004)
+    is_impulse = bool(
+        chasing_impulse
+        or (
+            fan_state in {"bull", "bear"}
+            and dist_entry_m15 is not None
+            and abs(dist_entry_m15) > 0.006
+        )
+    )
 
-    if should_block and mode != "aggressive":
+    entry_between_emas = False
+    if ema20_m15 is not None and ema20_h1 is not None:
+        lo = min(ema20_m15, ema20_h1)
+        hi = max(ema20_m15, ema20_h1)
+        if lo <= entry_ref <= hi:
+            entry_between_emas = True
+            if "ema_between_m15_h1" not in warnings:
+                warnings.append("ema_between_m15_h1")
+    is_between = bool(fan_state == "mixed" or entry_between_emas)
+
+    if is_impulse:
+        if "impulse_no_exhale" not in warnings:
+            warnings.append("impulse_no_exhale")
+    elif is_between:
+        if "phase_between" not in warnings:
+            warnings.append("phase_between")
+
+    # EXHALE (правильная фаза): фильтр не вмешивается
+    if is_exhale:
+        return
+
+    def _set_waiting_confirmation(hint: str = "ожидание подтверждения структуры") -> None:
         was_no_trade = bool(d.get("no_trade"))
         d["no_trade"] = True
         if not was_no_trade:
             d["no_trade_reasons"] = ["waiting_confirmation"]
-            d["no_trade_hint"] = block_hint or "ожидание подтверждения структуры"
-        else:
-            reasons = d.get("no_trade_reasons")
-            if not isinstance(reasons, list):
-                reasons = []
-            if "waiting_confirmation" not in reasons:
-                reasons.append("waiting_confirmation")
-            d["no_trade_reasons"] = reasons
+            d["no_trade_hint"] = hint
+            return
+        reasons = d.get("no_trade_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        if "waiting_confirmation" not in reasons:
+            reasons.append("waiting_confirmation")
+        d["no_trade_reasons"] = reasons
+        if not (d.get("no_trade_hint") or "").strip():
+            d["no_trade_hint"] = hint
 
-    if mode == "aggressive":
-        if overextended:
-            _tighten_conservative_size_hint()
-        if overextended or between:
+    # IMPULSE: догоняющий вход без выдоха
+    if is_impulse:
+        if mode == "aggressive":
             _disable_aggressive_entry()
+            _tighten_conservative_size_hint()
+            return
+        if mode in {"neutral", "conservative"}:
+            _set_waiting_confirmation("ожидание подтверждения структуры")
+            return
+
+    # BETWEEN: неопределённость / высокая вероятность пилы
+    if is_between:
+        _disable_aggressive_entry()
+        if mode == "conservative":
+            _set_waiting_confirmation("ожидание подтверждения структуры")
         return
 
-    # neutral/conservative: between is a warning only
-    if between:
-        _disable_aggressive_entry()
     return
 
 
@@ -1318,7 +1325,8 @@ if args.multi:
         "take_profit_rules, break_even_rule, multi_tf_view, why_asset, news_context, market_context, "
         "validity_minutes, cancel_condition, technical_rationale, disclaimer, entry_mode, confidence, "
         "confirmation_rules, alt_entry_range, entries, no_trade, no_trade_reasons, no_trade_hint, "
-        "max_valid_minutes, ema20_m15, ema20_h1, ema_guard, day_mid_context, adx_guard.\n"
+        "max_valid_minutes, ema20_m15, ema20_h1, ema_guard, day_mid_context, adx_guard, "
+        "tp_by_mode, rr_by_mode, exit_plan_by_mode.\n"
         "news_context: выбери 1–3 строки ПРЯМО из блока [NEWS] или NEWS_FOCUS и вставь их БЕЗ ИЗМЕНЕНИЙ, "
         "сохраняя префикс времени вида \"[YYYY-MM-DD HH:MM МСК]\" и тег [impact:…]. Нельзя удалять/менять "
         "timestamp/impact или переписывать заголовок. Допускается добавить пояснение только в конце через "
@@ -1326,6 +1334,24 @@ if args.multi:
         f"symbol выбирай ТОЛЬКО из списка: {', '.join(pool_symbols)}.\n"
         f"time_msk установи ровно в это значение: {time_msk}.\n"
         "market_context ссылайся на проценты из блока [BTC_ETH_24H] как есть.\n"
+        "\n=== EMA → TVH (TP) GUIDANCE (SOFT, FOR EXIT ONLY) ===\n"
+        "EMA в этом шаге — ТОЛЬКО контекст для мышления при формировании ТВХ/TP (tp_by_mode) и логики выхода "
+        "(exit_plan_by_mode). НЕ делай EMA обязательным правилом, НЕ вводи новых no-trade правил и НЕ меняй "
+        "выбор направления (direction) из-за EMA.\n"
+        "Используй уже существующие поля из входных данных/контекста:\n"
+        "- ema_m15, ema_h1\n"
+        "- ema_fan_m15_state, ema_fan_h1_state\n"
+        "- pivot_ema_hint_by_mode\n"
+        "Требование для tp_by_mode:\n"
+        "- если EMA-fan расширен (bull/bear) и быстрые EMA (EMA9/12) заметно удалены от EMA20, цели могут быть шире "
+        "(дальше TVH, трейлинг позже)\n"
+        "- если EMA-fan схлопывается к EMA20 (быстрые EMA близко к EMA20 / состояние mixed / потеря импульса), цели ближе "
+        "и трейлинг/BE раньше\n"
+        "- ориентируйся на pivot_ema_hint_by_mode: aggressive → EMA9/EMA12, neutral → EMA20, conservative → EMA50\n"
+        "Требование для exit_plan_by_mode:\n"
+        "- для каждого режима (aggressive/neutral/conservative) добавь ОДНУ короткую фразу-пояснение, "
+        "почему цели такие (без чисел EMA; используй формулировки «быстрая/средняя/медленная EMA», "
+        "«fan расширяется/схлопывается», «трейлинг раньше/позже»).\n"
     )
 
     focus = build_news_focus("", news_block)
@@ -1497,6 +1523,9 @@ schema_single = (
     "- tp1: число (первая цель)\n"
     "- tp2: число (вторая цель)\n"
     "- rr: число (отношение риск/прибыль по TP2)\n"
+    "- tp_by_mode: объект целей ТВХ по режимам: aggressive/neutral/conservative (см. требования ниже)\n"
+    "- rr_by_mode: объект RR по режимам: aggressive/neutral/conservative\n"
+    "- exit_plan_by_mode: объект плана выхода по режимам: aggressive/neutral/conservative\n"
     "- take_profit_rules: строка с логикой фиксации прибыли\n"
     "- break_even_rule: строка с правилом перевода в безубыток\n"
     "- multi_tf_view: объект с ключами m5, m15, h1, h4, d1 — каждое значение короткая строка-описание структуры\n"
@@ -1521,6 +1550,20 @@ schema_single = (
     "- ema_guard: объект с EMA-контекстом (как в finalize_signal)\n"
     "- day_mid_context: объект с полями day_bias, mid_bias, notes\n"
     "- adx_guard: объект для силы тренда (может быть заглушкой)\n"
+    "\n=== EMA → TVH (TP) GUIDANCE (SOFT, FOR EXIT ONLY) ===\n"
+    "EMA — не жёсткое правило и не повод блокировать сигнал. Используй EMA ТОЛЬКО как ориентир глубины целей "
+    "и логики выхода (tp_by_mode + exit_plan_by_mode). Direction/side не меняй из-за EMA.\n"
+    "Используй уже существующие поля:\n"
+    "- ema_m15, ema_h1\n"
+    "- ema_fan_m15_state, ema_fan_h1_state\n"
+    "- pivot_ema_hint_by_mode\n"
+    "Требование для tp_by_mode:\n"
+    "- если EMA-fan расширен (bull/bear) и быстрые EMA (EMA9/12) заметно удалены от EMA20 → цели шире, трейлинг позже\n"
+    "- если EMA-fan схлопывается к EMA20 → цели ближе, трейлинг/BE раньше\n"
+    "- pivot_ema_hint_by_mode: aggressive → EMA9/EMA12, neutral → EMA20, conservative → EMA50\n"
+    "Требование для exit_plan_by_mode:\n"
+    "- для каждого режима добавь ОДНУ короткую фразу, почему цели такие (без чисел EMA; "
+    "используй «быстрая/средняя/медленная EMA», «fan расширяется/схлопывается»).\n"
     "Все поля должны быть заполнены; если данных нет — используй осмысленное значение (например, пустой массив/строку), но ключ обязательно присутствует.\n"
 )
 
