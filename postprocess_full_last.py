@@ -10,6 +10,7 @@ from get_signal_json import (
     apply_ema_exhale_filter,
     normalize_no_trade,
     validate_or_fallback_tvh_by_mode,
+    validate_active_mode_setup,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -182,6 +183,7 @@ def main():
         pass
     normalize_no_trade(data)
     _ensure_by_mode_levels(data)
+    validate_active_mode_setup(data)
     normalize_no_trade(data)
 
     # 4) сохраняем обратно

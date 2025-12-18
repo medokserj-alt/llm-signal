@@ -5,6 +5,18 @@ import re
 import pathlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import math
+
+
+VALID_MODES = {"aggressive", "neutral", "conservative"}
+
+
+def normalize_mode(mode_val) -> str:
+    try:
+        m = (mode_val or "").strip().lower()
+    except Exception:
+        m = ""
+    return m if m in VALID_MODES else "neutral"
 
 
 def fmt(x):
@@ -92,13 +104,7 @@ def main():
     symbol = data.get("symbol", "?")
     price = fmt(data.get("price", ""))
 
-    direction = (data.get("direction") or "").lower() or "—"
-
-    sl = fmt(data.get("sl", ""))
-    tp1 = fmt(data.get("tp1", ""))
-    tp2 = fmt(data.get("tp2", ""))
-    rr = data.get("rr", None)
-    rr_str = f"1:{fmt(rr)}" if rr is not None else "—"
+    mode = normalize_mode(data.get("mode"))
 
     take_profit_rules = (data.get("take_profit_rules") or "").strip()
     break_even_rule = (data.get("break_even_rule") or "").strip()
@@ -153,158 +159,171 @@ def main():
 
         # 1) Почему выбран актив
         lines.append("1️⃣ Почему выбран актив")
-        lines.append(_truncate(why_asset or "—", 240) or "—")
+        lines.append(_one_line(why_asset) or "—")
         lines.append("")
 
-        # 2) Сетап
-        agg = entries.get("aggressive") or {}
-        neu = entries.get("neutral") or {}
-        con = entries.get("conservative") or {}
+        # 2) Сетап (ТОЛЬКО текущий режим)
+        MODE_LABELS = {
+            "aggressive": "🟥 Агрессивный",
+            "neutral": "🟨 Нейтральный",
+            "conservative": "🟩 Консервативный",
+        }
 
-        def _mode_enabled(mode_dict: dict) -> bool:
+        def _as_float(x):
             try:
-                return bool(mode_dict.get("enabled", True))
+                v = float(x)
+            except Exception:
+                return None
+            if not math.isfinite(v):
+                return None
+            return v
+
+        def _valid_price(x) -> float | None:
+            v = _as_float(x)
+            if v is None or not v:
+                return None
+            return v
+
+        def _mode_enabled_for_active_mode() -> bool:
+            try:
+                bucket = entries.get(mode) if isinstance(entries, dict) else {}
+                bucket = bucket if isinstance(bucket, dict) else {}
+                enabled = bucket.get("enabled", True)
+                return enabled is not False
             except Exception:
                 return True
 
-        def _entry_price(key: str, enabled: bool) -> str:
-            if not enabled:
-                return "—"
-            v = data.get(key)
-            return fmt(v) if v is not None else "—"
+        missing: list[str] = []
+        if not _mode_enabled_for_active_mode():
+            missing.append("режим отключён")
 
-        entry_price_aggressive = _entry_price("entry_price_aggressive", _mode_enabled(agg))
-        entry_price_neutral = _entry_price("entry_price_neutral", _mode_enabled(neu))
-        entry_price_conservative = _entry_price("entry_price_conservative", _mode_enabled(con))
+        entry_val = _valid_price(data.get(f"entry_price_{mode}"))
+        if entry_val is None:
+            missing.append("цена входа")
 
-        sl_by_mode = data.get("sl_by_mode") if isinstance(data.get("sl_by_mode"), dict) else None
-        tp_by_mode = data.get("tp_by_mode") if isinstance(data.get("tp_by_mode"), dict) else None
-        rr_by_mode = data.get("rr_by_mode") if isinstance(data.get("rr_by_mode"), dict) else None
-        if sl_by_mode is None:
-            sl_by_mode = {"aggressive": sl, "neutral": sl, "conservative": sl}
-        if tp_by_mode is None:
-            tp_by_mode = {
-                "aggressive": {"tvh1": tp1, "tvh2": tp2, "tvh3": "—"},
-                "neutral": {"tvh1": tp1, "tvh2": tp2},
-                "conservative": {"tvh1": tp1, "tvh2_or_trail": tp2},
-            }
-        if rr_by_mode is None:
-            rr_by_mode = {"aggressive": rr, "neutral": rr, "conservative": rr}
+        sl_by_mode = data.get("sl_by_mode") if isinstance(data.get("sl_by_mode"), dict) else {}
+        sl_val = _valid_price(sl_by_mode.get(mode))
+        if sl_val is None:
+            missing.append("SL")
 
-        def _rr_value(x) -> str:
-            if x is None or x == "":
-                return "—"
-            if isinstance(x, (int, float)):
-                return fmt(x)
-            s = _one_line(str(x))
-            s = s.replace("RR", "").strip()
-            if s.startswith("1:"):
-                s = s[2:].strip()
-            return s or "—"
+        tp_by_mode = data.get("tp_by_mode") if isinstance(data.get("tp_by_mode"), dict) else {}
+        tp_bucket = tp_by_mode.get(mode) if isinstance(tp_by_mode.get(mode), dict) else {}
 
-        def _tvh(mode: str, key: str, fallback: str = "—") -> str:
-            bucket = tp_by_mode.get(mode) or {}
-            if key in bucket and bucket.get(key) is not None and bucket.get(key) != "":
-                return fmt(bucket.get(key))
-            # поддержка legacy tp1/tp2
-            if key == "tvh1" and bucket.get("tp1") is not None:
-                return fmt(bucket.get("tp1"))
-            if key in ("tvh2", "tvh2_or_trail") and bucket.get("tp2") is not None:
-                return fmt(bucket.get("tp2"))
-            return fmt(fallback) if fallback not in ("—", "", None) else "—"
+        def _tp_num(*keys: str) -> float | None:
+            for k in keys:
+                if k in tp_bucket:
+                    v = _valid_price(tp_bucket.get(k))
+                    if v is not None:
+                        return v
+            return None
 
-        def _sl(mode: str) -> str:
-            v = sl_by_mode.get(mode, sl)
-            return fmt(v) if v not in ("", None) else "—"
+        tp1_val = _tp_num("tvh1", "tp1")
+        if tp1_val is None:
+            missing.append("TP1")
 
-        lines.append("2️⃣ Сетап")
-        lines.append(f"Направление: {direction}")
-        lines.append(
-            "Цена входа: "
-            f"Agg {entry_price_aggressive} | Neutral {entry_price_neutral} | Cons {entry_price_conservative}"
-        )
-        lines.append(
-            "SL: "
-            f"Agg {_sl('aggressive')} | Neutral {_sl('neutral')} | Cons {_sl('conservative')}"
-        )
-        lines.append("ТВХ:")
-        lines.append("")
-        agg_bucket = tp_by_mode.get("aggressive") or {}
-        show_tvh3 = ("tvh3" in agg_bucket) and (agg_bucket.get("tvh3") is not None) and (agg_bucket.get("tvh3") != "")
-        lines.append(
-            "Agg: "
-            f"ТВХ1 {_tvh('aggressive','tvh1')} | ТВХ2 {_tvh('aggressive','tvh2')}"
-            + (f" | ТВХ3 {_tvh('aggressive','tvh3')}" if show_tvh3 else "")
-            + f" | RR 1:{_rr_value(rr_by_mode.get('aggressive'))}"
-        )
-        lines.append("")
-        lines.append(
-            "Neutral: "
-            f"ТВХ1 {_tvh('neutral','tvh1')} | ТВХ2 {_tvh('neutral','tvh2')} | "
-            f"RR 1:{_rr_value(rr_by_mode.get('neutral'))}"
-        )
-        lines.append("")
-        lines.append(
-            "Cons: "
-            f"ТВХ1 {_tvh('conservative','tvh1')} | ТВХ2/Trail {_tvh('conservative','tvh2_or_trail')} | "
-            f"RR 1:{_rr_value(rr_by_mode.get('conservative'))}"
-        )
-        lines.append("")
+        tp2_val = None
+        tp3_val = None
+        tp2_or_trail = None
+        if mode == "aggressive":
+            tp2_val = _tp_num("tvh2", "tp2")
+            if tp2_val is None:
+                missing.append("TP2")
+            tp3_val = _tp_num("tvh3", "tp3")  # optional (can be None)
+        elif mode == "neutral":
+            tp2_val = _tp_num("tvh2", "tp2")
+            if tp2_val is None:
+                missing.append("TP2")
+        else:  # conservative
+            raw = tp_bucket.get("tvh2_or_trail")
+            if isinstance(raw, str) and raw.strip().lower() == "trail":
+                tp2_or_trail = "trail"
+            else:
+                v = _valid_price(raw)
+                if v is None:
+                    v = _tp_num("tp2")
+                tp2_or_trail = v
+            if tp2_or_trail is None:
+                missing.append("TP2_or_trail")
+
+        rr_by_mode = data.get("rr_by_mode") if isinstance(data.get("rr_by_mode"), dict) else {}
+        rr_val = _valid_price(rr_by_mode.get(mode))
+        if rr_val is None:
+            missing.append("RR")
 
         exit_plan_by_mode = (
-            data.get("exit_plan_by_mode") if isinstance(data.get("exit_plan_by_mode"), dict) else None
+            data.get("exit_plan_by_mode") if isinstance(data.get("exit_plan_by_mode"), dict) else {}
         )
-        if exit_plan_by_mode is None:
-            plan = " ".join(x for x in [take_profit_rules, break_even_rule] if x).strip()
-            exit_plan_by_mode = {"aggressive": plan, "neutral": plan, "conservative": plan}
+        exit_plan = exit_plan_by_mode.get(mode)
+        exit_plan = _one_line(exit_plan) if isinstance(exit_plan, str) else ""
+        if not exit_plan:
+            missing.append("план выхода")
 
-        lines.append("План выхода:")
-        lines.append(f"Agg: {_one_line(exit_plan_by_mode.get('aggressive') or '') or '—'}")
-        lines.append(f"Neutral: {_one_line(exit_plan_by_mode.get('neutral') or '') or '—'}")
-        lines.append(f"Cons: {_one_line(exit_plan_by_mode.get('conservative') or '') or '—'}")
-        lines.append("")
+        mode_valid = not missing
+        if not mode_valid:
+            reason = f"Невалидные данные для режима {mode}: " + ", ".join(missing) + "."
+            reason = _truncate(reason, 220).rstrip(".").rstrip()
+            text_out = "\n".join(
+                [
+                    "📌 Сигнал не выдан",
+                    f"Причина: {reason}.",
+                    "Я продолжу мониторить рынок и дам обновление при появлении надёжного сетапа.",
+                ]
+            )
+        else:
+            lines.append("2️⃣ Сетап")
+            lines.append(f"Режим: {MODE_LABELS.get(mode, mode)}")
+            lines.append(f"Вход: {fmt(entry_val)}")
+            lines.append(f"SL: {fmt(sl_val)}")
+            if mode == "aggressive":
+                lines.append(f"TP1: {fmt(tp1_val)}")
+                lines.append(f"TP2: {fmt(tp2_val)}")
+                if tp3_val is not None:
+                    lines.append(f"TP3: {fmt(tp3_val)}")
+            elif mode == "neutral":
+                lines.append(f"TP1: {fmt(tp1_val)}")
+                lines.append(f"TP2: {fmt(tp2_val)}")
+            else:
+                lines.append(f"TP1: {fmt(tp1_val)}")
+                if tp2_or_trail == "trail":
+                    lines.append("TP2_or_trail: trail")
+                else:
+                    lines.append(f"TP2_or_trail: {fmt(tp2_or_trail)}")
+            lines.append(f"RR: 1:{fmt(rr_val)}")
+            lines.append(f"План выхода: {exit_plan}")
+            lines.append("")
 
         # 3) Таймфреймы
-        lines.append("3️⃣ Таймфреймы")
-        lines.append(
-            "5m: "
-            f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(str(mtf.get('m15','—')))}; "
-            f"1h: {_one_line(str(mtf.get('h1','—')))}; 4h: {_one_line(str(mtf.get('h4','—')))}; "
-            f"1D: {_one_line(str(mtf.get('d1','—')))}"
-        )
-        lines.append("")
+        if mode_valid:
+            lines.append("3️⃣ Таймфреймы")
+            lines.append(
+                "5m: "
+                f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(str(mtf.get('m15','—')))}; "
+                f"1h: {_one_line(str(mtf.get('h1','—')))}; 4h: {_one_line(str(mtf.get('h4','—')))}; "
+                f"1D: {_one_line(str(mtf.get('d1','—')))}"
+            )
+            lines.append("")
 
-        # 4) Новостной фон (1–3 строки, как в news_snapshot.py)
-        lines.append("4️⃣ Новостной фон")
-        news_lines: list[str] = []
-        for it in (news_ctx or []):
-            if len(news_lines) >= 3:
-                break
-            s = _one_line(str(it))
-            if s:
-                news_lines.append(s)
-        if not news_lines:
-            news_lines = [
-                f"- [{_now_msk_news_prefix()} МСК] [impact:neutral] Новостных триггеров не выявлено."
-            ]
-        lines.extend(news_lines)
-        lines.append("")
+        if mode_valid:
+            # 4) Новостной фон (1–3 строки, как в news_snapshot.py)
+            lines.append("4️⃣ Новостной фон")
+            news_lines: list[str] = []
+            for it in (news_ctx or []):
+                if len(news_lines) >= 3:
+                    break
+                s = _one_line(str(it))
+                if s:
+                    news_lines.append(s)
+            if not news_lines:
+                news_lines = [
+                    f"- [{_now_msk_news_prefix()} МСК] [impact:neutral] Новостных триггеров не выявлено."
+                ]
+            lines.extend(news_lines)
+            lines.append("")
 
-        # 5) Контекст рынка (одна строка)
-        lines.append("5️⃣ Контекст рынка")
-        lines.append(_truncate(market_ctx or "—", 220) or "—")
-        lines.append("")
-
-        # Обоснование (коротко)
-        lines.append("⚙️ Обоснование")
-        lines.append(_truncate(rationale or "—", 650) or "—")
-        lines.append("")
-
-        # Дисклеймер (одна строка)
-        lines.append("⚠️ Дисклеймер")
-        lines.append(_one_line(disclaimer) or "—")
-
-        text_out = trim_all_numbers("\n".join(lines))
+            # Дисклеймер (одна строка)
+            lines.append("⚠️ Дисклеймер")
+            lines.append(_one_line(disclaimer) or "—")
+            text_out = trim_all_numbers("\n".join(lines))
 
     text_out = trim_all_numbers(text_out)
 

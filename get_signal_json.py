@@ -1092,6 +1092,69 @@ def apply_entry_prices_from_ranges(d: dict) -> None:
     d["entry_price_conservative"] = _round_price(cons_mid)
 
 
+def enforce_entry_price_order(d: dict) -> None:
+    """
+    Гарантирует геометрию entry_price_*:
+    - SHORT: aggressive <= neutral <= conservative
+    - LONG:  aggressive >= neutral >= conservative
+    Корректирует ТОЛЬКО entry_price_* (side/direction/TP/SL/RR не трогает).
+    """
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return
+
+    def _as_float(x):
+        try:
+            v = float(x)
+        except Exception:
+            return None
+        if not math.isfinite(v):
+            return None
+        return v
+
+    agg = _as_float(d.get("entry_price_aggressive"))
+    neu = _as_float(d.get("entry_price_neutral"))
+    cons = _as_float(d.get("entry_price_conservative"))
+
+    ref = neu
+    if ref is None:
+        ref = _as_float(_mid_from_range(d.get("entry_range")))
+    if ref is None:
+        entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+        ref = _as_float(_mid_from_range(((entries.get("neutral") or {}).get("range"))))
+    if ref is None:
+        ref = agg if agg is not None else cons
+
+    if ref is None:
+        return
+
+    if agg is None:
+        agg = ref
+    if neu is None:
+        neu = ref
+    if cons is None:
+        cons = ref
+
+    if side == "short":
+        if agg > neu:
+            agg = neu
+        if cons < neu:
+            cons = neu
+        if agg > cons:
+            agg = cons
+    else:  # long
+        if agg < neu:
+            agg = neu
+        if cons > neu:
+            cons = neu
+        if agg < cons:
+            agg = cons
+
+    d["entry_price_aggressive"] = _round_price(agg)
+    d["entry_price_neutral"] = _round_price(neu)
+    d["entry_price_conservative"] = _round_price(cons)
+
+
 def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
     """
     Гарантирует наличие sl_by_mode/tp_by_mode/rr_by_mode/exit_plan_by_mode,
@@ -1413,6 +1476,90 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
     return d
 
 
+def validate_active_mode_setup(d: dict) -> dict:
+    """
+    Mode-specific validation (render contract):
+    - проверяет, что для текущего режима есть entry/sl/tp/rr/exit_plan;
+    - НЕ меняет торговую логику и НЕ пересчитывает уровни;
+    - при невалидности помечает no_trade с понятным комментарием.
+    """
+    if bool(d.get("no_trade")):
+        return d
+
+    mode = normalize_mode(d.get("mode"))
+    entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+    bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
+    try:
+        enabled = bucket.get("enabled", True)
+    except Exception:
+        enabled = True
+    if enabled is False:
+        d["no_trade"] = True
+        d.setdefault("no_trade_reasons", []).append("mode_disabled")
+        d["no_trade_hint"] = f"Текущий режим ({mode}) отключён фильтром/валидатором — сигнал не выдан."
+        return d
+
+    missing: list[str] = []
+
+    entry = _to_float(d.get(f"entry_price_{mode}"))
+    if entry is None or not entry:
+        missing.append("цена входа")
+
+    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+    sl_val = _to_float(sl_by_mode.get(mode))
+    if sl_val is None or not sl_val:
+        missing.append("SL")
+
+    tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+    tp_bucket = tp_by_mode.get(mode) if isinstance(tp_by_mode.get(mode), dict) else {}
+
+    def _tp_num(*keys: str) -> float | None:
+        for k in keys:
+            if k in tp_bucket:
+                v = _to_float(tp_bucket.get(k))
+                if v is not None and v:
+                    return v
+        return None
+
+    if mode == "aggressive":
+        if _tp_num("tvh1", "tp1") is None:
+            missing.append("TP1")
+        if _tp_num("tvh2", "tp2") is None:
+            missing.append("TP2")
+        # TP3 optional: может быть null (не валидируем как обязательный)
+    elif mode == "neutral":
+        if _tp_num("tvh1", "tp1") is None:
+            missing.append("TP1")
+        if _tp_num("tvh2", "tp2") is None:
+            missing.append("TP2")
+    else:  # conservative
+        if _tp_num("tvh1", "tp1") is None:
+            missing.append("TP1")
+        tvh2_or_trail = tp_bucket.get("tvh2_or_trail")
+        ok_trail = isinstance(tvh2_or_trail, str) and tvh2_or_trail.strip().lower() == "trail"
+        ok_num = _to_float(tvh2_or_trail) is not None and bool(_to_float(tvh2_or_trail))
+        ok_legacy_num = _tp_num("tp2") is not None
+        if not (ok_trail or ok_num or ok_legacy_num):
+            missing.append("TP2_or_trail")
+
+    rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else {}
+    rr_val = _to_float(rr_by_mode.get(mode))
+    if rr_val is None or rr_val <= 0:
+        missing.append("RR")
+
+    ep_by_mode = d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else {}
+    ep_txt = ep_by_mode.get(mode)
+    if not isinstance(ep_txt, str) or not ep_txt.strip():
+        missing.append("план выхода")
+
+    if missing:
+        d["no_trade"] = True
+        d.setdefault("no_trade_reasons", []).append("invalid_mode_setup")
+        miss = ", ".join(missing)
+        d["no_trade_hint"] = f"Невалидные данные для текущего режима ({mode}): отсутствует/некорректно: {miss}."
+    return d
+
+
 def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool = True) -> dict:
     hints = hints or {}
     d = data or {}
@@ -1554,12 +1701,14 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     try:
         apply_ema_blocks_and_derivatives(d, sym_for_ema)
         apply_entry_prices_from_ranges(d)
+        enforce_entry_price_order(d)
     except Exception:
         pass
 
     apply_ema_exhale_filter(d)
 
     validate_or_fallback_tvh_by_mode(d)
+    validate_active_mode_setup(d)
     return normalize_no_trade(d)
 
 
