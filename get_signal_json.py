@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import math
+import time
 import argparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,7 +38,18 @@ def _normalize_timeframe(timeframe: str) -> str:
     return tf
 
 
-def _fetch_closes(timeframe: str, *, symbol: str, limit: int) -> list[float] | None:
+def _cache_ttl_seconds(timeframe: str) -> int:
+    tf = _normalize_timeframe(timeframe)
+    if tf == "15m":
+        return 60
+    if tf == "1h":
+        return 180
+    return 0
+
+
+def _fetch_closes(
+    timeframe: str, *, symbol: str, limit: int, min_len: int = 1
+) -> list[float] | None:
     tf = _normalize_timeframe(timeframe)
     try:
         lim = int(limit)
@@ -45,19 +57,33 @@ def _fetch_closes(timeframe: str, *, symbol: str, limit: int) -> list[float] | N
         lim = 0
     if lim <= 0:
         return None
+    try:
+        min_required = int(min_len)
+    except Exception:
+        min_required = 1
+    if min_required <= 0:
+        min_required = 1
 
     cache_key = (symbol, tf)
     cached = _CLOSES_CACHE.get(cache_key) or {}
     cached_closes = cached.get("closes")
-    if isinstance(cached_closes, list) and len(cached_closes) >= lim:
-        return cached_closes
+    cached_ts = cached.get("ts")
+    ttl = _cache_ttl_seconds(tf)
+    if ttl > 0 and isinstance(cached_ts, (int, float)) and isinstance(cached_closes, list):
+        try:
+            age = time.time() - float(cached_ts)
+        except Exception:
+            age = ttl + 1
+        if age <= ttl and len(cached_closes) >= min_required:
+            return cached_closes
 
+    # источник: приоритет Bybit → fallback Binance; если Bybit вернул closes, Binance не дергаем
     for ex in (ccxt.bybit(), ccxt.binance()):
         try:
             ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
             closes = [float(c[4]) for c in ohlcv if len(c) >= 5 and c[4] is not None]
-            if closes:
-                _CLOSES_CACHE[cache_key] = {"closes": closes}
+            if len(closes) >= min_required:
+                _CLOSES_CACHE[cache_key] = {"ts": time.time(), "closes": closes}
                 return closes
         except Exception:
             pass
@@ -75,7 +101,7 @@ def get_ema(period: int, timeframe: str, *, symbol: str):
     tf = _normalize_timeframe(timeframe)
     # чуть больше минимального окна, чтобы снизить шанс нехватки данных
     limit = max(p + 25, int(p * 1.25))
-    closes = _fetch_closes(tf, symbol=symbol, limit=limit)
+    closes = _fetch_closes(tf, symbol=symbol, limit=limit, min_len=p)
     if not closes:
         return None
     e = _ema(closes, p)
@@ -88,6 +114,16 @@ def get_ema20_m15(symbol: str):
 
 def get_ema20_h1(symbol: str):
     return get_ema(20, "1h", symbol=symbol)
+
+
+def _to_float(x) -> float | None:
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    return v
 
 
 # ---------- utils ----------
@@ -1055,11 +1091,16 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     hints = hints or {}
     d = data or {}
 
-    if hints.get("symbol"):
-        d["symbol"] = hints["symbol"]
+    # Защита от cross-symbol contamination в hints.*:
+    # hints.price / hints.ema* можно использовать только если hints.symbol == текущему d["symbol"].
+    hints_symbol = hints.get("symbol")
+    if not d.get("symbol") and hints_symbol:
+        d["symbol"] = hints_symbol
     if hints.get("time_msk"):
         d["time_msk"] = hints["time_msk"]
-    if "price" in hints and hints["price"] is not None:
+    symbol = d.get("symbol")
+    hints_match_symbol = bool(hints_symbol) and bool(symbol) and hints_symbol == symbol
+    if hints_match_symbol and "price" in hints and hints["price"] is not None:
         d["price"] = hints["price"]
     if "mode" in hints:
         mode_val = hints.get("mode")
@@ -1073,7 +1114,6 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     if not d.get("time_msk"):
         d["time_msk"] = current_msk()
 
-    symbol = d.get("symbol")
     if fetch_price and symbol and not d.get("price"):
         try:
             ticker = get_pair_ticker(symbol)
@@ -1083,16 +1123,42 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         except Exception:
             pass
 
-    sym_for_ema = hints.get("symbol") or symbol
+    sym_for_ema = symbol
     try:
-        if "ema20_m15" not in d or not d["ema20_m15"]:
-            d["ema20_m15"] = hints.get("ema20_m15") or (
-                get_ema20_m15(sym_for_ema) if sym_for_ema else None
-            )
-        if "ema20_h1" not in d or not d["ema20_h1"]:
-            d["ema20_h1"] = hints.get("ema20_h1") or (
-                get_ema20_h1(sym_for_ema) if sym_for_ema else None
-            )
+        ema20_m15 = _to_float(hints.get("ema20_m15")) if hints_match_symbol else None
+        if ema20_m15 is None:
+            ema20_m15 = _to_float(d.get("ema20_m15"))
+        if ema20_m15 is None and sym_for_ema:
+            ema20_m15 = get_ema20_m15(sym_for_ema)
+        d["ema20_m15"] = ema20_m15
+
+        ema20_h1 = _to_float(hints.get("ema20_h1")) if hints_match_symbol else None
+        if ema20_h1 is None:
+            ema20_h1 = _to_float(d.get("ema20_h1"))
+        if ema20_h1 is None and sym_for_ema:
+            ema20_h1 = get_ema20_h1(sym_for_ema)
+        d["ema20_h1"] = ema20_h1
+    except Exception:
+        pass
+
+    # Минимальная самопроверка источника EMA (только warnings, без блокировок)
+    try:
+        warnings = d.setdefault("warnings", [])
+        ema20_m15 = _to_float(d.get("ema20_m15"))
+        ema20_h1 = _to_float(d.get("ema20_h1"))
+        price_val = _to_float(d.get("price"))
+
+        if ema20_m15 is None and ema20_h1 is None:
+            if "ema_source_missing" not in warnings:
+                warnings.append("ema_source_missing")
+        elif (
+            price_val
+            and ema20_m15 is not None
+            and ema20_h1 is not None
+            and abs(ema20_m15 - ema20_h1) / price_val > 0.05
+        ):
+            if "ema_source_suspect" not in warnings:
+                warnings.append("ema_source_suspect")
     except Exception:
         pass
 
