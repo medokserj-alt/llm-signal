@@ -16,17 +16,9 @@ import pathlib as _pl
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 
-# ---- EMA20 helpers ----
-def _ema(vals, period=20):
-    if not vals or len(vals) < period:
-        return None
-    k = 2.0 / (period + 1.0)
-    ema = float(vals[-period])
-    for v in vals[-period + 1:]:
-        ema = float(v) * k + ema * (1.0 - k)
-    return round(ema, 6)
-
-_CLOSES_CACHE: dict[tuple[str, str], dict] = {}
+# ---- EMA helpers (Bybit Futures-aligned) ----
+_CLOSES_CACHE: dict[tuple[str, str, str], dict] = {}
+_EXCHANGES: dict[str, object] = {}
 
 
 def _normalize_timeframe(timeframe: str) -> str:
@@ -47,14 +39,148 @@ def _cache_ttl_seconds(timeframe: str) -> int:
     return 0
 
 
-def _fetch_closes(
-    timeframe: str, *, symbol: str, limit: int, min_len: int = 1
-) -> list[float] | None:
+def _timeframe_ms(tf: str) -> int:
+    tf = _normalize_timeframe(tf)
+    if tf == "15m":
+        return 15 * 60 * 1000
+    if tf == "1h":
+        return 60 * 60 * 1000
+    return 0
+
+
+def _normalize_bybit_swap_symbol(symbol: str) -> str:
+    s = (symbol or "").strip()
+    if not s:
+        return s
+    if ":" in s:
+        return s
+    # ccxt Bybit linear USDT perpetual обычно использует формат вида "BTC/USDT:USDT"
+    if s.upper().endswith("/USDT"):
+        return f"{s}:USDT"
+    return s
+
+
+def _get_exchange(name: str):
+    ex = _EXCHANGES.get(name)
+    if ex is not None:
+        return ex
+    if name == "bybit_swap":
+        ex = ccxt.bybit(
+            {
+                "enableRateLimit": True,
+                "options": {
+                    "defaultType": "swap",  # важно: USDT Perpetual (linear swap), как в разделе "Фьючерсы"
+                },
+            }
+        )
+    elif name == "binance_future":
+        ex = ccxt.binance(
+            {
+                "enableRateLimit": True,
+                "options": {
+                    "defaultType": "future",
+                },
+            }
+        )
+    else:
+        ex = ccxt.binance({"enableRateLimit": True})
+    _EXCHANGES[name] = ex
+    return ex
+
+
+def _fetch_ohlcv_paginated(
+    ex,
+    *,
+    symbol: str,
+    timeframe: str,
+    target_len: int,
+    chunk_limit: int,
+    since: int | None,
+) -> list[list]:
     tf = _normalize_timeframe(timeframe)
+    ms = _timeframe_ms(tf)
+    if ms <= 0:
+        return []
+
+    out: list[list] = []
+    seen_ts: set[int] = set()
+    loops = 0
+    max_loops = max(10, (target_len // max(1, chunk_limit)) + 5)
+
+    next_since = since
+    while len(out) < target_len and loops < max_loops:
+        loops += 1
+        try:
+            remaining = target_len - len(out)
+            lim = min(int(chunk_limit), int(remaining))
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, since=next_since, limit=lim)
+        except Exception:
+            break
+        if not ohlcv:
+            break
+
+        # ccxt обычно возвращает по возрастанию времени; но мы защитимся от дублей/перестановок
+        ohlcv_sorted = sorted(
+            [c for c in ohlcv if isinstance(c, (list, tuple)) and len(c) >= 5],
+            key=lambda c: int(c[0]),
+        )
+        appended_any = False
+        last_ts = None
+        for c in ohlcv_sorted:
+            try:
+                ts = int(c[0])
+            except Exception:
+                continue
+            if ts in seen_ts:
+                continue
+            seen_ts.add(ts)
+            out.append(list(c))
+            appended_any = True
+            last_ts = ts
+
+        if not appended_any or last_ts is None:
+            break
+
+        # двигаем since на следующую свечу, чтобы не зациклиться на дублях
+        next_since = last_ts + ms
+
+    return out
+
+
+def _fetch_closes_from_market(
+    market: str,
+    timeframe: str,
+    *,
+    symbol: str,
+    limit: int,
+    min_len: int,
+) -> dict | None:
+    tf = _normalize_timeframe(timeframe)
+    ttl = _cache_ttl_seconds(tf)
+
+    if market == "bybit_swap":
+        ex_symbol = _normalize_bybit_swap_symbol(symbol)
+    else:
+        ex_symbol = (symbol or "").strip()
+
+    cache_key = (ex_symbol, tf, market)
+    cached = _CLOSES_CACHE.get(cache_key) or {}
+    cached_closes = cached.get("closes")
+    cached_fetched_at = cached.get("fetched_at")
+    ttl_ok = False
+    if ttl > 0 and isinstance(cached_fetched_at, (int, float)) and isinstance(cached_closes, list):
+        try:
+            age = time.time() - float(cached_fetched_at)
+        except Exception:
+            age = ttl + 1
+        ttl_ok = age <= ttl
+    if ttl_ok and len(cached_closes) >= min_len:
+        return cached
+
     try:
         lim = int(limit)
     except Exception:
-        lim = 0
+        return None
     if lim <= 0:
         return None
     try:
@@ -64,33 +190,80 @@ def _fetch_closes(
     if min_required <= 0:
         min_required = 1
 
-    cache_key = (symbol, tf)
-    cached = _CLOSES_CACHE.get(cache_key) or {}
-    cached_closes = cached.get("closes")
-    cached_ts = cached.get("ts")
-    ttl = _cache_ttl_seconds(tf)
-    if ttl > 0 and isinstance(cached_ts, (int, float)) and isinstance(cached_closes, list):
-        try:
-            age = time.time() - float(cached_ts)
-        except Exception:
-            age = ttl + 1
-        if age <= ttl and len(cached_closes) >= min_required:
-            return cached_closes
+    ex = _get_exchange(market)
+    ms = _timeframe_ms(tf)
+    if ms <= 0:
+        return None
+    now_ms = int(time.time() * 1000)
+    since = now_ms - (lim * ms)
 
-    # источник: приоритет Bybit → fallback Binance; если Bybit вернул closes, Binance не дергаем
-    for ex in (ccxt.bybit(), ccxt.binance()):
+    chunk = 200 if market == "bybit_swap" else 1000
+    ohlcv = _fetch_ohlcv_paginated(
+        ex,
+        symbol=ex_symbol,
+        timeframe=tf,
+        target_len=lim,
+        chunk_limit=chunk,
+        since=since,
+    )
+    if not ohlcv:
+        return None
+
+    closes: list[float] = []
+    last_candle_ts = None
+    for c in ohlcv:
+        if len(c) < 5:
+            continue
+        if c[4] is None:
+            continue
         try:
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
-            closes = [float(c[4]) for c in ohlcv if len(c) >= 5 and c[4] is not None]
-            if len(closes) >= min_required:
-                _CLOSES_CACHE[cache_key] = {"ts": time.time(), "closes": closes}
-                return closes
+            closes.append(float(c[4]))
+        except Exception:
+            continue
+        try:
+            last_candle_ts = int(c[0])
         except Exception:
             pass
-    return None
+
+    if len(closes) < min_required:
+        return None
+
+    snap = {
+        "market": market,
+        "symbol": ex_symbol,
+        "timeframe": tf,
+        "last_candle_ts": last_candle_ts,
+        "fetched_at": time.time(),
+        "closes": closes,
+    }
+    _CLOSES_CACHE[cache_key] = snap
+    return snap
 
 
-def get_ema(period: int, timeframe: str, *, symbol: str):
+def _ema_sma_seed(closes: list[float], period: int) -> float | None:
+    if not closes:
+        return None
+    try:
+        p = int(period)
+    except Exception:
+        return None
+    if p <= 1 or len(closes) < p:
+        return None
+
+    # Инициализация EMA как SMA первых p значений (как на биржах/в терминалах)
+    seed = sum(closes[:p]) / float(p)
+    k = 2.0 / (float(p) + 1.0)
+    ema = float(seed)
+    for v in closes[p:]:
+        ema = float(v) * k + ema * (1.0 - k)
+    return ema
+
+
+def get_ema(period: int, timeframe: str, *, symbol: str) -> float | None:
+    """
+    EMA, считающаяся "по-людски" (SMA seed + итерация) и по рынку Bybit USDT Perpetual (swap/linear),
+    с длинным warm-up окном, чтобы совпадать по смыслу с индикаторами на бирже.
+    """
     try:
         p = int(period)
     except Exception:
@@ -99,13 +272,28 @@ def get_ema(period: int, timeframe: str, *, symbol: str):
         return None
 
     tf = _normalize_timeframe(timeframe)
-    # чуть больше минимального окна, чтобы снизить шанс нехватки данных
-    limit = max(p + 25, int(p * 1.25))
-    closes = _fetch_closes(tf, symbol=symbol, limit=limit, min_len=p)
-    if not closes:
-        return None
-    e = _ema(closes, p)
-    return float(e) if e is not None else None
+    warmup_len = max(500, p * 20)
+
+    # Источник: приоритет Bybit swap (USDT perpetual), затем fallback Binance (по возможности futures)
+    for market in ("bybit_swap", "binance_future"):
+        snap = _fetch_closes_from_market(
+            market,
+            tf,
+            symbol=symbol,
+            limit=warmup_len,
+            min_len=p,
+        )
+        if not snap:
+            continue
+        closes = snap.get("closes") if isinstance(snap.get("closes"), list) else None
+        if not closes:
+            continue
+        ema_val = _ema_sma_seed(closes, p)
+        if ema_val is None:
+            continue
+        return round(float(ema_val), 6)
+
+    return None
 
 
 def get_ema20_m15(symbol: str):
@@ -114,6 +302,28 @@ def get_ema20_m15(symbol: str):
 
 def get_ema20_h1(symbol: str):
     return get_ema(20, "1h", symbol=symbol)
+
+
+def debug_get_ema_snapshot(symbol: str) -> dict:
+    """
+    Диагностическая функция для ручного сравнения с Bybit Futures (USDT perpetual).
+    Не вызывается автоматически.
+    """
+    sym = (symbol or "").strip()
+    out = {"symbol": sym, "market": "bybit_swap", "m15": {}, "h1": {}}
+    for tf, key in (("15m", "m15"), ("1h", "h1")):
+        for p in (9, 12, 20):
+            snap = _fetch_closes_from_market(
+                "bybit_swap",
+                tf,
+                symbol=sym,
+                limit=max(500, p * 20),
+                min_len=p,
+            )
+            closes = snap.get("closes") if isinstance(snap, dict) else None
+            ema_val = _ema_sma_seed(closes, p) if isinstance(closes, list) else None
+            out[key][f"ema{p}"] = round(float(ema_val), 6) if ema_val is not None else None
+    return out
 
 
 def _to_float(x) -> float | None:
