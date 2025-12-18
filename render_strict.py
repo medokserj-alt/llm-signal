@@ -229,10 +229,13 @@ def main():
         )
         lines.append("ТВХ:")
         lines.append("")
+        agg_bucket = tp_by_mode.get("aggressive") or {}
+        show_tvh3 = ("tvh3" in agg_bucket) and (agg_bucket.get("tvh3") is not None) and (agg_bucket.get("tvh3") != "")
         lines.append(
             "Agg: "
-            f"ТВХ1 {_tvh('aggressive','tvh1')} | ТВХ2 {_tvh('aggressive','tvh2')} | ТВХ3 {_tvh('aggressive','tvh3')} | "
-            f"RR 1:{_rr_value(rr_by_mode.get('aggressive'))}"
+            f"ТВХ1 {_tvh('aggressive','tvh1')} | ТВХ2 {_tvh('aggressive','tvh2')}"
+            + (f" | ТВХ3 {_tvh('aggressive','tvh3')}" if show_tvh3 else "")
+            + f" | RR 1:{_rr_value(rr_by_mode.get('aggressive'))}"
         )
         lines.append("")
         lines.append(

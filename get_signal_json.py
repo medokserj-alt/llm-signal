@@ -1116,6 +1116,53 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
         return d
     is_long = side == "long"
 
+    ema_m15 = d.get("ema_m15") if isinstance(d.get("ema_m15"), dict) else {}
+    ema_h1 = d.get("ema_h1") if isinstance(d.get("ema_h1"), dict) else {}
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+    fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+
+    def _ema_from(block: dict, key: str) -> float | None:
+        v = _as_float(block.get(key))
+        return v
+
+    def _fan_aligned(state: str) -> bool:
+        return (is_long and state == "bull") or ((not is_long) and state == "bear")
+
+    fan_state = fan_m15 if fan_m15 in ("bull", "bear") else (fan_h1 if fan_h1 in ("bull", "bear") else "mixed")
+    fan_is_mixed_or_against = (fan_state == "mixed") or (not _fan_aligned(fan_state))
+
+    def _nearest_in_direction(values: list[float | None], *, above: float) -> float | None:
+        cands = []
+        for v in values:
+            vv = _as_float(v)
+            if vv is None:
+                continue
+            if is_long and vv > above:
+                cands.append(vv)
+            if (not is_long) and vv < above:
+                cands.append(vv)
+        if not cands:
+            return None
+        return min(cands) if is_long else max(cands)
+
+    def _ensure_monotonic(entry: float, a: float, b: float, c: float | None) -> tuple[float, float, float | None]:
+        min_step = abs(entry) * 0.001
+        if is_long:
+            if not (a > entry):
+                a = entry + max(min_step, abs(entry) * 0.005)
+            if not (b > a):
+                b = a + max(min_step, abs(entry) * 0.005)
+            if c is not None and not (c > b):
+                c = b + max(min_step, abs(entry) * 0.005)
+        else:
+            if not (a < entry):
+                a = entry - max(min_step, abs(entry) * 0.005)
+            if not (b < a):
+                b = a - max(min_step, abs(entry) * 0.005)
+            if c is not None and not (c < b):
+                c = b - max(min_step, abs(entry) * 0.005)
+        return a, b, c
+
     def _entry_price_by_mode(mode: str) -> float | None:
         k = f"entry_price_{mode}"
         v = _as_float(d.get(k))
@@ -1205,40 +1252,86 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
             tvh2 = _pick_num("tvh2", "tp2")
             tvh3 = _pick_num("tvh3", "tp3")
             if tvh1 is None or not _valid_tvh(entry, tvh1):
-                tvh1 = entry * (1.005 if is_long else 0.995)
+                fast_tvh = _nearest_in_direction(
+                    [
+                        _ema_from(ema_m15, "ema9"),
+                        _ema_from(ema_m15, "ema12"),
+                    ],
+                    above=entry,
+                )
+                tvh1 = fast_tvh if fast_tvh is not None else entry * (1.005 if is_long else 0.995)
             if tvh2 is None or not _valid_tvh(entry, tvh2):
-                tvh2 = entry * (1.01 if is_long else 0.99)
-            if tvh3 is None or not _valid_tvh(entry, tvh3):
-                tvh3 = entry * (1.02 if is_long else 0.98)
+                thr = (
+                    max(entry, float(tvh1) if _as_float(tvh1) is not None else entry)
+                    if is_long
+                    else min(entry, float(tvh1) if _as_float(tvh1) is not None else entry)
+                )
+                mid_tvh = _nearest_in_direction(
+                    [
+                        _ema_from(ema_m15, "ema20"),
+                        _ema_from(ema_h1, "ema20"),
+                    ],
+                    above=thr,
+                )
+                tvh2 = mid_tvh if mid_tvh is not None else entry * (1.01 if is_long else 0.99)
+
+            # VARIANT A: TP3 только если fan_state != mixed (и не против направления); иначе null.
+            if fan_is_mixed_or_against:
+                tvh3 = None
+            else:
+                if tvh3 is None or not _valid_tvh(entry, tvh3):
+                    thr = (
+                        max(entry, float(tvh2) if _as_float(tvh2) is not None else entry)
+                        if is_long
+                        else min(entry, float(tvh2) if _as_float(tvh2) is not None else entry)
+                    )
+                    far_tvh = _nearest_in_direction(
+                        [
+                            _ema_from(ema_h1, "ema20"),
+                            _ema_from(ema_h1, "ema50"),
+                            _ema_from(ema_h1, "ema200"),
+                        ],
+                        above=thr,
+                    )
+                    tvh3 = far_tvh if far_tvh is not None else entry * (1.02 if is_long else 0.98)
 
             tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
             tvh2 = float(_round_price(tvh2) if _round_price(tvh2) is not None else tvh2)
-            tvh3 = float(_round_price(tvh3) if _round_price(tvh3) is not None else tvh3)
-            if is_long and not (tvh1 < tvh2 < tvh3):
-                tvh1 = float(_round_price(entry * 1.005) or (entry * 1.005))
-                tvh2 = float(_round_price(entry * 1.01) or (entry * 1.01))
-                tvh3 = float(_round_price(entry * 1.02) or (entry * 1.02))
-            if (not is_long) and not (tvh1 > tvh2 > tvh3):
-                tvh1 = float(_round_price(entry * 0.995) or (entry * 0.995))
-                tvh2 = float(_round_price(entry * 0.99) or (entry * 0.99))
-                tvh3 = float(_round_price(entry * 0.98) or (entry * 0.98))
+            tvh3_val = _as_float(tvh3)
+            tvh3 = float(_round_price(tvh3_val) if (tvh3_val is not None and _round_price(tvh3_val) is not None) else tvh3_val) if tvh3_val is not None else None
+
+            tvh1, tvh2, tvh3 = _ensure_monotonic(entry, tvh1, tvh2, tvh3)
             out_bucket = {"tvh1": tvh1, "tvh2": tvh2, "tvh3": tvh3}
 
         elif mode == "neutral":
             tvh1 = _pick_num("tvh1", "tp1")
             tvh2 = _pick_num("tvh2", "tp2")
             if tvh1 is None or not _valid_tvh(entry, tvh1):
-                tvh1 = entry * (1.01 if is_long else 0.99)
+                mid_tvh = _nearest_in_direction(
+                    [
+                        _ema_from(ema_m15, "ema20"),
+                        _ema_from(ema_h1, "ema20"),
+                    ],
+                    above=entry,
+                )
+                tvh1 = mid_tvh if mid_tvh is not None else entry * (1.01 if is_long else 0.99)
             if tvh2 is None or not _valid_tvh(entry, tvh2):
-                tvh2 = entry * (1.02 if is_long else 0.98)
+                thr = (
+                    max(entry, float(tvh1) if _as_float(tvh1) is not None else entry)
+                    if is_long
+                    else min(entry, float(tvh1) if _as_float(tvh1) is not None else entry)
+                )
+                h1_tvh = _nearest_in_direction(
+                    [
+                        _ema_from(ema_h1, "ema20"),
+                        _ema_from(ema_h1, "ema50"),
+                    ],
+                    above=thr,
+                )
+                tvh2 = h1_tvh if h1_tvh is not None else entry * (1.02 if is_long else 0.98)
             tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
             tvh2 = float(_round_price(tvh2) if _round_price(tvh2) is not None else tvh2)
-            if is_long and not (tvh1 < tvh2):
-                tvh1 = float(_round_price(entry * 1.01) or (entry * 1.01))
-                tvh2 = float(_round_price(entry * 1.02) or (entry * 1.02))
-            if (not is_long) and not (tvh1 > tvh2):
-                tvh1 = float(_round_price(entry * 0.99) or (entry * 0.99))
-                tvh2 = float(_round_price(entry * 0.98) or (entry * 0.98))
+            tvh1, tvh2, _ = _ensure_monotonic(entry, tvh1, tvh2, None)
             out_bucket = {"tvh1": tvh1, "tvh2": tvh2}
 
         else:  # conservative
@@ -1252,8 +1345,16 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                     tvh2_or_trail = None
 
             if tvh1 is None or not _valid_tvh(entry, tvh1):
-                tvh1 = entry * (1.02 if is_long else 0.98)
+                near_tvh = _nearest_in_direction(
+                    [
+                        _ema_from(ema_m15, "ema20"),
+                        _ema_from(ema_h1, "ema20"),
+                    ],
+                    above=entry,
+                )
+                tvh1 = near_tvh if near_tvh is not None else entry * (1.02 if is_long else 0.98)
             tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
+            tvh1, _, _ = _ensure_monotonic(entry, tvh1, tvh1, None)
 
             if tvh2_or_trail is None:
                 tvh2_or_trail = "trail"
@@ -1277,6 +1378,21 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
 
         if mode == active_mode and (rr_val is None or rr_val < rr_min_by_mode[mode]):
             rr_ok_for_active_mode = False
+
+    # Если TP3 отключён (mixed/против направления) — не показываем TP3 в плане выхода, используем trail.
+    try:
+        agg_bucket = tp_by_mode.get("aggressive") if isinstance(tp_by_mode.get("aggressive"), dict) else {}
+        if agg_bucket.get("tvh3") is None:
+            txt = str(exit_plan_by_mode.get("aggressive") or "").strip()
+            low = txt.lower()
+            if txt and ("trail" not in low and "трейл" not in low):
+                exit_plan_by_mode["aggressive"] = (txt + " Дальше — trail.").strip()
+    except Exception:
+        pass
+
+    # Страховка структуры (в т.ч. при пропусках entry): ключи режимов всегда присутствуют.
+    for m in VALID_MODES:
+        rr_by_mode.setdefault(m, 0.0)
 
     d["sl_by_mode"] = sl_by_mode
     d["tp_by_mode"] = tp_by_mode
@@ -1614,20 +1730,26 @@ if args.multi:
         "EMA в этом шаге — ТОЛЬКО контекст для мышления при формировании ТВХ/TP (tp_by_mode) и логики выхода "
         "(exit_plan_by_mode). НЕ делай EMA обязательным правилом, НЕ вводи новых no-trade правил и НЕ меняй "
         "выбор направления (direction) из-за EMA.\n"
-        "Используй уже существующие поля из входных данных/контекста:\n"
-        "- ema_m15, ema_h1\n"
-        "- ema_fan_m15_state, ema_fan_h1_state\n"
-        "- pivot_ema_hint_by_mode\n"
-        "Требование для tp_by_mode:\n"
-        "- если EMA-fan расширен (bull/bear) и быстрые EMA (EMA9/12) заметно удалены от EMA20, цели могут быть шире "
-        "(дальше TVH, трейлинг позже)\n"
-        "- если EMA-fan схлопывается к EMA20 (быстрые EMA близко к EMA20 / состояние mixed / потеря импульса), цели ближе "
-        "и трейлинг/BE раньше\n"
-        "- ориентируйся на pivot_ema_hint_by_mode: aggressive → EMA9/EMA12, neutral → EMA20, conservative → EMA50\n"
-        "Требование для exit_plan_by_mode:\n"
-        "- для каждого режима (aggressive/neutral/conservative) добавь ОДНУ короткую фразу-пояснение, "
-        "почему цели такие (без чисел EMA; используй формулировки «быстрая/средняя/медленная EMA», "
-        "«fan расширяется/схлопывается», «трейлинг раньше/позже»).\n"
+        "Используй уже существующие поля:\n"
+        "- ema_m15, ema_h1 (уже рассчитанные EMA)\n"
+        "- ema_fan_m15_state, ema_fan_h1_state (bull/bear/mixed)\n"
+        "- pivot_ema_hint_by_mode (какой EMA использовать как якорь по режиму)\n"
+        "\nТРЕБОВАНИЕ (VARIANT A, по режимам) для tp_by_mode:\n"
+        "- aggressive: {tvh1, tvh2, tvh3}\n"
+        "  - tvh1: ближе (структура M15, ориентир на fast EMA9/EMA12)\n"
+        "  - tvh2: средняя цель (контекст EMA20 на M15–H1)\n"
+        "  - tvh3: дальняя цель ТОЛЬКО если fan_state != mixed; иначе tvh3 = null и вместо TP3 используй trail\n"
+        "- neutral: {tvh1, tvh2}\n"
+        "  - tvh1: около средней цели (EMA20)\n"
+        "  - tvh2: дальше (H1 контекст)\n"
+        "- conservative: {tvh1, tvh2_or_trail}\n"
+        "  - tvh1: ближе\n"
+        "  - tvh2_or_trail: всегда строка \"trail\" (дальше только трейлинг)\n"
+        "Все tvh* должны быть ЧИСЛАМИ (не формулы вида \"entry+2%\"), строго в сторону direction.\n"
+        "\nТРЕБОВАНИЕ (VARIANT A) для exit_plan_by_mode:\n"
+        "- сделай реально разным для режимов; кратко (1–2 короткие строки на режим, можно одной строкой)\n"
+        "- обязательно словами (БЕЗ чисел EMA и БЕЗ процентов) упомяни логику:\n"
+        "  fan расширяется → цели шире / trail позже; fan схлопывается или mixed → цели ближе / trail раньше\n"
     )
 
     focus = build_news_focus("", news_block)
@@ -1830,16 +1952,25 @@ schema_single = (
     "EMA — не жёсткое правило и не повод блокировать сигнал. Используй EMA ТОЛЬКО как ориентир глубины целей "
     "и логики выхода (tp_by_mode + exit_plan_by_mode). Direction/side не меняй из-за EMA.\n"
     "Используй уже существующие поля:\n"
-    "- ema_m15, ema_h1\n"
-    "- ema_fan_m15_state, ema_fan_h1_state\n"
+    "- ema_m15, ema_h1 (уже рассчитанные EMA)\n"
+    "- ema_fan_m15_state, ema_fan_h1_state (bull/bear/mixed)\n"
     "- pivot_ema_hint_by_mode\n"
-    "Требование для tp_by_mode:\n"
-    "- если EMA-fan расширен (bull/bear) и быстрые EMA (EMA9/12) заметно удалены от EMA20 → цели шире, трейлинг позже\n"
-    "- если EMA-fan схлопывается к EMA20 → цели ближе, трейлинг/BE раньше\n"
-    "- pivot_ema_hint_by_mode: aggressive → EMA9/EMA12, neutral → EMA20, conservative → EMA50\n"
-    "Требование для exit_plan_by_mode:\n"
-    "- для каждого режима добавь ОДНУ короткую фразу, почему цели такие (без чисел EMA; "
-    "используй «быстрая/средняя/медленная EMA», «fan расширяется/схлопывается»).\n"
+    "\nТРЕБОВАНИЕ (VARIANT A, по режимам) для tp_by_mode:\n"
+    "- aggressive: {tvh1, tvh2, tvh3}\n"
+    "  - tvh1: ближе (структура M15, ориентир на fast EMA9/EMA12)\n"
+    "  - tvh2: средняя цель (контекст EMA20 на M15–H1)\n"
+    "  - tvh3: дальняя цель ТОЛЬКО если fan_state != mixed; иначе tvh3 = null и вместо TP3 используй trail\n"
+    "- neutral: {tvh1, tvh2}\n"
+    "  - tvh1: около средней цели (EMA20)\n"
+    "  - tvh2: дальше (H1 контекст)\n"
+    "- conservative: {tvh1, tvh2_or_trail}\n"
+    "  - tvh1: ближе\n"
+    "  - tvh2_or_trail: всегда строка \"trail\" (дальше только трейлинг)\n"
+    "Все tvh* должны быть ЧИСЛАМИ (не формулы вида \"entry+2%\"), строго в сторону direction.\n"
+    "\nТРЕБОВАНИЕ (VARIANT A) для exit_plan_by_mode:\n"
+    "- сделай реально разным для режимов; кратко (1–2 короткие строки на режим, можно одной строкой)\n"
+    "- обязательно словами (БЕЗ чисел EMA и БЕЗ процентов) упомяни логику:\n"
+    "  fan расширяется → цели шире / trail позже; fan схлопывается или mixed → цели ближе / trail раньше\n"
     "Все поля должны быть заполнены; если данных нет — используй осмысленное значение (например, пустой массив/строку), но ключ обязательно присутствует.\n"
 )
 
