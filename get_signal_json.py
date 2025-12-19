@@ -4,6 +4,7 @@ import sys
 import json
 import math
 import time
+import re
 import argparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -357,24 +358,13 @@ def normalize_mode(mode_val) -> str:
 
 def normalize_no_trade(d: dict) -> dict:
     """
-    Нормализует no_trade-ветку и чистит legacy-маркеры (time_window и тексты про ликвидность)
+    Нормализует no_trade-ветку (без “чистки” семантических маркеров).
     без изменения торговой логики (направление/EMA/фильтры).
     """
-    def _has_legacy(s: str) -> bool:
-        low = (s or "").lower()
-        if "time_window" in low:
-            return True
-        # Удаляем любые явные формулировки про "пониженную ликвидность"
-        if "понижен" in low and "ликвид" in low:
-            return True
-        if "окно" in low and "ликвид" in low:
-            return True
-        return False
-
     def _clean_str(s: str) -> str:
         if not isinstance(s, str):
             return ""
-        return "" if _has_legacy(s) else s.strip()
+        return s.strip()
 
     def _clean_list_str(xs) -> list[str]:
         if not isinstance(xs, list):
@@ -385,7 +375,7 @@ def normalize_no_trade(d: dict) -> dict:
             if not isinstance(it, str):
                 continue
             s = it.strip()
-            if not s or _has_legacy(s):
+            if not s:
                 continue
             if s not in seen:
                 seen.add(s)
@@ -424,6 +414,208 @@ def normalize_no_trade(d: dict) -> dict:
         d["no_trade_hint"] = _clean_str(d.get("no_trade_hint") or "")
 
     return d
+
+
+def _msk_minutes_from_time_str(time_msk_val) -> int | None:
+    """
+    Возвращает минуты от полуночи по Москве.
+    Поддерживает форматы:
+    - "dd.mm.yyyy, HH:MM"
+    - "HH:MM"
+    """
+    try:
+        s = str(time_msk_val or "").strip()
+    except Exception:
+        s = ""
+    if not s:
+        return None
+
+    m = re.findall(r"(\d{1,2}):(\d{2})", s)
+    if not m:
+        return None
+    hh_s, mm_s = m[-1]
+    try:
+        hh = int(hh_s)
+        mm = int(mm_s)
+    except Exception:
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return hh * 60 + mm
+
+
+def _in_danger_time_window_msk(mins: int) -> bool:
+    # ВАЖНО: не добавлять новые окна.
+    windows = (
+        (0, 2 * 60),  # 00:00–02:00
+        (8 * 60, 9 * 60),  # 08:00–09:00
+        (17 * 60 + 25, 17 * 60 + 45),  # 17:25–17:45
+        (18 * 60 + 55, 19 * 60 + 10),  # 18:55–19:10
+    )
+    return any(start <= mins < end for start, end in windows)
+
+
+def _tw_clear_artifacts(d: dict) -> None:
+    reasons = d.get("no_trade_reasons")
+    if isinstance(reasons, list):
+        d["no_trade_reasons"] = [
+            r for r in reasons if not (isinstance(r, str) and "time_window" in r)
+        ]
+    warnings = d.get("warnings")
+    if isinstance(warnings, list):
+        d["warnings"] = [
+            w for w in warnings if not (isinstance(w, str) and "time_window" in w)
+        ]
+    hint = d.get("no_trade_hint")
+    if isinstance(hint, str):
+        low = hint.lower()
+        if "time_window" in low:
+            d["no_trade_hint"] = ""
+
+
+def _tw_news_stress(news_ctx) -> bool:
+    if not isinstance(news_ctx, list) or not news_ctx:
+        return False
+
+    keywords = (
+        "cpi",
+        "inflation",
+        "fomc",
+        "fed",
+        "powell",
+        "rate",
+        "nfp",
+        "jobs",
+        "sec",
+        "lawsuit",
+        "etf outflow",
+        "liquidation",
+    )
+
+    for it in news_ctx:
+        if isinstance(it, dict):
+            impact = str(it.get("impact") or "").strip()
+            text = str(it.get("text") or it.get("title") or "").strip()
+            s = f"{impact} {text}".strip()
+        else:
+            s = str(it or "").strip()
+        if not s:
+            continue
+        low = s.lower()
+        if re.search(r"impact\\s*:\\s*[-−]", low, flags=re.IGNORECASE):
+            return True
+        if any(k in low for k in keywords):
+            return True
+    return False
+
+
+def _tw_volatility_stress(warnings) -> bool:
+    if not isinstance(warnings, list) or not warnings:
+        return False
+    for w in warnings:
+        low = str(w or "").strip().lower()
+        if not low:
+            continue
+        if "impulse_no_exhale" in low:
+            return True
+        if "ema_source_suspect" in low:
+            return True
+        if re.search(r"overextended_(no_exhale|h1)\b", low):
+            return True
+    return False
+
+
+def _tw_structure_stress(d: dict) -> bool:
+    ss = d.get("structure_state")
+    return isinstance(ss, str) and ss.strip().lower() == "chaotic"
+
+
+def _tw_risk_off_stress(d: dict) -> bool:
+    if "risk_off" in d:
+        return bool(d.get("risk_off"))
+    mc = d.get("market_context")
+    return isinstance(mc, str) and ("risk-off" in mc.lower())
+
+
+def apply_time_window_policy_variant_b(d: dict) -> None:
+    """
+    “Опасные окна” (time_window) — вариант B:
+    - aggressive: игнорирует окна полностью
+    - neutral: в окнах по умолчанию ТОЛЬКО warning; no_trade только при stress
+    - conservative: в окнах всегда no_trade
+    """
+    mode = normalize_mode(d.get("mode"))
+
+    mins = _msk_minutes_from_time_str(d.get("time_msk"))
+    if mins is None:
+        mins = _msk_minutes_from_time_str(current_msk())
+    if mins is None or not _in_danger_time_window_msk(mins):
+        return
+
+    d.setdefault("warnings", [])
+    d.setdefault("no_trade_reasons", [])
+    d.setdefault("no_trade_hint", "")
+
+    if mode == "aggressive":
+        reasons_before = d.get("no_trade_reasons") if isinstance(d.get("no_trade_reasons"), list) else []
+        hint_before = d.get("no_trade_hint") if isinstance(d.get("no_trade_hint"), str) else ""
+        had_tw = any(isinstance(r, str) and "time_window" in r for r in reasons_before) or ("time_window" in hint_before.lower())
+
+        _tw_clear_artifacts(d)
+        if had_tw and bool(d.get("no_trade")):
+            reasons = d.get("no_trade_reasons") if isinstance(d.get("no_trade_reasons"), list) else []
+            hint = d.get("no_trade_hint") if isinstance(d.get("no_trade_hint"), str) else ""
+            if not reasons and not hint:
+                d["no_trade"] = False
+        return
+
+    warnings = d.get("warnings")
+    if isinstance(warnings, list) and "time_window_low_liquidity" not in warnings:
+        warnings.append("time_window_low_liquidity")
+
+    if mode == "conservative":
+        d["no_trade"] = True
+        reasons = d.get("no_trade_reasons")
+        if isinstance(reasons, list) and "time_window" not in reasons:
+            reasons.append("time_window")
+        d["no_trade_hint"] = "Опасное окно времени (пониженная ликвидность): режим conservative — без сделок."
+        return
+
+    stress_news = _tw_news_stress(d.get("news_context"))
+    stress_vol = _tw_volatility_stress(d.get("warnings"))
+    stress_struct = _tw_structure_stress(d)
+    stress_risk_off = _tw_risk_off_stress(d)
+    stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
+
+    if stress:
+        d["no_trade"] = True
+        reasons = d.get("no_trade_reasons")
+        if isinstance(reasons, list) and "time_window" not in reasons:
+            reasons.append("time_window")
+        tags = []
+        if stress_news:
+            tags.append("news")
+        if stress_vol:
+            tags.append("volatility")
+        if stress_struct:
+            tags.append("chaotic")
+        if stress_risk_off:
+            tags.append("risk-off")
+        tag_str = "/".join(tags) if tags else "stress"
+        d["no_trade_hint"] = f"Опасное окно времени + стресс-условия ({tag_str}): режим neutral — пропустить сделку."
+        return
+
+    # В окне, но без stress: time_window сам по себе не отключает neutral.
+    if bool(d.get("no_trade")):
+        reasons = d.get("no_trade_reasons")
+        if isinstance(reasons, list):
+            had_tw = any(isinstance(r, str) and "time_window" in r for r in reasons)
+            d["no_trade_reasons"] = [
+                r for r in reasons if not (isinstance(r, str) and "time_window" in r)
+            ]
+            if had_tw and not d["no_trade_reasons"]:
+                d["no_trade"] = False
+                d["no_trade_hint"] = ""
 
 
 def _normalize_side(d: dict) -> None:
@@ -1572,6 +1764,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     if hints.get("time_msk"):
         d["time_msk"] = hints["time_msk"]
     symbol = d.get("symbol")
+    DRY_RUN = os.getenv("DRY_RUN") == "1"
     hints_match_symbol = bool(hints_symbol) and bool(symbol) and hints_symbol == symbol
     if hints_match_symbol and "price" in hints and hints["price"] is not None:
         d["price"] = hints["price"]
@@ -1587,7 +1780,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     if not d.get("time_msk"):
         d["time_msk"] = current_msk()
 
-    if fetch_price and symbol and not d.get("price"):
+    if fetch_price and symbol and not DRY_RUN and not d.get("price"):
         try:
             ticker = get_pair_ticker(symbol)
             rounded = _round_price(ticker.get("last"))
@@ -1611,6 +1804,34 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         if ema20_h1 is None and sym_for_ema:
             ema20_h1 = get_ema20_h1(sym_for_ema)
         d["ema20_h1"] = ema20_h1
+    except Exception:
+        pass
+
+    def _refresh_price() -> float | None:
+        if not symbol:
+            return None
+        try:
+            return _round_price(get_pair_ticker(symbol).get("last"))
+        except Exception:
+            return None
+
+    # Price refresh policy:
+    # A) DRY_RUN: price всегда берём с биржи (source of truth).
+    # B) Non-DRY_RUN: если price явно "битый" относительно EMA20(M15) — один раз рефрешим.
+    try:
+        if DRY_RUN and symbol:
+            refreshed_price = _refresh_price()
+            if refreshed_price is not None:
+                d["price"] = refreshed_price
+        elif symbol:
+            price_val = _to_float(d.get("price"))
+            ema20_m15_val = _to_float(d.get("ema20_m15"))
+            if price_val is not None and price_val > 0 and ema20_m15_val is not None:
+                ratio = abs(price_val - ema20_m15_val) / price_val
+                if ratio > 0.15:
+                    refreshed_price = _refresh_price()
+                    if refreshed_price is not None:
+                        d["price"] = refreshed_price
     except Exception:
         pass
 
@@ -1709,6 +1930,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
 
     validate_or_fallback_tvh_by_mode(d)
     validate_active_mode_setup(d)
+    apply_time_window_policy_variant_b(d)
     return normalize_no_trade(d)
 
 
