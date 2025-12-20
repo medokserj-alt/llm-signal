@@ -9,6 +9,8 @@ from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+from pinned_state import get_pinned_message_id, load_pinned_state, save_pinned_state, set_pinned_message_id
+
 # ============== BASE / ENV ==================
 
 BASE = Path(__file__).resolve().parent
@@ -36,6 +38,7 @@ ALLOWED_UIDS = parse_allowed_ids()
 
 USER_CHANNELS_PATH = PROJECT_ROOT / "user_channels.json"
 PARAMS_PATH = PROJECT_ROOT / "params.json"
+PINNED_STATE_PATH = PROJECT_ROOT / "pinned_state.json"
 USER_CONFIG = {}
 GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
 VALID_MODES = {"aggressive", "neutral", "conservative"}
@@ -64,6 +67,23 @@ def get_main_chat_id(uid:int):
         if ch:
             return ch
     return FALLBACK_CHANNEL
+
+def get_all_main_channels() -> list[int]:
+    out: set[int] = set()
+    for cfg in USER_CONFIG.values():
+        if not isinstance(cfg, dict):
+            continue
+        channels = cfg.get("channels")
+        if not isinstance(channels, dict):
+            continue
+        ch = channels.get("main_chat_id")
+        if isinstance(ch, int):
+            out.add(ch)
+        elif isinstance(ch, str) and ch.strip().lstrip("-").isdigit():
+            out.add(int(ch.strip()))
+    if FALLBACK_CHANNEL and str(FALLBACK_CHANNEL).strip().lstrip("-").isdigit():
+        out.add(int(str(FALLBACK_CHANNEL).strip()))
+    return sorted(out)
 
 def get_min_interval(uid:int) -> int:
     cfg = get_user_cfg(uid)
@@ -127,6 +147,11 @@ def latest(pattern:str):
     files = list(PROJECT_ROOT.glob(pattern))
     return max(files, key=lambda p:p.stat().st_mtime) if files else None
 
+def latest_report_dir(root_dir: str) -> Path | None:
+    root = PROJECT_ROOT / "reports" / root_dir
+    roots = sorted(root.glob("*"))
+    return roots[-1] if roots else None
+
 def strip_snapshot(text:str)->str:
     return re.sub(
         r"(?s)^=== \[SNAPSHOT ДЛЯ LLM\] ===.*?==========================\n?",
@@ -143,6 +168,18 @@ def html_file_to_tg_text(p:Path,max_len:int=4000):
         chunks.append(s[:max_len])
         s=s[max_len:]
     return chunks
+
+def _relpath(p: Path) -> str:
+    try:
+        return p.relative_to(PROJECT_ROOT).as_posix()
+    except Exception:
+        return p.as_posix()
+
+def format_done(done_line: str, logs_path: str | None = None) -> str:
+    msg = "Готово.\n<pre>" + htmllib.escape(done_line) + "</pre>"
+    if logs_path:
+        msg += "\nЛоги сохранены: <code>" + htmllib.escape(logs_path) + "</code>"
+    return msg
 
 def set_params_mode(mode: str):
     if mode not in VALID_MODES:
@@ -401,6 +438,7 @@ async def handle_full(update,context):
 
         analysis = latest("analysis_*.md")
         sig_html = latest("signal_*.html")
+        run_log = latest("logs/signal_*.log")
 
         if analysis:
             hdr = make_header("📝 LLM Full анализ")
@@ -413,9 +451,12 @@ async def handle_full(update,context):
             if parts:
                 await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+parts[0])
 
-        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
+        mode_label = MODE_LABELS.get(get_user_mode(uid), MODE_LABELS["neutral"])
         await msg.edit_text(
-            "Готово.\n<pre>"+htmllib.escape(tail or '(лог пуст)')+"</pre>",
+            format_done(
+                f"✅ FULL: режим {mode_label}",
+                logs_path=_relpath(run_log) if run_log else None,
+            ),
             parse_mode=ParseMode.HTML
         )
 
@@ -453,6 +494,7 @@ async def handle_current_analysis(update,context):
             capture_output=True, text=True, timeout=900
         )
         analysis = latest("analysis_*.md")
+        run_log = latest("logs/signal_*.log")
         if not analysis:
             await msg.edit_text("Не удалось сформировать анализ.")
             return
@@ -462,9 +504,11 @@ async def handle_current_analysis(update,context):
         txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
         await context.bot.send_message(chat_id=target, text=hdr+"\n\n"+txt)
 
-        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
         await msg.edit_text(
-            "Готово.\n<pre>"+htmllib.escape(tail or '(лог пуст)')+"</pre>",
+            format_done(
+                f"✅ CURRENT: {_relpath(Path(analysis))}",
+                logs_path=_relpath(run_log) if run_log else None,
+            ),
             parse_mode=ParseMode.HTML
         )
     finally:
@@ -514,6 +558,7 @@ async def handle_symbol(update,context):
 
         analysis = latest("analysis_*.md")
         sig_html = latest("signal_*.html")
+        run_log = latest("logs/signal_*.log")
 
         if analysis:
             hdr = make_header(f"📝 Анализ {symbol}")
@@ -526,9 +571,11 @@ async def handle_symbol(update,context):
             if parts:
                 await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+parts[0])
 
-        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
         await msg.edit_text(
-            "Готово.\n<pre>"+htmllib.escape(tail or '(лог пуст)')+"</pre>",
+            format_done(
+                f"✅ SIGNAL: {symbol}",
+                logs_path=_relpath(run_log) if run_log else None,
+            ),
             parse_mode=ParseMode.HTML
         )
 
@@ -536,20 +583,36 @@ async def handle_symbol(update,context):
         release_gen_lock()
 
 # ---------- DAY / MID ----------
-async def _post_report(root_dir, emoji, update,context,channel):
-    root = PROJECT_ROOT/"reports"/root_dir
-    roots = sorted(root.glob("*"))
-    if not roots:
-        await update.message.reply_text("Отчёт не найден.")
-        return
-    d = roots[-1]
+async def _post_report(root_dir, emoji, context, channel, report_dir: Path) -> None:
+    d = report_dir
     hdr = make_header(f"{emoji} {root_dir.upper()}")
     header_line = f"<b><u>{emoji} {root_dir.upper()} REPORT</u></b>\n"
-    await context.bot.send_message(chat_id=channel, text=header_line, parse_mode=ParseMode.HTML)
+    header_msg = await context.bot.send_message(chat_id=channel, text=header_line, parse_mode=ParseMode.HTML)
     an = sorted(d.glob("analysis_*.md"))
+    report_msg = None
     if an:
         txt = an[-1].read_text(encoding="utf-8").strip()
-        await context.bot.send_message(chat_id=channel, text=hdr+"\n\n"+txt[:3900])
+        report_msg = await context.bot.send_message(chat_id=channel, text=hdr+"\n\n"+txt[:3900])
+
+    pinned_kind = root_dir.lower()
+    if pinned_kind in ("day", "mid"):
+        state = load_pinned_state(PINNED_STATE_PATH)
+        prev_id = get_pinned_message_id(state, channel, pinned_kind)
+        new_id = (report_msg.message_id if report_msg else header_msg.message_id)
+        if prev_id and prev_id != new_id:
+            try:
+                await context.bot.unpin_chat_message(chat_id=channel, message_id=prev_id)
+            except Exception:
+                pass
+        try:
+            await context.bot.pin_chat_message(chat_id=channel, message_id=new_id, disable_notification=True)
+        except Exception:
+            pass
+        try:
+            save_pinned_state(PINNED_STATE_PATH, set_pinned_message_id(state, channel, pinned_kind, new_id))
+        except Exception:
+            pass
+    return None
 
 async def handle_day(update,context):
     uid = update.effective_user.id
@@ -560,7 +623,6 @@ async def handle_day(update,context):
         await update.message.reply_text("Уже считается, позже.")
         return
     msg = await update.message.reply_text("Готовлю DAY… ⏳")
-    channel = get_main_chat_id(uid)
     if not acquire_gen_lock():
         await msg.edit_text("Занято, позже.")
         return
@@ -569,9 +631,20 @@ async def handle_day(update,context):
             ["bash","-lc", f"cd '{PROJECT_ROOT}' && chmod +x run_day.sh && ./run_day.sh"],
             capture_output=True, text=True, timeout=1200
         )
-        await _post_report("day","🗓",update,context,channel)
-        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
-        await msg.edit_text("Готово.\n<pre>"+htmllib.escape(tail or '(лог пуст)')+"</pre>",parse_mode=ParseMode.HTML)
+        report_dir = latest_report_dir("day")
+        if not report_dir:
+            await msg.edit_text("Отчёт не найден.")
+            return
+        for channel in get_all_main_channels():
+            await _post_report("day","🗓",context,channel,report_dir=report_dir)
+        report_rel = _relpath(report_dir)
+        await msg.edit_text(
+            format_done(
+                f"✅ DAY report: {report_rel}",
+                logs_path=None,
+            ),
+            parse_mode=ParseMode.HTML,
+        )
     finally:
         release_gen_lock()
 
@@ -584,7 +657,6 @@ async def handle_mid(update,context):
         await update.message.reply_text("Уже считается, позже.")
         return
     msg = await update.message.reply_text("Готовлю MID… ⏳")
-    channel = get_main_chat_id(uid)
     if not acquire_gen_lock():
         await msg.edit_text("Занято, позже.")
         return
@@ -593,9 +665,20 @@ async def handle_mid(update,context):
             ["bash","-lc", f"cd '{PROJECT_ROOT}' && chmod +x run_mid.sh && ./run_mid.sh"],
             capture_output=True, text=True, timeout=1200
         )
-        await _post_report("mid","📰",update,context,channel)
-        tail = "\n".join((proc.stdout or "").splitlines()[-20:])
-        await msg.edit_text("Готово.\n<pre>"+htmllib.escape(tail or '(лог пуст)')+"</pre>",parse_mode=ParseMode.HTML)
+        report_dir = latest_report_dir("mid")
+        if not report_dir:
+            await msg.edit_text("Отчёт не найден.")
+            return
+        for channel in get_all_main_channels():
+            await _post_report("mid","📰",context,channel,report_dir=report_dir)
+        report_rel = _relpath(report_dir)
+        await msg.edit_text(
+            format_done(
+                f"✅ MID report: {report_rel}",
+                logs_path=None,
+            ),
+            parse_mode=ParseMode.HTML,
+        )
     finally:
         release_gen_lock()
 
