@@ -6,6 +6,7 @@ import math
 import time
 import re
 import argparse
+import copy
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -16,6 +17,52 @@ from pathlib import Path
 import pathlib as _pl
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
+
+# ---- Debug trace (diagnostics only; gated by env DEBUG_TRACE=1) ----
+_DEBUG_TRACE_ENABLED = os.getenv("DEBUG_TRACE") == "1"
+_DEBUG_TRACE: dict | None = {} if _DEBUG_TRACE_ENABLED else None
+_DEBUG_TRACE_PATH = Path(__file__).resolve().parent / "logs" / "debug_trace.json"
+
+
+def _debug_trace_reset() -> None:
+    if _DEBUG_TRACE is None:
+        return
+    _DEBUG_TRACE.clear()
+
+
+def _debug_trace_update_main_fields(d: dict | None) -> None:
+    if _DEBUG_TRACE is None or not isinstance(d, dict):
+        return
+    for k in ("symbol", "time_msk", "price"):
+        if k in d and d.get(k) is not None:
+            _DEBUG_TRACE[k] = copy.deepcopy(d.get(k))
+
+
+def _debug_trace_set_entry_range(field: str, d: dict | None) -> None:
+    if _DEBUG_TRACE is None:
+        return
+    _debug_trace_update_main_fields(d if isinstance(d, dict) else None)
+    try:
+        _DEBUG_TRACE[field] = copy.deepcopy((d or {}).get("entry_range"))
+    except Exception:
+        try:
+            _DEBUG_TRACE[field] = (d or {}).get("entry_range")
+        except Exception:
+            _DEBUG_TRACE[field] = None
+
+
+def _debug_trace_write() -> None:
+    if _DEBUG_TRACE is None:
+        return
+    try:
+        _DEBUG_TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DEBUG_TRACE_PATH.write_text(
+            json.dumps(_DEBUG_TRACE, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
 
 # ---- EMA helpers (Bybit Futures-aligned) ----
 _CLOSES_CACHE: dict[tuple[str, str, str], dict] = {}
@@ -1918,6 +1965,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     d.setdefault("max_valid_minutes", 90)
 
     build_entries(d)
+    _debug_trace_set_entry_range("entry_range_post_entries", d)
 
     try:
         apply_ema_blocks_and_derivatives(d, sym_for_ema)
@@ -1929,6 +1977,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     apply_ema_exhale_filter(d)
 
     validate_or_fallback_tvh_by_mode(d)
+    _debug_trace_set_entry_range("entry_range_post_tvh", d)
     validate_active_mode_setup(d)
     apply_time_window_policy_variant_b(d)
     return normalize_no_trade(d)
@@ -2183,9 +2232,22 @@ if args.multi:
         print(content)
         sys.exit(1)
 
+    if _DEBUG_TRACE_ENABLED:
+        _debug_trace_reset()
+        _debug_trace_update_main_fields(signal_raw)
+        _debug_trace_set_entry_range("entry_range_raw", signal_raw)
+        _DEBUG_TRACE["entry_range_source"] = (  # type: ignore[index]
+            "llm_raw" if "entry_range" in signal_raw else "missing"
+        )
+        _debug_trace_set_entry_range("entry_range_pre_finalize", signal_raw)
+
     hints = {"time_msk": time_msk, "mode": mode}
     signal = finalize_signal(signal_raw, hints)
     signal["time_msk"] = time_msk
+
+    _debug_trace_set_entry_range("entry_range_post_finalize", signal)
+    _debug_trace_set_entry_range("entry_range_final", signal)
+    _debug_trace_write()
 
     if overview_lines:
         print("\n=== [POOL OVERVIEW] ===\n")
@@ -2402,7 +2464,21 @@ except Exception:
     print(content)
     sys.exit(0)
 
+if _DEBUG_TRACE_ENABLED:
+    _debug_trace_reset()
+    _debug_trace_update_main_fields(data if isinstance(data, dict) else None)
+    if isinstance(data, dict):
+        _debug_trace_set_entry_range("entry_range_raw", data)
+        _DEBUG_TRACE["entry_range_source"] = (  # type: ignore[index]
+            "llm_raw" if "entry_range" in data else "missing"
+        )
+        _debug_trace_set_entry_range("entry_range_pre_finalize", data)
+
 data = finalize_signal(data, payload.get("hints", {}))
+
+_debug_trace_set_entry_range("entry_range_post_finalize", data)
+_debug_trace_set_entry_range("entry_range_final", data)
+_debug_trace_write()
 
 print(json.dumps(data, ensure_ascii=False))
 sys.exit(0)

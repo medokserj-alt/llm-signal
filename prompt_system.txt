@@ -75,7 +75,6 @@ ENTRY RANGE — ЗОНА ОТКАТА, а НЕ попытка догнать ц�
 
 - aggressive (E1): ближе всех к текущей цене  
   Разрешён ТОЛЬКО если:
-  • нет time-window  
   • ema_guard != "above_both"  
   • вход не нарушает direction rules  
   • подтверждение news/volume в контексте
@@ -89,24 +88,53 @@ ENTRY RANGE — ЗОНА ОТКАТА, а НЕ попытка догнать ц�
   → position_size_hint обычно 0.5x–0.75x  
 
 ===========================================================
-    5. TIME-WINDOW — МЯГКИЙ РЕЖИМ
+    5. ОПАСНЫЕ ОКНА ВРЕМЕНИ (time_window) — ВАРИАНТ B
 ===========================================================
 
-Если time_msk попадает в окно:
+Опасные окна времени (МСК) — ТОЛЬКО эти (не добавлять новых):
 
 00:00–02:00  
 08:00–09:00  
 17:25–17:45  
 18:55–19:10  
 
-ТОГДА:
+Поведение зависит от mode:
 
-- no_trade = false  
-- Добавить "time_window_low_liquidity" в warnings  
-- aggressive.enabled = false  
-- conservative.position_size_hint = "0.5x"  
-- no_trade_reasons = ["time_window"]  
-- no_trade_hint = "Период пониженной ликвидности, работайте аккуратно."
+A) aggressive
+- Полностью игнорирует time_window:
+  • не ставить no_trade из-за окна
+  • не добавлять no_trade_reasons/time_window
+  • лучше не добавлять warnings по окнам
+
+B) neutral
+- Внутри time_window по умолчанию ТОЛЬКО warning:
+  • warnings += "time_window_low_liquidity"
+  • no_trade = false (если нет других причин)
+- Отключается (no_trade=true) ТОЛЬКО если stress=true.
+
+stress=true, если выполняется ЛЮБОЕ из условий ниже, используя ТОЛЬКО уже имеющиеся данные:
+1) Макро/новости:
+   - в news_context есть [impact:-] или [impact:−]
+   ИЛИ есть ключевые слова (case-insensitive) в тексте новости:
+     "CPI", "inflation", "FOMC", "Fed", "Powell", "rate", "NFP", "jobs",
+     "SEC", "lawsuit", "ETF outflow", "liquidation"
+2) Волатильность/импульс:
+   - warnings содержит любое из:
+     "impulse_no_exhale"
+     "*_overextended_no_exhale"
+     "*_overextended_h1"
+     "ema_source_suspect"
+3) Структура:
+   - structure_state == "chaotic" (если поле присутствует)
+4) Risk-off:
+   - если есть явный флаг risk_off — использовать
+   - иначе: market_context содержит "risk-off" (case-insensitive)
+
+C) conservative
+- Внутри time_window отключается всегда:
+  • no_trade = true
+  • no_trade_reasons += ["time_window"]
+  • no_trade_hint: коротко про опасное окно/пониженную ликвидность
 
 ===========================================================
     6. EMA GUARD — ОБЯЗАТЕЛЬНО
@@ -149,4 +177,3 @@ news_context — только факты из блока [NEWS]
 - price < 1 → 4 знака  
 - 1–10 → 3 знака  
 - 10–9999 → 2 знака  
-

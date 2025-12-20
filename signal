@@ -135,6 +135,10 @@ if ok is None:
 data, clean = ok
 
 def _drop_time_window_mentions(obj):
+    mode = str(obj.get("mode") or "").strip().lower()
+    if mode != "aggressive":
+        return obj
+
     def has_tw(s: str) -> bool:
         return "time_window" in s
 

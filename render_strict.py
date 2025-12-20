@@ -49,6 +49,10 @@ def _now_msk_news_prefix() -> str:
     return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M")
 
 def _drop_time_window_mentions(data: dict) -> dict:
+    mode = normalize_mode(data.get("mode"))
+    if mode != "aggressive":
+        return data
+
     def has_tw(s: str) -> bool:
         return "time_window" in s
 
