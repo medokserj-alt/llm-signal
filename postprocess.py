@@ -37,11 +37,33 @@ def apply_day_mid_context(d: dict, day_txt: str | None, mid_txt: str | None) -> 
     Мягкий вариант A: DAY/MID только как фон (bias + короткая пометка), не фильтр.
     Работает и для SINGLE, и для FULL.
     """
-    ctx = d.get("day_mid_context") or {
+    raw_ctx = d.get("day_mid_context")
+    default_ctx = {
         "day_bias": None,
         "mid_bias": None,
         "notes": None,
     }
+    if isinstance(raw_ctx, dict):
+        ctx = raw_ctx
+    elif isinstance(raw_ctx, str):
+        s = raw_ctx.strip()
+        ctx = dict(default_ctx)
+        ctx["notes"] = s or None
+    elif raw_ctx is None:
+        ctx = dict(default_ctx)
+    else:
+        ctx = dict(default_ctx)
+        try:
+            ctx["notes"] = str(raw_ctx)
+        except Exception:
+            ctx["notes"] = None
+
+    if "day_bias" not in ctx:
+        ctx["day_bias"] = None
+    if "mid_bias" not in ctx:
+        ctx["mid_bias"] = None
+    if "notes" not in ctx:
+        ctx["notes"] = None
 
     def detect_bias(txt: str | None) -> str | None:
         if not txt:

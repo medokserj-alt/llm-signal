@@ -9,9 +9,21 @@ import argparse
 import copy
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
-from openai import OpenAI
-import ccxt
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:  # pragma: no cover
+    def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
+        return False
+
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore[assignment]
+
+try:
+    import ccxt  # type: ignore
+except Exception:  # pragma: no cover
+    ccxt = None  # type: ignore[assignment]
 import subprocess
 from pathlib import Path
 import pathlib as _pl
@@ -711,6 +723,32 @@ def _normalize_entry_mode(d: dict) -> None:
         d.setdefault("entry_mode", "limit")
 
 
+def _normalize_day_mid_context(d: dict) -> None:
+    raw = d.get("day_mid_context")
+    if isinstance(raw, dict):
+        ctx = raw
+    elif isinstance(raw, str):
+        s = raw.strip()
+        ctx = {"day_bias": None, "mid_bias": None, "notes": (s or None)}
+    elif raw is None:
+        ctx = {"day_bias": None, "mid_bias": None, "notes": None}
+    else:
+        try:
+            notes = str(raw)
+        except Exception:
+            notes = None
+        ctx = {"day_bias": None, "mid_bias": None, "notes": notes}
+
+    if "day_bias" not in ctx:
+        ctx["day_bias"] = None
+    if "mid_bias" not in ctx:
+        ctx["mid_bias"] = None
+    if "notes" not in ctx:
+        ctx["notes"] = None
+
+    d["day_mid_context"] = ctx
+
+
 def _resolve_lessons_path():
     _env_path = os.getenv("LLM_LESSONS_FILE")
     if not _env_path:
@@ -968,12 +1006,32 @@ def build_entries(d: dict) -> None:
 
         ema_guard = d.get("ema_guard") or {}
         state = (ema_guard.get("state") or "unknown").lower()
+
+        def _disable_aggressive(tag: str) -> None:
+            agg = entries.get("aggressive")
+            if not isinstance(agg, dict):
+                return
+            agg["enabled"] = False
+            disabled_by = agg.get("disabled_by")
+            if disabled_by is None:
+                disabled_by_list: list[str] = []
+            elif isinstance(disabled_by, list):
+                disabled_by_list = [str(x) for x in disabled_by if str(x).strip()]
+            elif isinstance(disabled_by, str) and disabled_by.strip():
+                disabled_by_list = [disabled_by.strip()]
+            else:
+                disabled_by_list = []
+            if tag and tag not in disabled_by_list:
+                disabled_by_list.append(tag)
+            if disabled_by_list:
+                agg["disabled_by"] = disabled_by_list
+
         if state == "between":
-            entries["aggressive"]["enabled"] = False
+            _disable_aggressive("ema_guard_between")
         if state == "below_both" and side == "long":
-            entries["aggressive"]["enabled"] = False
+            _disable_aggressive("ema_guard_below_both_long")
         if state == "above_both" and side == "short":
-            entries["aggressive"]["enabled"] = False
+            _disable_aggressive("ema_guard_above_both_short")
 
         d["entry_range"] = entries["neutral"]["range"]
         d["entries"] = entries
@@ -1733,10 +1791,83 @@ def validate_active_mode_setup(d: dict) -> dict:
     except Exception:
         enabled = True
     if enabled is False:
-        d["no_trade"] = True
-        d.setdefault("no_trade_reasons", []).append("mode_disabled")
-        d["no_trade_hint"] = f"Текущий режим ({mode}) отключён фильтром/валидатором — сигнал не выдан."
-        return d
+        fallback_mode = None
+        for cand in ("neutral", "conservative"):
+            if cand == mode:
+                continue
+            cb = entries.get(cand)
+            if not isinstance(cb, dict):
+                continue
+            try:
+                cand_enabled = cb.get("enabled", True)
+            except Exception:
+                cand_enabled = True
+            if cand_enabled is True:
+                fallback_mode = cand
+                break
+
+        if fallback_mode:
+            warnings = d.setdefault("warnings", [])
+            msg = f"mode_fallback: {mode}->{fallback_mode}"
+            if msg not in warnings:
+                warnings.append(msg)
+
+            disabled_by = bucket.get("disabled_by") if isinstance(bucket, dict) else None
+            if disabled_by:
+                if isinstance(disabled_by, list):
+                    tags = ",".join([str(x) for x in disabled_by if str(x).strip()])
+                else:
+                    tags = str(disabled_by).strip()
+                if tags:
+                    why = f"mode_disabled_by: {mode}: {tags}"
+                    if why not in warnings:
+                        warnings.append(why)
+
+            d["mode"] = fallback_mode
+            fb = entries.get(fallback_mode) if isinstance(entries.get(fallback_mode), dict) else {}
+            fb_range = fb.get("range") if isinstance(fb.get("range"), dict) else None
+            if fb_range is not None:
+                d["entry_range"] = fb_range
+
+            mode = fallback_mode
+            bucket = fb
+        else:
+            d["no_trade"] = True
+            d.setdefault("no_trade_reasons", []).append("mode_disabled")
+            hint = f"Текущий режим ({mode}) отключён фильтром/валидатором — сигнал не выдан."
+            disabled_by = bucket.get("disabled_by") if isinstance(bucket, dict) else None
+            if disabled_by:
+                if isinstance(disabled_by, list):
+                    tags = ",".join([str(x) for x in disabled_by if str(x).strip()])
+                else:
+                    tags = str(disabled_by).strip()
+                if tags:
+                    hint = f"{hint} disabled_by={tags}"
+            d["no_trade_hint"] = hint
+            return d
+
+    # Finalize mode + keep top-level entry_range consistent with it.
+    # Important: final_mode must be computed AFTER any fallback logic above.
+    final_mode = normalize_mode(d.get("mode"))
+    d["mode"] = final_mode
+
+    def _get_mode_range(m: str) -> dict | None:
+        b = entries.get(m) if isinstance(entries.get(m), dict) else None
+        r = b.get("range") if isinstance(b, dict) else None
+        if not isinstance(r, dict):
+            return None
+        if "min" not in r and "max" not in r:
+            return None
+        return r
+
+    final_range = _get_mode_range(final_mode)
+    if final_range is None:
+        final_range = _get_mode_range("neutral")
+    if final_range is not None:
+        d["entry_range"] = final_range
+
+    mode = final_mode
+    bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
 
     missing: list[str] = []
 
@@ -1938,15 +2069,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         )
 
     apply_direction_guard(d)
-
-    d.setdefault(
-        "day_mid_context",
-        {
-            "day_bias": None,
-            "mid_bias": None,
-            "notes": None,
-        },
-    )
+    _normalize_day_mid_context(d)
     d.setdefault(
         "adx_guard",
         {
@@ -2007,6 +2130,7 @@ def read_latest_report_text(root_dir: str, limit_chars: int = 2000) -> str:
 
 # ---------------- Bootstrap ----------------
 BASE = Path(__file__).resolve().parent
+_CLI_CODE = r'''
 load_dotenv(BASE / ".env")
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
@@ -2482,3 +2606,14 @@ _debug_trace_write()
 
 print(json.dumps(data, ensure_ascii=False))
 sys.exit(0)
+'''
+
+
+if __name__ == "__main__":
+    if OpenAI is None:
+        print("ERROR: openai package not installed", file=sys.stderr)
+        sys.exit(1)
+    if ccxt is None:
+        print("ERROR: ccxt package not installed", file=sys.stderr)
+        sys.exit(1)
+    exec(_CLI_CODE, globals(), globals())
