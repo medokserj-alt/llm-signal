@@ -39,3 +39,6 @@ signal_*.html
 *.tar.gz
 /tmp/
 codex_tasks/
+user_channels.json
+params.json
+
