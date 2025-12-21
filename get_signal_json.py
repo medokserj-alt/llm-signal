@@ -854,6 +854,31 @@ def get_pair_ticker(sym: str):
             pass
     return {"last": None, "change": None}
 
+def apply_live_price_hint(payload: dict) -> None:
+    """
+    SINGLE-mode helper: attach an exchange-derived price hint (source of truth for scale)
+    into payload["hints"] before prompting the LLM.
+    """
+    if not isinstance(payload, dict):
+        return
+    hints = payload.get("hints")
+    if not isinstance(hints, dict):
+        return
+    sym = hints.get("symbol")
+    if not sym:
+        return
+    try:
+        last = get_pair_ticker(sym).get("last")
+    except Exception:
+        last = None
+    if last is None:
+        return
+    try:
+        hints["price"] = _round_price(last)
+        hints["price_source"] = "live"
+    except Exception:
+        return
+
 
 def get_pool_snapshot() -> dict:
     with open("pool.json", "r", encoding="utf-8") as f:
@@ -2397,18 +2422,8 @@ if os.path.exists(args.params):
 payload.setdefault("hints", {})
 if args.symbol:
     payload["hints"]["symbol"] = args.symbol
-    # live price
-    _sym = payload["hints"]["symbol"]
-    try:
-        _last = get_pair_ticker(_sym).get("last")
-    except Exception:
-        _last = None
-        if _last is not None:
-            try:
-                payload["hints"]["price"] = _round_price(_last)
-                payload["hints"]["price_source"] = "live"
-            except Exception:
-                pass
+    # live price (source of truth for price scale)
+    apply_live_price_hint(payload)
 
 # time hint
 payload["hints"]["time_msk"] = current_msk()

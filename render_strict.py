@@ -110,6 +110,17 @@ def main():
 
     mode = normalize_mode(data.get("mode"))
 
+    def _direction_badge(d: dict) -> str:
+        raw_side = d.get("side")
+        raw = raw_side
+        if not (isinstance(raw_side, str) and raw_side.strip()):
+            raw = d.get("direction")
+        if isinstance(raw, str):
+            key = raw.strip().lower()
+        else:
+            key = (str(raw).strip().lower() if raw is not None else "")
+        return {"long": "🟩 LONG", "short": "🟥 SHORT"}.get(key, "")
+
     take_profit_rules = (data.get("take_profit_rules") or "").strip()
     break_even_rule = (data.get("break_even_rule") or "").strip()
     mtf = data.get("multi_tf_view", {}) or {}
@@ -276,6 +287,7 @@ def main():
         else:
             lines.append("2️⃣ Сетап")
             lines.append(f"Режим: {MODE_LABELS.get(mode, mode)}")
+            lines.append(f"Направление: {_direction_badge(data) or '—'}")
             lines.append(f"Вход: {fmt(entry_val)}")
             lines.append(f"SL: {fmt(sl_val)}")
             if mode == "aggressive":
