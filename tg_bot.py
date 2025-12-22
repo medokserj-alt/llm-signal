@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from zoneinfo import ZoneInfo
+import asyncio
 import os, json, time, subprocess, re, html as htmllib, tempfile
 from datetime import datetime
 from pathlib import Path
+from urllib import request as urlrequest, parse as urlparse
 
 from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
@@ -21,6 +23,11 @@ load_dotenv(BASE / ".env.tg.clean")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 FALLBACK_CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL")
+
+# ============== AIA (AI Agent) ==============
+
+AIA_BASE_URL = "http://127.0.0.1:8002"
+AIA_TIMEOUT_SEC = 2.5
 
 # ============== ACCESS CONTROL ==============
 
@@ -181,6 +188,156 @@ def format_done(done_line: str, logs_path: str | None = None) -> str:
     if logs_path:
         msg += "\nЛоги сохранены: <code>" + htmllib.escape(logs_path) + "</code>"
     return msg
+
+def _utc_now_z() -> str:
+    return datetime.utcnow().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _infer_signal_id(sig_html: Path | None, run_log: Path | None, published_at: str) -> str:
+    for p in (sig_html, run_log):
+        if not p:
+            continue
+        m = re.search(r"_(\d{8}_\d{6})\.", p.name)
+        if m:
+            return m.group(1)
+    # fallback: YYYYMMDD_HHMMSS from published_at
+    try:
+        dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+def _aia_request_json(method: str, path: str, *, query: dict | None = None, body: dict | None = None) -> tuple[int, dict | None]:
+    url = AIA_BASE_URL.rstrip("/") + path
+    if query:
+        url += "?" + urlparse.urlencode(query, doseq=True)
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    req = urlrequest.Request(url, data=data, method=method.upper(), headers=headers)
+    with urlrequest.urlopen(req, timeout=AIA_TIMEOUT_SEC) as resp:
+        status = int(getattr(resp, "status", 200))
+        raw = resp.read() or b""
+        if not raw:
+            return status, None
+        try:
+            return status, json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return status, None
+
+def _read_last_signal_json() -> dict | None:
+    p = PROJECT_ROOT / "logs" / "last.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symbol_hint: str | None = None) -> dict | None:
+    d = _read_last_signal_json()
+    if not isinstance(d, dict):
+        return None
+
+    symbol = d.get("symbol") or symbol_hint
+    direction = d.get("direction") or d.get("side")
+    entry_range = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else {}
+    entry_low = entry_range.get("min")
+    entry_high = entry_range.get("max")
+    sl = d.get("sl")
+    tp1 = d.get("tp1")
+    tp2 = d.get("tp2")
+
+    if not symbol or not direction:
+        return None
+    if entry_low is None or entry_high is None or sl is None:
+        return None
+
+    try:
+        entry_zone = [float(entry_low), float(entry_high)]
+        sl_val = float(sl)
+        tp_out: dict = {"tp1": (float(tp1) if tp1 is not None else None), "tp2": (float(tp2) if tp2 is not None else None)}
+    except Exception:
+        return None
+
+    try:
+        if isinstance(channel_id, str) and channel_id.strip().lstrip("-").isdigit():
+            channel_id = int(channel_id.strip())
+    except Exception:
+        pass
+
+    return {
+        "signal_id": str(signal_id),
+        "symbol": str(symbol),
+        "direction": str(direction),
+        "entry_zone": entry_zone,
+        "sl": sl_val,
+        "tp": tp_out,
+        "published_at": str(published_at),
+        "channel_id": channel_id,
+    }
+
+def send_signal_to_aia(signal_json_v1: dict) -> bool:
+    try:
+        status, _ = _aia_request_json("POST", "/tg/signal", body=signal_json_v1)
+        return 200 <= status < 300
+    except Exception:
+        return False
+
+def fetch_trade_report(signal_id: str) -> tuple[bool, str]:
+    try:
+        status, data = _aia_request_json("GET", "/jobs/trade_report", query={"signal_id": signal_id})
+        if not (200 <= status < 300):
+            return False, f"AIA: ошибка {status} при получении отчёта."
+        if not isinstance(data, dict):
+            return False, "AIA: неожиданный ответ (не JSON)."
+        summary = data.get("summary")
+        if not summary:
+            return False, "AIA: отчёт пустой."
+        return True, str(summary)
+    except Exception:
+        return False, "AIA недоступен. Попробуй позже."
+
+def fetch_daily_summary(window_hours: int = 24) -> tuple[bool, str]:
+    try:
+        status, data = _aia_request_json("GET", "/jobs/daily_summary", query={"window_hours": int(window_hours)})
+        if not (200 <= status < 300):
+            return False, f"AIA: ошибка {status} при получении daily summary."
+        if not isinstance(data, dict):
+            return False, "AIA: неожиданный ответ (не JSON)."
+        summary = data.get("summary")
+        if not summary:
+            return False, "AIA: summary пустой."
+        return True, str(summary)
+    except Exception:
+        return False, "AIA недоступен. Попробуй позже."
+
+async def _send_signal_to_aia_background(signal_json_v1: dict) -> None:
+    try:
+        await asyncio.to_thread(send_signal_to_aia, signal_json_v1)
+    except Exception:
+        pass
+
+async def _is_chat_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.effective_user:
+        return False
+    uid = update.effective_user.id
+    chat = update.effective_chat
+    if chat:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=uid)
+            if getattr(member, "status", None) in ("creator", "administrator"):
+                return True
+        except Exception:
+            pass
+    return is_admin(uid)
+
+async def _send_to_current_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    chat = update.effective_chat
+    if chat:
+        await context.bot.send_message(chat_id=chat.id, text=text)
+        return
+    if update.message:
+        await update.message.reply_text(text)
 
 def set_params_mode(mode: str):
     if mode not in VALID_MODES:
@@ -448,6 +605,16 @@ async def handle_full(update,context):
             parts = html_file_to_tg_text(Path(sig_html))
             if parts:
                 await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+parts[0])
+                published_at = _utc_now_z()
+                signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
+                sig_v1 = _build_signal_json_v1(
+                    signal_id=signal_id,
+                    published_at=published_at,
+                    channel_id=target,
+                    symbol_hint=None,
+                )
+                if sig_v1:
+                    asyncio.create_task(_send_signal_to_aia_background(sig_v1))
 
         mode_label = MODE_LABELS.get(get_user_mode(uid), MODE_LABELS["neutral"])
         await msg.edit_text(
@@ -568,6 +735,16 @@ async def handle_symbol(update,context):
             parts = html_file_to_tg_text(Path(sig_html))
             if parts:
                 await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+parts[0])
+                published_at = _utc_now_z()
+                signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
+                sig_v1 = _build_signal_json_v1(
+                    signal_id=signal_id,
+                    published_at=published_at,
+                    channel_id=target,
+                    symbol_hint=symbol,
+                )
+                if sig_v1:
+                    asyncio.create_task(_send_signal_to_aia_background(sig_v1))
 
         await msg.edit_text(
             format_done(
@@ -686,6 +863,32 @@ async def handle_mid(update,context):
     finally:
         release_gen_lock()
 
+# ---------- AIA REPORTS ----------
+async def handle_aia_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_chat_admin_or_owner(update, context):
+        await _send_to_current_chat(update, context, "⛔ Недоступно")
+        return
+    if not context.args:
+        await _send_to_current_chat(update, context, "Использование: /aia_report <signal_id>")
+        return
+    signal_id = (context.args[0] or "").strip()
+    if not signal_id:
+        await _send_to_current_chat(update, context, "Использование: /aia_report <signal_id>")
+        return
+
+    ok, summary = await asyncio.to_thread(fetch_trade_report, signal_id)
+    if ok:
+        await _send_to_current_chat(update, context, "Отчёт агента\n\n" + summary)
+    else:
+        await _send_to_current_chat(update, context, summary)
+
+async def handle_aia_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_chat_admin_or_owner(update, context):
+        await _send_to_current_chat(update, context, "⛔ Недоступно")
+        return
+    ok, summary = await asyncio.to_thread(fetch_daily_summary, 24)
+    await _send_to_current_chat(update, context, summary)
+
 # ============== REGISTER / MAIN ==============
 
 def register_text_handlers(app:Application):
@@ -710,6 +913,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("aia_report", handle_aia_report))
+    app.add_handler(CommandHandler("aia_daily", handle_aia_daily))
     register_text_handlers(app)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
