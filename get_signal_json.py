@@ -130,6 +130,7 @@ def _get_exchange(name: str):
                 "enableRateLimit": True,
                 "options": {
                     "defaultType": "swap",  # важно: USDT Perpetual (linear swap), как в разделе "Фьючерсы"
+                    "defaultSubType": "linear",
                 },
             }
         )
@@ -271,6 +272,7 @@ def _fetch_closes_from_market(
 
     closes: list[float] = []
     last_candle_ts = None
+    last_candle_raw: list | None = None
     for c in ohlcv:
         if len(c) < 5:
             continue
@@ -284,15 +286,32 @@ def _fetch_closes_from_market(
             last_candle_ts = int(c[0])
         except Exception:
             pass
+        last_candle_raw = list(c)
 
     if len(closes) < min_required:
         return None
+
+    last_candle: dict | None = None
+    if isinstance(last_candle_raw, list) and len(last_candle_raw) >= 5:
+        try:
+            last_candle = {
+                "ts": int(last_candle_raw[0]),
+                "open": float(last_candle_raw[1]),
+                "high": float(last_candle_raw[2]),
+                "low": float(last_candle_raw[3]),
+                "close": float(last_candle_raw[4]),
+                "volume": float(last_candle_raw[5]) if len(last_candle_raw) >= 6 and last_candle_raw[5] is not None else None,
+            }
+        except Exception:
+            last_candle = None
 
     snap = {
         "market": market,
         "symbol": ex_symbol,
         "timeframe": tf,
         "last_candle_ts": last_candle_ts,
+        "last_candle": last_candle,
+        "ohlcv_count": len(ohlcv),
         "fetched_at": time.time(),
         "closes": closes,
     }
@@ -362,6 +381,77 @@ def get_ema20_m15(symbol: str):
 
 def get_ema20_h1(symbol: str):
     return get_ema(20, "1h", symbol=symbol)
+
+
+def get_ema_provenance(period: int, timeframe: str, *, symbol: str) -> dict:
+    """
+    Возвращает EMA и минимальный provenance для воспроизводимости:
+    рынок/таймфрейм/кол-во свечей/последняя свеча/хвост close.
+    """
+    try:
+        p = int(period)
+    except Exception:
+        p = 0
+    tf = _normalize_timeframe(timeframe)
+
+    out: dict = {
+        "ema": None,
+        "exchange": None,
+        "market_type": None,
+        "price_source": "last",
+        "timeframe": tf,
+        "candles_count": None,
+        "last_candle": None,
+        "closes_tail": None,
+        "symbol": (symbol or "").strip() or None,
+        "market": None,
+    }
+
+    if p <= 1:
+        return out
+
+    warmup_len = max(500, p * 20)
+    for market in ("bybit_swap", "binance_future"):
+        snap = _fetch_closes_from_market(
+            market,
+            tf,
+            symbol=symbol,
+            limit=warmup_len,
+            min_len=p,
+        )
+        if not snap:
+            continue
+        closes = snap.get("closes") if isinstance(snap.get("closes"), list) else None
+        if not closes:
+            continue
+        ema_val = _ema_sma_seed(closes, p)
+        if ema_val is None:
+            continue
+
+        out["ema"] = round(float(ema_val), 6)
+        out["market"] = market
+        out["symbol"] = snap.get("symbol")
+        out["timeframe"] = snap.get("timeframe") or tf
+        out["candles_count"] = len(closes)
+        out["last_candle"] = snap.get("last_candle")
+        try:
+            out["closes_tail"] = [float(x) for x in closes[-5:]]
+        except Exception:
+            out["closes_tail"] = None
+
+        if market == "bybit_swap":
+            out["exchange"] = "bybit"
+            out["market_type"] = "linear_perp"
+        elif market == "binance_future":
+            out["exchange"] = "binance"
+            out["market_type"] = "usdt_future"
+        else:
+            out["exchange"] = str(market)
+            out["market_type"] = None
+
+        return out
+
+    return out
 
 
 def debug_get_ema_snapshot(symbol: str) -> dict:
@@ -843,6 +933,16 @@ def _fetch_ticker(ex, sym):
 
 
 def get_pair_ticker(sym: str):
+    # Приоритет: Bybit USDT perpetual (swap/linear), чтобы совпадать по смыслу с EMA (Bybit Futures chart).
+    try:
+        ex = _get_exchange("bybit_swap")
+        ex_sym = _normalize_bybit_swap_symbol(sym)
+        last, change = _fetch_ticker(ex, ex_sym)
+        if last is not None:
+            return {"last": last, "change": change}
+    except Exception:
+        pass
+
     bybit = ccxt.bybit()
     binance = ccxt.binance()
     for ex in (bybit, binance):

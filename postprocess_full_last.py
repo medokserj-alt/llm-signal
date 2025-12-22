@@ -7,6 +7,7 @@ from postprocess import process as pp_process
 from get_signal_json import (
     get_ema20_m15,
     get_ema20_h1,
+    get_ema_provenance,
     apply_ema_exhale_filter,
     normalize_no_trade,
     validate_or_fallback_tvh_by_mode,
@@ -16,6 +17,38 @@ from get_signal_json import (
 BASE = Path(__file__).resolve().parent
 
 VALID_MODES = ("aggressive", "neutral", "conservative")
+
+def _ema_state(price, em15, em1h) -> str:
+    try:
+        if price is None or em15 is None or em1h is None:
+            return "unknown"
+        p = float(price)
+        e15 = float(em15)
+        e1h = float(em1h)
+        if p > e15 and p > e1h:
+            return "above_both"
+        if p < e15 and p < e1h:
+            return "below_both"
+        return "between"
+    except Exception:
+        return "unknown"
+
+
+def _ema_guard_text(state: str) -> str:
+    s = (state or "unknown").strip().lower()
+    if s == "above_both":
+        return "Цена выше EMA20 на M15 и H1."
+    if s == "below_both":
+        return "Цена ниже EMA20 на M15 и H1."
+    if s == "between":
+        return "Цена между EMA20(M15) и EMA20(H1)."
+    return "EMA guard: недостаточно данных для определения положения цены относительно EMA."
+
+
+def _apply_ema_guard_text_consistent(d: dict) -> None:
+    state = _ema_state(d.get("price"), d.get("ema20_m15"), d.get("ema20_h1"))
+    d["ema_guard"] = _ema_guard_text(state)
+
 
 def _round_price(val):
     try:
@@ -154,10 +187,35 @@ def main():
     try:
         sym = data.get("symbol")
         if sym:
-            if not data.get("ema20_m15"):
+            prov_m15 = get_ema_provenance(20, "15m", symbol=sym)
+            if prov_m15.get("ema") is not None:
+                data["ema20_m15"] = prov_m15.get("ema")
+            elif not data.get("ema20_m15"):
                 data["ema20_m15"] = get_ema20_m15(sym)
+
+            if prov_m15.get("exchange") is not None:
+                data["exchange"] = prov_m15.get("exchange")
+            if prov_m15.get("market_type") is not None:
+                data["market_type"] = prov_m15.get("market_type")
+            if prov_m15.get("price_source") is not None:
+                data["price_source"] = prov_m15.get("price_source")
+            if prov_m15.get("timeframe") is not None:
+                data["timeframe_m15"] = prov_m15.get("timeframe")
+            if prov_m15.get("candles_count") is not None:
+                data["candles_m15_count"] = prov_m15.get("candles_count")
+            if prov_m15.get("last_candle") is not None:
+                data["last_candle_m15"] = prov_m15.get("last_candle")
+            if prov_m15.get("closes_tail") is not None:
+                data["closes_m15_tail"] = prov_m15.get("closes_tail")
+
             if not data.get("ema20_h1"):
                 data["ema20_h1"] = get_ema20_h1(sym)
+    except Exception:
+        pass
+
+    # 1b) ema_guard текст должен соответствовать рассчитанным EMA/price (без изменения остального текста)
+    try:
+        _apply_ema_guard_text_consistent(data)
     except Exception:
         pass
 
