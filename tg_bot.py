@@ -10,6 +10,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 from pinned_state import get_pinned_message_id, load_pinned_state, save_pinned_state, set_pinned_message_id
+from rbac import analysis_menu_layout, is_admin
 
 # ============== BASE / ENV ==================
 
@@ -256,15 +257,11 @@ def signal_menu_kb():
     rows.append([KeyboardButton("⬅️ Назад")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def analysis_menu_kb():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("📈 Current")],
-            [KeyboardButton("🗓 DAY"), KeyboardButton("📰 MID")],
-            [KeyboardButton("⬅️ Назад")],
-        ],
-        resize_keyboard=True
-    )
+def analysis_menu_kb(uid: int):
+    rows = []
+    for row in analysis_menu_layout(is_admin(uid)):
+        rows.append([KeyboardButton(x) for x in row])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 def mode_menu_kb():
     return ReplyKeyboardMarkup(
@@ -361,7 +358,8 @@ async def handle_signal_menu(update,context):
     await update.message.reply_text("Выбери актив или режим:", reply_markup=signal_menu_kb())
 
 async def handle_analysis_menu(update,context):
-    await update.message.reply_text("Выбери тип анализа:", reply_markup=analysis_menu_kb())
+    uid = update.effective_user.id
+    await update.message.reply_text("Выбери тип анализа:", reply_markup=analysis_menu_kb(uid))
 
 async def handle_mode_menu(update,context):
     uid = update.effective_user.id
@@ -619,6 +617,9 @@ async def handle_day(update,context):
     if not is_allowed(uid):
         await update.message.reply_text("Нет доступа.")
         return
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Недоступно")
+        return
     if is_gen_locked():
         await update.message.reply_text("Уже считается, позже.")
         return
@@ -652,6 +653,9 @@ async def handle_mid(update,context):
     uid = update.effective_user.id
     if not is_allowed(uid):
         await update.message.reply_text("Нет доступа.")
+        return
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Недоступно")
         return
     if is_gen_locked():
         await update.message.reply_text("Уже считается, позже.")
