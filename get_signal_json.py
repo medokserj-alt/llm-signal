@@ -1372,6 +1372,120 @@ def _round_price(val):
     prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
     return round(v, prec)
 
+def _ema_relation_flag(price, ema) -> str:
+    """
+    Returns relation of price vs EMA in {"above","below","equal"}.
+    If values are missing/unparseable, defaults to "equal" (neutral).
+    """
+    try:
+        p = float(price)
+        e = float(ema)
+    except Exception:
+        return "equal"
+    if not (p == p and e == e):  # NaN guard
+        return "equal"
+    # Use a small relative tolerance for "equal" to avoid flip-flops due to rounding.
+    tol = max(abs(p) * 1e-6, 1e-12)
+    if abs(p - e) <= tol:
+        return "equal"
+    return "above" if p > e else "below"
+
+
+def apply_ema_relation_flags(d: dict) -> None:
+    """
+    Adds explicit EMA relation flags used by the LLM and by rendering:
+      - price_vs_ema20_m15: above|below|equal
+      - price_vs_ema20_h1:  above|below|equal
+      - ema_guard_state: above_both|below_both|between
+      - ema_guard_notes: optional (derived from ema_guard.note/comment if present)
+    Does NOT change trading logic.
+    """
+    if not isinstance(d, dict):
+        return
+
+    price = d.get("price")
+    em15 = d.get("ema20_m15")
+    em1h = d.get("ema20_h1")
+
+    d["price_vs_ema20_m15"] = _ema_relation_flag(price, em15)
+    d["price_vs_ema20_h1"] = _ema_relation_flag(price, em1h)
+
+    # Derive guard state from relations when possible; otherwise keep neutral "between".
+    m15 = d.get("price_vs_ema20_m15")
+    h1 = d.get("price_vs_ema20_h1")
+    if m15 == "above" and h1 == "above":
+        state = "above_both"
+    elif m15 == "below" and h1 == "below":
+        state = "below_both"
+    else:
+        state = "between"
+    d["ema_guard_state"] = state
+
+    # Preserve any existing notes if already present.
+    if "ema_guard_notes" not in d:
+        eg = d.get("ema_guard")
+        note = None
+        if isinstance(eg, dict):
+            note = eg.get("note") or eg.get("comment")
+        if isinstance(note, str) and note.strip():
+            d["ema_guard_notes"] = note.strip()
+
+
+def enforce_ema_narrative_consistency(d: dict) -> None:
+    """
+    Minimal safety-net: ensure why_asset and multi_tf_view (m15/h1)
+    do not contradict computed EMA relation flags.
+    """
+    if not isinstance(d, dict):
+        return
+
+    apply_ema_relation_flags(d)
+
+    vs_m15 = (d.get("price_vs_ema20_m15") or "equal").strip().lower()
+    vs_h1 = (d.get("price_vs_ema20_h1") or "equal").strip().lower()
+    guard = (d.get("ema_guard_state") or "between").strip().lower()
+
+    def _fix_line(text: str, desired: str) -> str:
+        s = str(text or "")
+        low = s.lower()
+        wants_above = desired == "above"
+        wants_below = desired == "below"
+        wants_equal = desired == "equal"
+
+        # If line makes an explicit contradictory EMA20 claim, rewrite to the desired polarity.
+        if ("ema20" in low) and ("выше" in low or "ниже" in low or "над " in low or "под " in low):
+            if wants_above and ("ниже" in low or "под " in low):
+                return re.sub(r"(?i)\b(ниже|под)\b", "выше", s)
+            if wants_below and ("выше" in low or "над " in low):
+                return re.sub(r"(?i)\b(выше|над)\b", "ниже", s)
+            if wants_equal:
+                # Neutralize strong above/below wording while keeping the rest.
+                s2 = re.sub(r"(?i)\b(выше|над|ниже|под)\b", "у", s)
+                return s2
+        return s
+
+    # multi_tf_view: m15/h1 lines must be consistent if present.
+    mtf = d.get("multi_tf_view")
+    if isinstance(mtf, dict):
+        if "m15" in mtf and isinstance(mtf.get("m15"), str):
+            mtf["m15"] = _fix_line(mtf.get("m15", ""), vs_m15)
+        if "h1" in mtf and isinstance(mtf.get("h1"), str):
+            mtf["h1"] = _fix_line(mtf.get("h1", ""), vs_h1)
+        d["multi_tf_view"] = mtf
+
+    # why_asset: avoid generic "above/below EMA20" claims that contradict guard state.
+    why = d.get("why_asset")
+    if isinstance(why, str) and why.strip():
+        low = why.lower()
+        if "ema20" in low and ("выше" in low or "ниже" in low or "над " in low or "под " in low):
+            if guard == "above_both":
+                d["why_asset"] = re.sub(r"(?i)\b(ниже|под)\b", "выше", why)
+            elif guard == "below_both":
+                d["why_asset"] = re.sub(r"(?i)\b(выше|над)\b", "ниже", why)
+            else:
+                # between: keep neutral wording
+                d["why_asset"] = re.sub(r"(?i)\b(выше|над|ниже|под)\b", "у", why)
+
 
 def apply_direction_guard(d: dict) -> None:
     """
@@ -2193,6 +2307,13 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
             },
         )
 
+    # Explicit EMA relation flags (payload + rendering) + narrative safety net.
+    try:
+        apply_ema_relation_flags(d)
+        enforce_ema_narrative_consistency(d)
+    except Exception:
+        pass
+
     apply_direction_guard(d)
     _normalize_day_mid_context(d)
     d.setdefault(
@@ -2532,6 +2653,10 @@ payload["hints"]["time_msk"] = current_msk()
 _sym = payload["hints"].get("symbol")
 payload["hints"]["ema20_m15"] = get_ema20_m15(_sym) if _sym else None
 payload["hints"]["ema20_h1"] = get_ema20_h1(_sym) if _sym else None
+try:
+    apply_ema_relation_flags(payload.get("hints", {}))
+except Exception:
+    pass
 
 btc_info = get_pair_ticker("BTC/USDT")
 eth_info = get_pair_ticker("ETH/USDT")

@@ -77,6 +77,18 @@
   "max_valid_minutes": 90
 }
 
+### EMA NARRATIVE CONSTRAINTS (HARD)
+Во входе могут быть рассчитанные флаги:
+- price_vs_ema20_m15: "above" | "below" | "equal"
+- price_vs_ema20_h1:  "above" | "below" | "equal"
+- ema_guard_state: "above_both" | "below_both" | "between"
+
+Правила для why_asset и multi_tf_view:
+1) Никогда не утверждай «цена выше/ниже EMA20» по ТФ, если это не совпадает с флагами.
+2) Если price_vs_ema20_m15="below" — в multi_tf_view.m15 нельзя писать «выше EMA20»; исправь на «ниже EMA20».
+3) Если ema_guard_state="between" — не описывай ситуацию так, будто цена выше EMA20 одновременно на M15 и H1.
+4) Если флаг "equal" или данных мало — пиши нейтрально: «цена у EMA20 / вблизи EMA20», без противоречий.
+
 ### LEVEL RULES (HARD)
 - `entry_range` ОБЯЗАТЕЛЕН. Если его нельзя корректно построить — **stand-by**, не публиковать.
 - `entry_mid = (min+max)/2`. Запрещено использовать `price` как `entry_mid`.

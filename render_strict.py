@@ -95,6 +95,33 @@ def _truncate(s: str, limit: int) -> str:
         cut = cut.rsplit(" ", 1)[0].rstrip()
     return cut.rstrip(".,;:—- ") + "…"
 
+def _ema_status_line(data: dict) -> str | None:
+    def norm_flag(v) -> str | None:
+        if not isinstance(v, str):
+            return None
+        v = v.strip().lower()
+        return v if v in ("above", "below", "equal") else None
+
+    def compute_flag(price, ema) -> str | None:
+        try:
+            p = float(price)
+            e = float(ema)
+        except Exception:
+            return None
+        tol = max(abs(p) * 1e-6, 1e-12)
+        if abs(p - e) <= tol:
+            return "equal"
+        return "above" if p > e else "below"
+
+    def label(flag: str | None) -> str:
+        return {"above": "ВЫШЕ EMA20", "below": "НИЖЕ EMA20", "equal": "У EMA20"}.get(flag or "", "—")
+
+    m15 = norm_flag(data.get("price_vs_ema20_m15")) or compute_flag(data.get("price"), data.get("ema20_m15"))
+    h1 = norm_flag(data.get("price_vs_ema20_h1")) or compute_flag(data.get("price"), data.get("ema20_h1"))
+    if not m15 and not h1:
+        return None
+    return f"EMA статус: M15: {label(m15)} | H1: {label(h1)}"
+
 
 def main():
     raw = sys.stdin.read().strip()
@@ -311,6 +338,9 @@ def main():
         # 3) Таймфреймы
         if mode_valid:
             lines.append("3️⃣ Таймфреймы")
+            ema_line = _ema_status_line(data)
+            if ema_line:
+                lines.append(ema_line)
             lines.append(
                 "5m: "
                 f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(str(mtf.get('m15','—')))}; "

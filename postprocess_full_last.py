@@ -8,6 +8,8 @@ from get_signal_json import (
     get_ema20_m15,
     get_ema20_h1,
     get_ema_provenance,
+    apply_ema_relation_flags,
+    enforce_ema_narrative_consistency,
     apply_ema_exhale_filter,
     normalize_no_trade,
     validate_or_fallback_tvh_by_mode,
@@ -218,6 +220,11 @@ def main():
         _apply_ema_guard_text_consistent(data)
     except Exception:
         pass
+    try:
+        apply_ema_relation_flags(data)
+        enforce_ema_narrative_consistency(data)
+    except Exception:
+        pass
 
     # 2) Читаем DAY/MID тексты (вариант A)
     day_txt, day_age_hours = read_latest_report_text("day", limit_chars=2000)
@@ -237,6 +244,11 @@ def main():
     data = pp_process(data, day_context, mid_context)
     try:
         apply_ema_exhale_filter(data)
+    except Exception:
+        pass
+    try:
+        apply_ema_relation_flags(data)
+        enforce_ema_narrative_consistency(data)
     except Exception:
         pass
     normalize_no_trade(data)
