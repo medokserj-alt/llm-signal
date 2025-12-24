@@ -15,6 +15,7 @@ from get_signal_json import (
     validate_or_fallback_tvh_by_mode,
     validate_active_mode_setup,
 )
+from no_trade_explain import ensure_decision_path
 
 BASE = Path(__file__).resolve().parent
 
@@ -255,6 +256,7 @@ def main():
     _ensure_by_mode_levels(data)
     validate_active_mode_setup(data)
     normalize_no_trade(data)
+    ensure_decision_path(data)
 
     # 4) сохраняем обратно
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

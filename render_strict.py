@@ -7,6 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import math
 
+from no_trade_explain import format_no_trade_message, ensure_decision_path
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 
@@ -173,22 +174,8 @@ def main():
     no_trade_hint = (data.get("no_trade_hint") or "").strip()
 
     if no_trade:
-        reason = _one_line(no_trade_hint)
-        if not reason:
-            for r in no_trade_reasons:
-                if isinstance(r, str) and _one_line(r):
-                    reason = _one_line(r)
-                    break
-        reason = _truncate(reason or "Недостаточно надёжного сетапа", 220)
-        reason = reason.rstrip(".").rstrip()
-
-        text_out = "\n".join(
-            [
-                "📌 Сигнал не выдан",
-                f"Причина: {reason}.",
-                "Я продолжу мониторить рынок и дам обновление при появлении надёжного сетапа.",
-            ]
-        )
+        ensure_decision_path(data)
+        text_out = format_no_trade_message(data)
     else:
         # --- формируем текст (короткий формат Димы) ---
         lines: list[str] = []
