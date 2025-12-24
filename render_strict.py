@@ -7,7 +7,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import math
 
-from no_trade_explain import format_no_trade_message, ensure_decision_path
+from no_trade_explain import (
+    ensure_decision_path,
+    format_no_trade_message,
+    infer_mode_reject_reason_key,
+    reason_to_short_text,
+)
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 
@@ -137,6 +142,10 @@ def main():
     price = fmt(data.get("price", ""))
 
     mode = normalize_mode(data.get("mode"))
+    requested_mode_raw = data.get("requested_mode") if isinstance(data, dict) else None
+    requested_mode = (
+        normalize_mode(requested_mode_raw) if requested_mode_raw is not None else None
+    )
 
     def _direction_badge(d: dict) -> str:
         raw_side = d.get("side")
@@ -197,6 +206,88 @@ def main():
             "neutral": "🟨 Нейтральный",
             "conservative": "🟩 Консервативный",
         }
+
+        def _iter_warnings(d: dict) -> list[str]:
+            w = d.get("warnings")
+            if not isinstance(w, list):
+                return []
+            out: list[str] = []
+            for it in w:
+                if isinstance(it, str) and it.strip():
+                    out.append(it.strip())
+            return out
+
+        def _is_between_ema_m15_h1(d: dict) -> bool:
+            def norm_flag(v) -> str | None:
+                if not isinstance(v, str):
+                    return None
+                v = v.strip().lower()
+                return v if v in ("above", "below", "equal") else None
+
+            m15 = norm_flag(d.get("price_vs_ema20_m15"))
+            h1 = norm_flag(d.get("price_vs_ema20_h1"))
+            if m15 and h1:
+                if m15 == "equal" or h1 == "equal":
+                    return True
+                return m15 != h1
+
+            ema_guard = d.get("ema_guard")
+            if isinstance(ema_guard, dict):
+                st = str(ema_guard.get("state") or "").strip().lower()
+                return st == "between"
+            return False
+
+        def _downgrade_reason_text(d: dict, src_mode: str) -> str:
+            keys: list[str] = []
+
+            path = d.get("decision_path") if isinstance(d.get("decision_path"), list) else None
+            if path is None:
+                ensure_decision_path(d)
+                path = d.get("decision_path") if isinstance(d.get("decision_path"), list) else []
+
+            for step in path or []:
+                if not isinstance(step, dict):
+                    continue
+                if step.get("result") != "rejected":
+                    continue
+                if normalize_mode(step.get("mode")) != src_mode:
+                    continue
+                rk = str(step.get("reason") or "").strip()
+                if rk:
+                    keys.append(rk)
+
+            # Fallback to direct inference from existing fields.
+            if not keys:
+                keys.append(infer_mode_reject_reason_key(d, src_mode))
+
+            # Add up to one extra "headline" reason if present.
+            wl = " ".join(w.lower() for w in _iter_warnings(d))
+            if "time_window" in wl:
+                keys.append("time_window")
+            elif "risk_off" in wl:
+                keys.append("risk_off")
+            elif "impulse_no_exhale" in wl:
+                keys.append("impulse_no_exhale")
+            elif "phase_between" in wl:
+                keys.append("phase_between")
+            elif _is_between_ema_m15_h1(d):
+                keys.append("ema_guard_between")
+
+            seen: set[str] = set()
+            out: list[str] = []
+            for k in keys:
+                kk = (k or "").strip()
+                if not kk:
+                    continue
+                if kk in seen:
+                    continue
+                seen.add(kk)
+                txt = reason_to_short_text(kk, src_mode).strip()
+                if txt:
+                    out.append(txt)
+                if len(out) >= 2:
+                    break
+            return "; ".join(out[:2])
 
         def _as_float(x):
             try:
@@ -301,6 +392,11 @@ def main():
         else:
             lines.append("2️⃣ Сетап")
             lines.append(f"Режим: {MODE_LABELS.get(mode, mode)}")
+            if requested_mode and requested_mode != mode:
+                lines.append(f"🔁 Downgrade: {requested_mode} → {mode}")
+                reason = _downgrade_reason_text(data, requested_mode)
+                if reason:
+                    lines.append(f"Причина: {reason}")
             lines.append(f"Направление: {_direction_badge(data) or '—'}")
             lines.append(f"Вход: {fmt(entry_val)}")
             lines.append(f"SL: {fmt(sl_val)}")

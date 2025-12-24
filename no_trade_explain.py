@@ -113,6 +113,46 @@ def _infer_mode_reject_reason_key(d: dict, mode: str) -> str:
     return "mode_disabled"
 
 
+def infer_mode_reject_reason_key(d: dict, mode: str) -> str:
+    """
+    Public wrapper for mode rejection inference (used by renderers for transparency).
+    Does NOT change trading logic.
+    """
+    return _infer_mode_reject_reason_key(d, mode)
+
+
+def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
+    """
+    Trader-readable short reason (1 line).
+    Does NOT change trading logic.
+    """
+    k = (reason_key or "").strip()
+    low = k.lower()
+
+    if low in {"phase_between", "ema_between_m15_h1", "ema_guard_between"}:
+        return "цена в зоне между EMA20(M15) и EMA20(H1)"
+    if low in {"impulse_no_exhale", "waiting_confirmation"}:
+        return "нет подтверждённого отката/«выдоха» после импульса (M15)"
+    if low in {"time_window", "time_window_low_liquidity"}:
+        return "риск-окно по времени/ликвидности"
+    if low == "risk_off":
+        return "режим risk-off (повышенный риск рынка)"
+    if low == "low_rr":
+        return "недостаточный R:R для режима"
+    if low == "invalid_mode_setup":
+        return "неполные/некорректные уровни для режима"
+    if low == "mode_disabled":
+        m = normalize_mode(mode) if mode else ""
+        suffix = f" ({m})" if m else ""
+        return f"режим отключён фильтрами{suffix}"
+    if low == "ema_guard_below_both_long":
+        return "для LONG: цена ниже EMA20(M15/H1)"
+    if low == "ema_guard_above_both_short":
+        return "для SHORT: цена выше EMA20(M15/H1)"
+
+    return k
+
+
 def build_decision_path(d: dict) -> list[dict]:
     """
     Builds a structured decision path from existing facts only (warnings/entries/no_trade fields).

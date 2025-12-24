@@ -2191,7 +2191,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         mode_val = d.get("mode")
     else:
         mode_val = "neutral"
-    d["mode"] = normalize_mode(mode_val)
+    requested_mode = normalize_mode(mode_val)
+    d["mode"] = requested_mode
+    # Persist the originally requested mode for transparency (may differ from final mode after fallback).
+    d["requested_mode"] = requested_mode
 
     d.setdefault("warnings", [])
     if not d.get("time_msk"):
