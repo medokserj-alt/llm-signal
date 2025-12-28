@@ -50,6 +50,7 @@ PINNED_STATE_PATH = PROJECT_ROOT / "pinned_state.json"
 USER_CONFIG = {}
 GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
 VALID_MODES = {"aggressive", "neutral", "conservative"}
+_AIA_UID_CONTEXT = None
 
 def load_user_channels():
     global USER_CONFIG, GLOBAL_SETTINGS
@@ -277,6 +278,8 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
             uid = uid_val
         elif isinstance(uid_val, str) and uid_val.strip().isdigit():
             uid = int(uid_val.strip())
+        if uid is None and isinstance(_AIA_UID_CONTEXT, int):
+            uid = _AIA_UID_CONTEXT
 
         mode = get_user_mode(uid) if isinstance(uid, int) else "neutral"
 
@@ -290,6 +293,8 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
             entry_type = "pullback"
         elif raw_entry_mode == "breakout":
             entry_type = "breakout"
+        else:
+            entry_type = "pullback"
 
         market_phase = None
         if entry_type == "breakout":
@@ -297,6 +302,8 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         elif entry_type == "wait_confirm":
             market_phase = "range"
         elif entry_type == "pullback":
+            market_phase = "consolidation"
+        else:
             market_phase = "consolidation"
 
         if (
@@ -770,6 +777,8 @@ async def handle_full(update,context):
                         asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
                 published_at = _utc_now_z()
                 signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
+                global _AIA_UID_CONTEXT
+                _AIA_UID_CONTEXT = uid
                 sig_v1 = _build_signal_json_v1(
                     signal_id=signal_id,
                     published_at=published_at,
@@ -905,6 +914,8 @@ async def handle_symbol(update,context):
                         asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
                 published_at = _utc_now_z()
                 signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
+                global _AIA_UID_CONTEXT
+                _AIA_UID_CONTEXT = uid
                 sig_v1 = _build_signal_json_v1(
                     signal_id=signal_id,
                     published_at=published_at,
