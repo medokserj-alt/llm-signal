@@ -265,7 +265,50 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
     except Exception:
         pass
 
-    return {
+    meta = None
+    try:
+        uid_val = d.get("uid")
+        if uid_val is None:
+            uid_val = d.get("user_id")
+        if uid_val is None:
+            uid_val = d.get("tg_uid")
+        uid = None
+        if isinstance(uid_val, int):
+            uid = uid_val
+        elif isinstance(uid_val, str) and uid_val.strip().isdigit():
+            uid = int(uid_val.strip())
+
+        mode = get_user_mode(uid) if isinstance(uid, int) else "neutral"
+
+        raw_entry_mode = d.get("entry_mode")
+        entry_type = None
+        if raw_entry_mode is None:
+            entry_type = "pullback"
+        elif raw_entry_mode in ("wait_confirm", "confirm"):
+            entry_type = "wait_confirm"
+        elif raw_entry_mode == "pullback":
+            entry_type = "pullback"
+        elif raw_entry_mode == "breakout":
+            entry_type = "breakout"
+
+        market_phase = None
+        if entry_type == "breakout":
+            market_phase = "impulse"
+        elif entry_type == "wait_confirm":
+            market_phase = "range"
+        elif entry_type == "pullback":
+            market_phase = "consolidation"
+
+        if (
+            mode in ("aggressive", "neutral", "conservative")
+            and entry_type in ("pullback", "breakout", "wait_confirm")
+            and market_phase in ("impulse", "consolidation", "range")
+        ):
+            meta = {"mode": mode, "entry_type": entry_type, "market_phase": market_phase}
+    except Exception:
+        meta = None
+
+    out = {
         "signal_id": str(signal_id),
         "symbol": str(symbol),
         "direction": str(direction),
@@ -275,10 +318,20 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         "published_at": str(published_at),
         "channel_id": channel_id,
     }
+    if meta is not None:
+        out["meta"] = meta
+    return out
 
 def send_signal_to_aia(signal_json_v1: dict) -> bool:
     try:
         status, _ = _aia_request_json("POST", "/tg/signal", body=signal_json_v1)
+        return 200 <= status < 300
+    except Exception:
+        return False
+
+def send_no_trade_decision_to_aia(payload: dict) -> bool:
+    try:
+        status, _ = _aia_request_json("POST", "/tg/decision", body=payload)
         return 200 <= status < 300
     except Exception:
         return False
@@ -316,6 +369,111 @@ async def _send_signal_to_aia_background(signal_json_v1: dict) -> None:
         await asyncio.to_thread(send_signal_to_aia, signal_json_v1)
     except Exception:
         pass
+
+async def _send_no_trade_decision_to_aia_background(payload: dict) -> None:
+    try:
+        await asyncio.to_thread(send_no_trade_decision_to_aia, payload)
+    except Exception:
+        pass
+
+def _normalize_direction_v1(raw) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("long", "short"):
+        return s
+    if s in ("buy", "bull", "bullish"):
+        return "long"
+    if s in ("sell", "bear", "bearish"):
+        return "short"
+    return None
+
+def _extract_no_trade_reason_text(tg_text: str) -> str:
+    s = (tg_text or "").strip()
+    if not s:
+        return ""
+
+    low = s.lower()
+    start = None
+    for marker in ("причина (no trade):", "причина:"):
+        i = low.find(marker)
+        if i >= 0:
+            start = i + len(marker)
+            break
+    if start is None:
+        start = 0
+
+    tail = s[start:].strip()
+    lines = [ln.strip() for ln in tail.splitlines()]
+
+    picked: list[str] = []
+    for ln in lines:
+        if not ln:
+            continue
+        lnl = ln.lower()
+        if lnl.startswith("что должно измениться"):
+            break
+        if lnl.startswith("статус:"):
+            break
+        if ln.startswith("• "):
+            ln = ln[2:].strip()
+        if ln.startswith(("– ", "- ")):
+            continue
+        if ln and not ln.startswith("📌"):
+            picked.append(ln)
+        if len(picked) >= 2:
+            break
+
+    out = " ".join(picked).strip()
+    if not out:
+        return ""
+    out = re.sub(r"\s+", " ", out).strip()
+    if len(out) > 320:
+        out = out[:320].rstrip()
+    return out
+
+def _build_no_trade_decision_payload(uid: int, *, tg_text: str, symbol_hint: str | None) -> dict | None:
+    last = _read_last_signal_json() or {}
+    asset = (symbol_hint or last.get("symbol") or last.get("asset"))
+    if not asset:
+        return None
+
+    direction = _normalize_direction_v1(last.get("direction") or last.get("side"))
+    if direction is None:
+        return None
+
+    mode = get_user_mode(uid)
+
+    low = (tg_text or "").lower()
+    if "risk" in low:
+        reason_code = "risk_window"
+        market_phase = "range"
+        entry_type = "wait_confirm"
+    elif "structural" in low:
+        reason_code = "structural"
+        market_phase = "consolidation"
+        entry_type = "pullback"
+    elif "liquidity" in low:
+        reason_code = "liquidity"
+        market_phase = "consolidation"
+        entry_type = "pullback"
+    else:
+        reason_code = "rr_invalid"
+        market_phase = "consolidation"
+        entry_type = "pullback"
+
+    reason_text = _extract_no_trade_reason_text(tg_text)
+    if not reason_text:
+        reason_text = "NO_TRADE"
+
+    return {
+        "signal_candidate": {"asset": str(asset), "direction": direction, "mode": mode},
+        "reason_code": reason_code,
+        "reason_text": reason_text,
+        "market_phase": market_phase,
+        "entry_type": entry_type,
+        "evaluated_at": _utc_now_z(),
+    }
 
 async def _is_chat_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_user:
@@ -604,7 +762,12 @@ async def handle_full(update,context):
         if sig_html:
             parts = html_file_to_tg_text(Path(sig_html))
             if parts:
-                await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+parts[0])
+                part0 = parts[0]
+                await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+part0)
+                if "📌 Сигнал не выдан" in part0:
+                    payload = _build_no_trade_decision_payload(uid, tg_text=part0, symbol_hint=None)
+                    if payload:
+                        asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
                 published_at = _utc_now_z()
                 signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
                 sig_v1 = _build_signal_json_v1(
@@ -734,7 +897,12 @@ async def handle_symbol(update,context):
         if sig_html:
             parts = html_file_to_tg_text(Path(sig_html))
             if parts:
-                await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+parts[0])
+                part0 = parts[0]
+                await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+part0)
+                if "📌 Сигнал не выдан" in part0:
+                    payload = _build_no_trade_decision_payload(uid, tg_text=part0, symbol_hint=symbol)
+                    if payload:
+                        asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
                 published_at = _utc_now_z()
                 signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
                 sig_v1 = _build_signal_json_v1(
