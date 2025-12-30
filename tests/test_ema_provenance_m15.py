@@ -10,16 +10,18 @@ import postprocess_full_last
 class TestEMAProvenanceM15(unittest.TestCase):
     def test_last_json_has_provenance_and_ema_uses_15m(self) -> None:
         calls: list[tuple[str, str]] = []
-        closes = [float(i) for i in range(1, 31)]  # 30 closes, enough for EMA20 with warm-up tail
+        closes_15m = [float(i) for i in range(1, 31)]  # 30 closes, enough for EMA20 with warm-up tail
+        closes_1h = [float(i) for i in range(101, 131)]
 
         old_fetch = get_signal_json._fetch_closes_from_market
         old_base = postprocess_full_last.BASE
 
         def fake_fetch(market: str, timeframe: str, *, symbol: str, limit: int, min_len: int):  # type: ignore[no-untyped-def]
             calls.append((market, timeframe))
-            # Regression: EMA20_m15 must be built from 15m candles, not 1h/5m/etc.
-            self.assertEqual(timeframe, "15m")
             self.assertEqual(symbol, "SOL/USDT")
+            # Regression: EMA20_m15 must be built from 15m candles, not 1h/5m/etc.
+            self.assertIn(timeframe, ("15m", "1h"))
+            closes = closes_15m if timeframe == "15m" else closes_1h
             return {
                 "market": market,
                 "symbol": "SOL/USDT:USDT",
@@ -47,7 +49,7 @@ class TestEMAProvenanceM15(unittest.TestCase):
                 in_data = {
                     "symbol": "SOL/USDT",
                     "price": 50.0,
-                    "ema20_h1": 40.0,  # avoid any network fetch for H1
+                    "ema20_h1": 40.0,  # intentionally present; must still be overwritten by provenance
                     "entries": {"neutral": {"enabled": True, "range": {"min": 1, "max": 2}}},
                     "no_trade": False,
                     "no_trade_reasons": [],
@@ -75,14 +77,14 @@ class TestEMAProvenanceM15(unittest.TestCase):
 
                 # Expected EMA20 from closes, SMA seed + iterative EMA (same as get_signal_json._ema_sma_seed).
                 p = 20
-                seed = sum(closes[:p]) / float(p)
+                seed = sum(closes_15m[:p]) / float(p)
                 k = 2.0 / (float(p) + 1.0)
                 ema = float(seed)
-                for v in closes[p:]:
+                for v in closes_15m[p:]:
                     ema = float(v) * k + ema * (1.0 - k)
                 self.assertAlmostEqual(float(out.get("ema20_m15")), round(ema, 6), places=6)
 
-                # Ensure we did fetch and only needed the 15m path.
+                # Ensure we did fetch using Bybit (single source of truth).
                 self.assertTrue(any(m == "bybit_swap" for (m, _tf) in calls))
         finally:
             get_signal_json._fetch_closes_from_market = old_fetch  # type: ignore[assignment]
@@ -91,4 +93,3 @@ class TestEMAProvenanceM15(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

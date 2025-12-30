@@ -16,8 +16,8 @@ class TestEMANarrativeConsistency(unittest.TestCase):
     def test_postprocess_adds_flags_and_fixes_m15_claim(self) -> None:
         old_base = postprocess_full_last.BASE
 
-        def fake_prov(*_args, **_kwargs):  # type: ignore[no-untyped-def]
-            return {"ema": None}
+        def fake_overwrite(_d: dict) -> None:
+            return
 
         try:
             with tempfile.TemporaryDirectory(dir=str(Path(__file__).resolve().parent)) as td:
@@ -54,7 +54,9 @@ class TestEMANarrativeConsistency(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                with patch.object(postprocess_full_last, "get_ema_provenance", side_effect=fake_prov):
+                # For this test we want to validate narrative fixes using the explicitly provided EMA values
+                # without overriding them from provenance.
+                with patch.object(postprocess_full_last, "overwrite_ema20_from_provenance", side_effect=fake_overwrite):
                     postprocess_full_last.main()
 
                 out = json.loads((base / "logs" / "last.json").read_text(encoding="utf-8"))

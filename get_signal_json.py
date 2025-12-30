@@ -30,6 +30,12 @@ import pathlib as _pl
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 
+# ---- Variant B+2: neutral semantics guard ----
+# Neutral mode must not recommend entries "too close" to current price.
+# Thresholds are configurable here (single place).
+NEUTRAL_MIN_DIST_PCT_MAJOR = 0.25  # BTC/, ETH/
+NEUTRAL_MIN_DIST_PCT_ALT = 0.35  # others
+
 # ---- Debug trace (diagnostics only; gated by env DEBUG_TRACE=1) ----
 _DEBUG_TRACE_ENABLED = os.getenv("DEBUG_TRACE") == "1"
 _DEBUG_TRACE: dict | None = {} if _DEBUG_TRACE_ENABLED else None
@@ -353,8 +359,8 @@ def get_ema(period: int, timeframe: str, *, symbol: str) -> float | None:
     tf = _normalize_timeframe(timeframe)
     warmup_len = max(500, p * 20)
 
-    # Источник: приоритет Bybit swap (USDT perpetual), затем fallback Binance (по возможности futures)
-    for market in ("bybit_swap", "binance_future"):
+    # Источник: Bybit swap (USDT perpetual / linear) — единый источник истины.
+    for market in ("bybit_swap",):
         snap = _fetch_closes_from_market(
             market,
             tf,
@@ -411,7 +417,8 @@ def get_ema_provenance(period: int, timeframe: str, *, symbol: str) -> dict:
         return out
 
     warmup_len = max(500, p * 20)
-    for market in ("bybit_swap", "binance_future"):
+    # Single source of truth: Bybit USDT perpetual (linear swap).
+    for market in ("bybit_swap",):
         snap = _fetch_closes_from_market(
             market,
             tf,
@@ -439,19 +446,45 @@ def get_ema_provenance(period: int, timeframe: str, *, symbol: str) -> dict:
         except Exception:
             out["closes_tail"] = None
 
-        if market == "bybit_swap":
-            out["exchange"] = "bybit"
-            out["market_type"] = "linear_perp"
-        elif market == "binance_future":
-            out["exchange"] = "binance"
-            out["market_type"] = "usdt_future"
-        else:
-            out["exchange"] = str(market)
-            out["market_type"] = None
+        # Keep provenance identity stable.
+        out["exchange"] = "bybit"
+        out["market_type"] = "linear_perp"
 
         return out
 
     return out
+
+
+def overwrite_ema20_from_provenance(d: dict) -> None:
+    """
+    Enforce a single source of truth for EMA20(M15/H1):
+    always overwrite EMA values from computed OHLCV provenance (Bybit linear perp),
+    never from LLM text/hints.
+    """
+    if not isinstance(d, dict):
+        return
+    sym = (d.get("symbol") or "").strip()
+    if not sym:
+        return
+
+    # Keep identity fields stable (EMA provenance source, not a price hint).
+    d["exchange"] = "bybit"
+    d["market_type"] = "linear_perp"
+    d["price_source"] = "last"
+
+    prov_m15 = get_ema_provenance(20, "15m", symbol=sym)
+    d["ema20_m15"] = prov_m15.get("ema")
+    d["timeframe_m15"] = prov_m15.get("timeframe") or "15m"
+    d["candles_m15_count"] = prov_m15.get("candles_count")
+    d["last_candle_m15"] = prov_m15.get("last_candle")
+    d["closes_m15_tail"] = prov_m15.get("closes_tail")
+
+    prov_h1 = get_ema_provenance(20, "1h", symbol=sym)
+    d["ema20_h1"] = prov_h1.get("ema")
+    d["timeframe_h1"] = prov_h1.get("timeframe") or "1h"
+    d["candles_h1_count"] = prov_h1.get("candles_count")
+    d["last_candle_h1"] = prov_h1.get("last_candle")
+    d["closes_h1_tail"] = prov_h1.get("closes_tail")
 
 
 def debug_get_ema_snapshot(symbol: str) -> dict:
@@ -2105,6 +2138,165 @@ def validate_active_mode_setup(d: dict) -> dict:
     if final_range is not None:
         d["entry_range"] = final_range
 
+    # ---- Variant B+2: neutral entry must not be too close to current price ----
+    # Hard constraint: do not change mode selection rules, SL/TP/RR; only shape neutral entry geometry + transparency.
+    if final_mode == "neutral" and not bool(d.get("no_trade")):
+        price_val = _to_float(d.get("price"))
+        sym = str(d.get("symbol") or "")
+        threshold_pct = (
+            NEUTRAL_MIN_DIST_PCT_MAJOR
+            if (sym.startswith("BTC/") or sym.startswith("ETH/"))
+            else NEUTRAL_MIN_DIST_PCT_ALT
+        )
+
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        er = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None
+        neu_bucket = entries.get("neutral") if isinstance(entries.get("neutral"), dict) else None
+        neu_range_env = (neu_bucket or {}).get("range") if isinstance(neu_bucket, dict) else None
+
+        def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
+            if not isinstance(r, dict):
+                return None
+            a = _to_float(r.get("min"))
+            b = _to_float(r.get("max"))
+            if a is None or b is None:
+                return None
+            if b < a:
+                a, b = b, a
+            if not (a < b):
+                return None
+            return (a, b)
+
+        er_mm = _range_to_minmax(er)
+        env_mm = _range_to_minmax(neu_range_env)
+
+        neutral_too_close = False
+        if price_val is not None and price_val > 0 and er_mm is not None:
+            er_mid = (er_mm[0] + er_mm[1]) / 2.0
+            dist_pct = abs(er_mid - price_val) / price_val * 100.0
+            if dist_pct < threshold_pct:
+                neutral_too_close = True
+
+        if neutral_too_close and side in ("long", "short") and env_mm is not None and price_val is not None and price_val > 0:
+            env_min, env_max = env_mm
+            cur_min, cur_max = er_mm if er_mm is not None else env_mm
+            cur_w = cur_max - cur_min
+            env_w = env_max - env_min
+            if cur_w <= 0:
+                cur_w = env_w
+
+            def _clamp_range_minmax(mn: float, mx: float) -> tuple[float, float] | None:
+                if not (math.isfinite(mn) and math.isfinite(mx)):
+                    return None
+                if mx < mn:
+                    mn, mx = mx, mn
+                if not (mn < mx):
+                    return None
+                mn = max(mn, env_min)
+                mx = min(mx, env_max)
+                if not (mn < mx):
+                    return None
+                return (mn, mx)
+
+            def _adjust_long() -> tuple[float, float] | None:
+                target_mid = price_val * (1.0 - threshold_pct / 100.0)
+                w = min(cur_w, env_w)
+                if w <= 0:
+                    return None
+
+                # Prefer keeping width; center at target mid if possible.
+                mn0 = target_mid - w / 2.0
+                mx0 = target_mid + w / 2.0
+                if mn0 >= env_min and mx0 <= env_max:
+                    return _clamp_range_minmax(mn0, mx0)
+
+                # Move toward farther (lower) edge inside the envelope.
+                mn1 = env_min
+                mx1 = env_min + w
+                if mx1 > env_max:
+                    mx1 = env_max
+                mm1 = _clamp_range_minmax(mn1, mx1)
+                if mm1 is None:
+                    return None
+                if (mm1[0] + mm1[1]) / 2.0 <= target_mid:
+                    return mm1
+
+                # If still too close, shrink width anchored at the farther edge.
+                w2 = 2.0 * (target_mid - env_min)
+                if not (math.isfinite(w2) and w2 > 0):
+                    return mm1
+                w2 = min(w2, env_w)
+                if w2 <= 0:
+                    return mm1
+                return _clamp_range_minmax(env_min, env_min + w2)
+
+            def _adjust_short() -> tuple[float, float] | None:
+                target_mid = price_val * (1.0 + threshold_pct / 100.0)
+                w = min(cur_w, env_w)
+                if w <= 0:
+                    return None
+
+                # Prefer keeping width; center at target mid if possible.
+                mn0 = target_mid - w / 2.0
+                mx0 = target_mid + w / 2.0
+                if mn0 >= env_min and mx0 <= env_max:
+                    return _clamp_range_minmax(mn0, mx0)
+
+                # Move toward farther (upper) edge inside the envelope.
+                mx1 = env_max
+                mn1 = env_max - w
+                if mn1 < env_min:
+                    mn1 = env_min
+                mm1 = _clamp_range_minmax(mn1, mx1)
+                if mm1 is None:
+                    return None
+                if (mm1[0] + mm1[1]) / 2.0 >= target_mid:
+                    return mm1
+
+                # If still too close, shrink width anchored at the farther edge.
+                w2 = 2.0 * (env_max - target_mid)
+                if not (math.isfinite(w2) and w2 > 0):
+                    return mm1
+                w2 = min(w2, env_w)
+                if w2 <= 0:
+                    return mm1
+                return _clamp_range_minmax(env_max - w2, env_max)
+
+            new_mm = _adjust_long() if side == "long" else _adjust_short()
+            if new_mm is not None:
+                new_range = {
+                    "min": float(_round_price(new_mm[0]) if _round_price(new_mm[0]) is not None else new_mm[0]),
+                    "max": float(_round_price(new_mm[1]) if _round_price(new_mm[1]) is not None else new_mm[1]),
+                }
+
+                d["entry_range"] = new_range
+                if isinstance(neu_bucket, dict):
+                    neu_bucket["range"] = new_range
+                    entries["neutral"] = neu_bucket
+                    d["entries"] = entries
+
+                neu_mid = _mid_from_range(new_range)
+                if neu_mid is not None:
+                    d["entry_price_neutral"] = neu_mid
+
+                d["neutral_adjusted"] = True
+                d["neutral_adjust_reason"] = "neutral_too_close"
+
+                # Optional transparency: expose aggressive option (only from existing computed fields).
+                agg_bucket = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else None
+                if isinstance(agg_bucket, dict) and agg_bucket.get("enabled") is True:
+                    agg_range = agg_bucket.get("range") if isinstance(agg_bucket.get("range"), dict) else None
+                    agg_mm = _range_to_minmax(agg_range)
+                    if agg_mm is not None:
+                        agg_entry = _to_float(d.get("entry_price_aggressive"))
+                        if agg_entry is None:
+                            agg_entry = _mid_from_range(agg_range)
+                        d["aggressive_option"] = {
+                            "range": {"min": agg_mm[0], "max": agg_mm[1]},
+                            "entry_price": agg_entry,
+                            "note": "Возможен более ранний вход (aggressive) при повышенном риске.",
+                        }
+
     mode = final_mode
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
 
@@ -2209,21 +2401,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         except Exception:
             pass
 
-    sym_for_ema = symbol
+    # EMA20(M15/H1) must be derived from computed OHLCV provenance (Bybit linear perp),
+    # never from LLM-provided fields or stale hints.
     try:
-        ema20_m15 = _to_float(hints.get("ema20_m15")) if hints_match_symbol else None
-        if ema20_m15 is None:
-            ema20_m15 = _to_float(d.get("ema20_m15"))
-        if ema20_m15 is None and sym_for_ema:
-            ema20_m15 = get_ema20_m15(sym_for_ema)
-        d["ema20_m15"] = ema20_m15
-
-        ema20_h1 = _to_float(hints.get("ema20_h1")) if hints_match_symbol else None
-        if ema20_h1 is None:
-            ema20_h1 = _to_float(d.get("ema20_h1"))
-        if ema20_h1 is None and sym_for_ema:
-            ema20_h1 = get_ema20_h1(sym_for_ema)
-        d["ema20_h1"] = ema20_h1
+        overwrite_ema20_from_provenance(d)
     except Exception:
         pass
 

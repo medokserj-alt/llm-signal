@@ -5,9 +5,7 @@ from pathlib import Path
 
 from postprocess import process as pp_process
 from get_signal_json import (
-    get_ema20_m15,
-    get_ema20_h1,
-    get_ema_provenance,
+    overwrite_ema20_from_provenance,
     apply_ema_relation_flags,
     enforce_ema_narrative_consistency,
     apply_ema_exhale_filter,
@@ -186,33 +184,9 @@ def main():
 
     data = json.loads(p.read_text(encoding="utf-8"))
 
-    # 1) EMA20(M15/H1) для FULL, если отсутствуют
+    # 1) EMA20(M15/H1) for FULL must come from computed OHLCV provenance (Bybit linear perp).
     try:
-        sym = data.get("symbol")
-        if sym:
-            prov_m15 = get_ema_provenance(20, "15m", symbol=sym)
-            if prov_m15.get("ema") is not None:
-                data["ema20_m15"] = prov_m15.get("ema")
-            elif not data.get("ema20_m15"):
-                data["ema20_m15"] = get_ema20_m15(sym)
-
-            if prov_m15.get("exchange") is not None:
-                data["exchange"] = prov_m15.get("exchange")
-            if prov_m15.get("market_type") is not None:
-                data["market_type"] = prov_m15.get("market_type")
-            if prov_m15.get("price_source") is not None:
-                data["price_source"] = prov_m15.get("price_source")
-            if prov_m15.get("timeframe") is not None:
-                data["timeframe_m15"] = prov_m15.get("timeframe")
-            if prov_m15.get("candles_count") is not None:
-                data["candles_m15_count"] = prov_m15.get("candles_count")
-            if prov_m15.get("last_candle") is not None:
-                data["last_candle_m15"] = prov_m15.get("last_candle")
-            if prov_m15.get("closes_tail") is not None:
-                data["closes_m15_tail"] = prov_m15.get("closes_tail")
-
-            if not data.get("ema20_h1"):
-                data["ema20_h1"] = get_ema20_h1(sym)
+        overwrite_ema20_from_provenance(data)
     except Exception:
         pass
 
