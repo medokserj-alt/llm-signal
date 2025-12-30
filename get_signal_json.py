@@ -1405,6 +1405,28 @@ def _round_price(val):
     prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
     return round(v, prec)
 
+def _round_price_dir(val, direction: str) -> float | None:
+    """
+    Directional rounding on the same scale as _round_price():
+      - direction="down": round towards -inf
+      - direction="up":   round towards +inf
+      - otherwise: nearest (round)
+    """
+    try:
+        v = float(val)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    av = abs(v)
+    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
+    m = 10**prec
+    if direction == "down":
+        return math.floor(v * m) / m
+    if direction == "up":
+        return math.ceil(v * m) / m
+    return round(v, prec)
+
 def _ema_relation_flag(price, ema) -> str:
     """
     Returns relation of price vs EMA in {"above","below","equal"}.
@@ -1642,23 +1664,94 @@ def _mid_from_range(r):
 
 
 def apply_entry_prices_from_ranges(d: dict) -> None:
-    neutral_mid = _mid_from_range(d.get("entry_range"))
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
 
     entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
-    agg_mid = _mid_from_range(((entries.get("aggressive") or {}).get("range")))
-    cons_mid = _mid_from_range(((entries.get("conservative") or {}).get("range")))
+    neutral_range = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None
+    if not isinstance(neutral_range, dict):
+        neutral_range = (entries.get("neutral") or {}).get("range") if isinstance(entries.get("neutral"), dict) else None
 
-    if neutral_mid is None:
-        neutral_mid = _mid_from_range(((entries.get("neutral") or {}).get("range")))
+    aggressive_range = (
+        (entries.get("aggressive") or {}).get("range") if isinstance(entries.get("aggressive"), dict) else None
+    )
+    conservative_range = (
+        (entries.get("conservative") or {}).get("range") if isinstance(entries.get("conservative"), dict) else None
+    )
 
-    if agg_mid is None:
-        agg_mid = neutral_mid
-    if cons_mid is None:
-        cons_mid = neutral_mid
+    def _range_minmax(r: dict | None) -> tuple[float, float] | None:
+        if not isinstance(r, dict):
+            return None
+        a = _to_float(r.get("min"))
+        b = _to_float(r.get("max"))
+        if a is None or b is None:
+            return None
+        if b < a:
+            a, b = b, a
+        if not (a < b):
+            return None
+        return (a, b)
 
-    d["entry_price_neutral"] = _round_price(neutral_mid)
-    d["entry_price_aggressive"] = _round_price(agg_mid)
-    d["entry_price_conservative"] = _round_price(cons_mid)
+    def _clamp_to(mm: tuple[float, float] | None, v: float | None) -> float | None:
+        if mm is None or v is None:
+            return v
+        lo, hi = mm
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def _pick_neutral_anchor(mm: tuple[float, float] | None) -> float | None:
+        if mm is None:
+            return None
+        lo, hi = mm
+        return lo if side == "long" else hi
+
+    def _pick_aggressive_anchor(mm: tuple[float, float] | None) -> float | None:
+        if mm is None:
+            return None
+        lo, hi = mm
+        return hi if side == "long" else lo
+
+    if side not in ("long", "short"):
+        neutral_mid = _mid_from_range(neutral_range)
+        if neutral_mid is None:
+            neutral_mid = _mid_from_range(((entries.get("neutral") or {}).get("range")))
+        agg_mid = _mid_from_range(aggressive_range)
+        cons_mid = _mid_from_range(conservative_range)
+        if agg_mid is None:
+            agg_mid = neutral_mid
+        if cons_mid is None:
+            cons_mid = neutral_mid
+        d["entry_price_neutral"] = _round_price(neutral_mid)
+        d["entry_price_aggressive"] = _round_price(agg_mid)
+        d["entry_price_conservative"] = _round_price(cons_mid)
+        return
+
+    neu_mm = _range_minmax(neutral_range)
+    agg_mm = _range_minmax(aggressive_range)
+    cons_mm = _range_minmax(conservative_range)
+
+    neutral_anchor = _pick_neutral_anchor(neu_mm)
+    aggressive_anchor = _pick_aggressive_anchor(agg_mm) if agg_mm is not None else _pick_aggressive_anchor(neu_mm)
+    conservative_anchor = _pick_neutral_anchor(cons_mm) if cons_mm is not None else neutral_anchor
+
+    # Directional rounding so neutral is naturally more conservative than aggressive on the same price scale.
+    neu_dir = "down" if side == "long" else "up"
+    agg_dir = "up" if side == "long" else "down"
+    cons_dir = neu_dir
+
+    neutral_val = _round_price_dir(neutral_anchor, neu_dir)
+    aggressive_val = _round_price_dir(aggressive_anchor, agg_dir)
+    conservative_val = _round_price_dir(conservative_anchor, cons_dir)
+
+    neutral_val = _clamp_to(neu_mm, neutral_val)
+    aggressive_val = _clamp_to(agg_mm, aggressive_val)
+    conservative_val = _clamp_to(cons_mm, conservative_val)
+
+    d["entry_price_neutral"] = neutral_val
+    d["entry_price_aggressive"] = aggressive_val if aggressive_val is not None else neutral_val
+    d["entry_price_conservative"] = conservative_val if conservative_val is not None else neutral_val
 
 
 def enforce_entry_price_order(d: dict) -> None:
@@ -2290,12 +2383,22 @@ def validate_active_mode_setup(d: dict) -> dict:
                     if agg_mm is not None:
                         agg_entry = _to_float(d.get("entry_price_aggressive"))
                         if agg_entry is None:
-                            agg_entry = _mid_from_range(agg_range)
-                        d["aggressive_option"] = {
-                            "range": {"min": agg_mm[0], "max": agg_mm[1]},
-                            "entry_price": agg_entry,
-                            "note": "Возможен более ранний вход (aggressive) при повышенном риске.",
-                        }
+                            # Derive from the aggressive mode's own envelope (no shifting).
+                            lo, hi = agg_mm
+                            anchor = hi if side == "long" else lo
+                            agg_entry = _round_price_dir(anchor, "up" if side == "long" else "down")
+
+                        neutral_entry = _to_float(d.get("entry_price_neutral"))
+                        strict_ok = (
+                            (side == "long" and neutral_entry is not None and agg_entry is not None and neutral_entry < agg_entry)
+                            or (side == "short" and neutral_entry is not None and agg_entry is not None and neutral_entry > agg_entry)
+                        )
+
+                        if strict_ok:
+                            d["aggressive_option"] = {
+                                "entry_price": agg_entry,
+                                "note": "Возможен более ранний вход (aggressive) при повышенном риске.",
+                            }
 
     mode = final_mode
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
@@ -2523,7 +2626,6 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     try:
         apply_ema_blocks_and_derivatives(d, sym_for_ema)
         apply_entry_prices_from_ranges(d)
-        enforce_entry_price_order(d)
     except Exception:
         pass
 

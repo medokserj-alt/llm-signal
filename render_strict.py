@@ -321,25 +321,9 @@ def main():
         if not _mode_enabled_for_active_mode():
             missing.append("режим отключён")
 
-        entry_range = data.get("entry_range") if isinstance(data.get("entry_range"), dict) else {}
-        er_min = _as_float(entry_range.get("min"))
-        er_max = _as_float(entry_range.get("max"))
-        has_valid_entry_range = (
-            er_min is not None
-            and er_max is not None
-            and math.isfinite(er_min)
-            and math.isfinite(er_max)
-            and er_min < er_max
-        )
-        entry_range_str = f"{fmt(er_min)}–{fmt(er_max)}" if has_valid_entry_range else ""
-
         entry_val = _valid_price(data.get(f"entry_price_{mode}"))
-        entry_fallback_to_range = False
         if entry_val is None:
-            if has_valid_entry_range:
-                entry_fallback_to_range = True
-            else:
-                missing.append("цена входа")
+            missing.append("цена входа")
 
         sl_by_mode = data.get("sl_by_mode") if isinstance(data.get("sl_by_mode"), dict) else {}
         sl_val = _valid_price(sl_by_mode.get(mode))
@@ -419,45 +403,21 @@ def main():
                     lines.append(f"Причина: {reason}")
             lines.append(f"Направление: {_direction_badge(data) or '—'}")
 
-            entry_line = f"Зона входа: {entry_range_str}" if entry_fallback_to_range else f"Вход: {fmt(entry_val)}"
+            entry_line = f"Вход: {fmt(entry_val)}"
             px = _as_float(data.get("price"))
-            if (
-                px is not None
-                and px > 0
-                and er_min is not None
-                and er_max is not None
-                and math.isfinite(er_min)
-                and math.isfinite(er_max)
-                and er_min < er_max
-            ):
-                entry_mid = (er_min + er_max) / 2.0
-                delta_pct = abs(entry_mid - px) / px * 100.0
-
-                if er_min <= px <= er_max:
-                    relation = "around_current"
-                elif entry_mid < px:
-                    relation = "below_current"
-                else:
-                    relation = "above_current"
+            if px is not None and px > 0 and entry_val is not None:
+                delta_pct = abs(entry_val - px) / px * 100.0
 
                 raw_side = data.get("side")
                 raw_dir = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")
                 side_key = (raw_dir or "").strip().lower() if isinstance(raw_dir, str) else ""
-                range_str = entry_range_str
 
                 if side_key in ("long", "short"):
-                    near_and_correct_side = (
-                        delta_pct <= THRESHOLD_NEAR_PCT
-                        and (
-                            (side_key == "long" and relation in ("around_current", "below_current"))
-                            or (side_key == "short" and relation in ("around_current", "above_current"))
-                        )
-                    )
-                    strange_side = (side_key == "long" and relation == "above_current") or (
-                        side_key == "short" and relation == "below_current"
-                    )
+                    correct_side = (side_key == "long" and entry_val <= px) or (side_key == "short" and entry_val >= px)
+                    strange_side = (side_key == "long" and entry_val > px) or (side_key == "short" and entry_val < px)
+                    near_and_correct_side = delta_pct <= THRESHOLD_NEAR_PCT and correct_side
 
-                    if near_and_correct_side:
+                    if mode == "aggressive" and near_and_correct_side:
                         lines.append("**✅ Логичен вход от текущей / вблизи текущей (агрессивно).**")
                     elif strange_side:
                         if side_key == "long":
@@ -468,25 +428,16 @@ def main():
                             lines.append(
                                 "⚠️ Вход расположен *ниже текущей цены* (для SHORT): это не вход по рынку, а активация при достижении уровня."
                             )
-                        entry_line = f"Зона активации: {range_str}"
 
             lines.append(entry_line)
             aggressive_option = data.get("aggressive_option")
-            if isinstance(aggressive_option, dict):
-                ar = aggressive_option.get("range")
-                if isinstance(ar, dict):
-                    a_min = _as_float(ar.get("min"))
-                    a_max = _as_float(ar.get("max"))
-                    if (
-                        a_min is not None
-                        and a_max is not None
-                        and math.isfinite(a_min)
-                        and math.isfinite(a_max)
-                        and a_min < a_max
-                    ):
-                        lines.append(
-                            f"⚡ Возможен агрессивный вход: {fmt(a_min)}–{fmt(a_max)} (повышенный риск)."
-                        )
+            if mode == "neutral" and isinstance(aggressive_option, dict):
+                a_entry = _valid_price(aggressive_option.get("entry_price"))
+                if a_entry is None:
+                    a_entry = _valid_price(data.get("entry_price_aggressive"))
+                if a_entry is not None:
+                    lines.append(f"⚡ Возможен агрессивный вход: {fmt(a_entry)} (повышенный риск).")
+                    lines.append("ℹ️ Neutral-вход более аккуратный, чем агрессивный (лучший запас по цене).")
             lines.append(f"SL: {fmt(sl_val)}")
             if mode == "aggressive":
                 lines.append(f"TP1: {fmt(tp1_val)}")

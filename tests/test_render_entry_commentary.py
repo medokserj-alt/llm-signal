@@ -40,7 +40,13 @@ class TestRenderEntryCommentary(unittest.TestCase):
     def test_long_entry_range_around_current_marks_aggressive_from_current(self) -> None:
         d = _base_signal_data()
         d["side"] = "long"
-        d["entry_range"] = {"min": 99.95, "max": 100.05}
+        d["mode"] = "aggressive"
+        d["entries"] = {"aggressive": {"enabled": True}}
+        d["entry_price_aggressive"] = 100.0
+        d["sl_by_mode"] = {"aggressive": 99.0}
+        d["tp_by_mode"] = {"aggressive": {"tvh1": 102.0, "tvh2": 103.0}}
+        d["rr_by_mode"] = {"aggressive": 1.2}
+        d["exit_plan_by_mode"] = {"aggressive": "plan"}
         out = _render_text(d)
         self.assertIn("**✅ Логичен вход от текущей / вблизи текущей (агрессивно).**", out)
         self.assertIn("Вход:", out)
@@ -51,24 +57,22 @@ class TestRenderEntryCommentary(unittest.TestCase):
     def test_long_entry_range_above_current_warns_and_uses_activation_zone(self) -> None:
         d = _base_signal_data()
         d["side"] = "long"
-        d["entry_range"] = {"min": 101.0, "max": 102.0}
         d["entry_price_neutral"] = 101.5
         out = _render_text(d)
         self.assertIn("⚠️ Вход расположен *выше текущей цены* (для LONG)", out)
-        self.assertIn("Зона активации:", out)
         self.assertNotIn("ℹ️ Вход через лимит в зоне", out)
-        self.assertNotIn("Вход: ", out)
+        self.assertIn("Вход:", out)
+        self.assertNotIn("Зона активации:", out)
+        self.assertNotIn("Зона входа:", out)
 
     def test_missing_entry_price_falls_back_to_entry_zone(self) -> None:
         d = _base_signal_data()
         d["entry_price_neutral"] = None
         d["entry_range"] = {"min": 99.0, "max": 100.0}
         out = _render_text(d)
-        self.assertIn("2️⃣ Сетап", out)
-        self.assertIn("Зона входа:", out)
-        self.assertNotIn("Вход: ", out)
+        self.assertIn("📌 Сигнал не выдан", out)
+        self.assertNotIn("Зона входа:", out)
         self.assertNotIn("Зона активации:", out)
-        self.assertNotIn("ℹ️ Вход через лимит в зоне", out)
 
 
 if __name__ == "__main__":
