@@ -250,13 +250,11 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
 
     if not symbol or not direction:
         return None
-    if entry_low is None or entry_high is None or sl is None:
+    if entry_low is None or entry_high is None:
         return None
 
     try:
         entry_zone = [float(entry_low), float(entry_high)]
-        sl_val = float(sl)
-        tp_out: dict = {"tp1": (float(tp1) if tp1 is not None else None), "tp2": (float(tp2) if tp2 is not None else None)}
     except Exception:
         return None
 
@@ -266,6 +264,7 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
     except Exception:
         pass
 
+    mode = "neutral"
     meta = None
     try:
         uid_val = d.get("uid")
@@ -314,6 +313,45 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
             meta = {"mode": mode, "entry_type": entry_type, "market_phase": market_phase}
     except Exception:
         meta = None
+
+    try:
+        def _try_float(v):
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        sl_val = None
+        sl_by_mode = d.get("sl_by_mode")
+        if isinstance(sl_by_mode, dict):
+            sl_val = _try_float(sl_by_mode.get(mode))
+        if sl_val is None:
+            sl_val = float(sl)
+
+        tp_out: dict = {"tp1": None, "tp2": None}
+        tp_by_mode = d.get("tp_by_mode")
+        tp1_mode = None
+        tp2_mode = None
+        if isinstance(tp_by_mode, dict):
+            tp_m = tp_by_mode.get(mode)
+            if isinstance(tp_m, dict):
+                tp1_mode = tp_m.get("tvh1")
+                tp2_mode = tp_m.get("tvh2")
+
+        tp1_mode_f = _try_float(tp1_mode)
+        tp2_mode_f = _try_float(tp2_mode)
+        if tp1_mode_f is not None or tp2_mode_f is not None:
+            tp_out = {"tp1": tp1_mode_f, "tp2": tp2_mode_f}
+        else:
+            tp_out = {"tp1": (_try_float(tp1) if tp1 is not None else None), "tp2": (_try_float(tp2) if tp2 is not None else None)}
+    except Exception:
+        try:
+            sl_val = float(sl)
+            tp_out = {"tp1": (float(tp1) if tp1 is not None else None), "tp2": (float(tp2) if tp2 is not None else None)}
+        except Exception:
+            return None
 
     out = {
         "signal_id": str(signal_id),
