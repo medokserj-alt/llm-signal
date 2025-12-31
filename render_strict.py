@@ -7,6 +7,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import math
 
+import get_signal_json
+
 from no_trade_explain import (
     ensure_decision_path,
     format_no_trade_message,
@@ -143,7 +145,24 @@ def main():
     # базовые поля
     time_msk = data.get("time_msk", now_msk())
     symbol = data.get("symbol", "?")
-    price = fmt(data.get("price", ""))
+    try:
+        price_prec = get_signal_json._price_precision(  # type: ignore[attr-defined]
+            symbol if isinstance(symbol, str) else None,
+            value_hint=float(data.get("price")) if data.get("price") is not None else None,
+        )
+    except Exception:
+        price_prec = 2
+
+    def fmt_price(x) -> str:
+        try:
+            v = float(x)
+        except Exception:
+            return str(x)
+        if not math.isfinite(v):
+            return str(x)
+        return f"{v:.{int(price_prec)}f}"
+
+    price = fmt_price(data.get("price", ""))
 
     mode = normalize_mode(data.get("mode"))
     requested_mode_raw = data.get("requested_mode") if isinstance(data, dict) else None
@@ -403,7 +422,7 @@ def main():
                     lines.append(f"Причина: {reason}")
             lines.append(f"Направление: {_direction_badge(data) or '—'}")
 
-            entry_line = f"Вход: {fmt(entry_val)}"
+            entry_line = f"Вход: {fmt_price(entry_val)}"
             px = _as_float(data.get("price"))
             if px is not None and px > 0 and entry_val is not None:
                 delta_pct = abs(entry_val - px) / px * 100.0
@@ -436,23 +455,25 @@ def main():
                 if a_entry is None:
                     a_entry = _valid_price(data.get("entry_price_aggressive"))
                 if a_entry is not None:
-                    lines.append(f"⚡ Возможен агрессивный вход: {fmt(a_entry)} (повышенный риск).")
+                    lines.append(
+                        f"⚡ Возможен агрессивный вход: {fmt_price(a_entry)} (повышенный риск)."
+                    )
                     lines.append("ℹ️ Neutral-вход более аккуратный, чем агрессивный (лучший запас по цене).")
-            lines.append(f"SL: {fmt(sl_val)}")
+            lines.append(f"SL: {fmt_price(sl_val)}")
             if mode == "aggressive":
-                lines.append(f"TP1: {fmt(tp1_val)}")
-                lines.append(f"TP2: {fmt(tp2_val)}")
+                lines.append(f"TP1: {fmt_price(tp1_val)}")
+                lines.append(f"TP2: {fmt_price(tp2_val)}")
                 if tp3_val is not None:
-                    lines.append(f"TP3: {fmt(tp3_val)}")
+                    lines.append(f"TP3: {fmt_price(tp3_val)}")
             elif mode == "neutral":
-                lines.append(f"TP1: {fmt(tp1_val)}")
-                lines.append(f"TP2: {fmt(tp2_val)}")
+                lines.append(f"TP1: {fmt_price(tp1_val)}")
+                lines.append(f"TP2: {fmt_price(tp2_val)}")
             else:
-                lines.append(f"TP1: {fmt(tp1_val)}")
+                lines.append(f"TP1: {fmt_price(tp1_val)}")
                 if tp2_or_trail == "trail":
                     lines.append("TP2_or_trail: trail")
                 else:
-                    lines.append(f"TP2_or_trail: {fmt(tp2_or_trail)}")
+                    lines.append(f"TP2_or_trail: {fmt_price(tp2_or_trail)}")
             lines.append(f"RR: 1:{fmt(rr_val)}")
             lines.append(f"План выхода: {exit_plan}")
             lines.append("")
@@ -491,9 +512,9 @@ def main():
             # Дисклеймер (одна строка)
             lines.append("⚠️ Дисклеймер")
             lines.append(_one_line(disclaimer) or "—")
-            text_out = trim_all_numbers("\n".join(lines))
+            text_out = "\n".join(lines)
 
-    text_out = trim_all_numbers(text_out)
+    # Keep price precision in rendered text (no global trimming).
 
     # HTML-пост (тот же контент, но без **)
     html = text_out.replace("**", "")

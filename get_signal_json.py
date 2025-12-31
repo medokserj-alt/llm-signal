@@ -1007,7 +1007,7 @@ def apply_live_price_hint(payload: dict) -> None:
     if last is None:
         return
     try:
-        hints["price"] = _round_price(last)
+        hints["price"] = _round_price(last, symbol=sym)
         hints["price_source"] = "live"
     except Exception:
         return
@@ -1396,16 +1396,93 @@ def apply_ema_exhale_filter(d: dict) -> None:
     return
 
 
-def _round_price(val):
+_FALLBACK_SYMBOL_PRICE_PRECISION: dict[str, int] = {
+    # Common alts whose chart tick size is usually finer than 2 decimals.
+    "XRP": 4,
+    "ADA": 4,
+    "DOGE": 5,
+}
+
+
+def _symbol_base(sym: str | None) -> str | None:
+    s = (sym or "").strip()
+    if not s:
+        return None
+    # Examples:
+    # - "XRP/USDT" -> "XRP"
+    # - "XRP/USDT:USDT" -> "XRP"
+    # - "XRPUSDT" -> "XRPUSDT" (unknown format; keep)
+    s = s.split(":", 1)[0]
+    if "/" in s:
+        return s.split("/", 1)[0].strip().upper() or None
+    return s.strip().upper() or None
+
+
+def _price_precision_from_exchange(exchange, symbol: str | None) -> int | None:
+    if exchange is None or not symbol:
+        return None
+    try:
+        markets = getattr(exchange, "markets", None)
+    except Exception:
+        markets = None
+    if not isinstance(markets, dict) or not markets:
+        return None
+
+    candidates = [symbol]
+    try:
+        candidates.append(_normalize_bybit_swap_symbol(symbol))
+    except Exception:
+        pass
+    for key in candidates:
+        try:
+            market = markets.get(key)
+        except Exception:
+            market = None
+        if not isinstance(market, dict):
+            continue
+        try:
+            prec = ((market.get("precision") or {}).get("price"))
+        except Exception:
+            prec = None
+        if isinstance(prec, int) and prec >= 0:
+            return prec
+    return None
+
+
+def _price_precision(symbol: str | None, *, exchange=None, value_hint: float | None = None) -> int:
+    # 1) Prefer exchange market metadata, if already loaded.
+    prec = _price_precision_from_exchange(exchange, symbol)
+    if prec is not None:
+        return prec
+    # Opportunistically use cached Bybit swap exchange if it already has markets loaded.
+    try:
+        prec = _price_precision_from_exchange(_EXCHANGES.get("bybit_swap"), symbol)
+        if prec is not None:
+            return prec
+    except Exception:
+        pass
+
+    # 2) Fallback to a small symbol-based map (base token).
+    base = _symbol_base(symbol)
+    if base and base in _FALLBACK_SYMBOL_PRICE_PRECISION:
+        return int(_FALLBACK_SYMBOL_PRICE_PRECISION[base])
+
+    # 3) Final fallback: legacy heuristic by magnitude.
+    av = abs(float(value_hint)) if value_hint is not None else 0.0
+    return 2 if av >= 1 else (4 if av >= 0.01 else 6)
+
+
+def _round_price(val, *, symbol: str | None = None, exchange=None):
     try:
         v = float(val)
     except Exception:
         return None
-    av = abs(v)
-    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
+    if not math.isfinite(v):
+        return None
+    prec = _price_precision(symbol, exchange=exchange, value_hint=v)
     return round(v, prec)
 
-def _round_price_dir(val, direction: str) -> float | None:
+def _round_price_dir(val, direction: str, *, symbol: str | None = None, exchange=None) -> float | None:
     """
     Directional rounding on the same scale as _round_price():
       - direction="down": round towards -inf
@@ -1418,14 +1495,77 @@ def _round_price_dir(val, direction: str) -> float | None:
         return None
     if not math.isfinite(v):
         return None
-    av = abs(v)
-    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
+    prec = _price_precision(symbol, exchange=exchange, value_hint=v)
     m = 10**prec
     if direction == "down":
         return math.floor(v * m) / m
     if direction == "up":
         return math.ceil(v * m) / m
     return round(v, prec)
+
+
+def quantize_price_levels_to_symbol_precision(d: dict, *, exchange=None) -> dict:
+    """
+    Hard normalization layer (source of truth):
+    quantize all LLM-produced price levels to the exchange symbol price precision.
+
+    This intentionally does not change trading logic; it only rounds price levels.
+    """
+    if not isinstance(d, dict):
+        return d
+
+    symbol = d.get("symbol")
+
+    def _q_price_val(v):
+        r = _round_price(v, symbol=symbol, exchange=exchange)
+        return float(r) if r is not None else None
+
+    def _q_inplace(container: dict, key: str) -> None:
+        if not isinstance(container, dict) or key not in container:
+            return
+        v = container.get(key)
+        r = _q_price_val(v)
+        if r is not None:
+            container[key] = r
+
+    # Entry prices (single prices, not ranges).
+    for k in ("entry_price_neutral", "entry_price_aggressive", "entry_price_conservative"):
+        _q_inplace(d, k)
+
+    # Top-level SL/TPs (active mode).
+    for k in ("sl", "tp1", "tp2", "tp3"):
+        _q_inplace(d, k)
+
+    # Per-mode SL.
+    sl_by_mode = d.get("sl_by_mode")
+    if isinstance(sl_by_mode, dict):
+        for mode_key in list(sl_by_mode.keys()):
+            v = sl_by_mode.get(mode_key)
+            r = _q_price_val(v)
+            if r is not None:
+                sl_by_mode[mode_key] = r
+
+    # Per-mode TP buckets.
+    tp_by_mode = d.get("tp_by_mode")
+    if isinstance(tp_by_mode, dict):
+        for mode_key, bucket in list(tp_by_mode.items()):
+            if not isinstance(bucket, dict):
+                continue
+            for k in ("tvh1", "tvh2", "tvh3", "tp1", "tp2", "tp3", "tvh2_or_trail"):
+                v = bucket.get(k)
+                if isinstance(v, str) and v.strip().lower() == "trail":
+                    continue
+                r = _q_price_val(v)
+                if r is not None:
+                    bucket[k] = r
+            tp_by_mode[mode_key] = bucket
+
+    # Optional aggressive option entry.
+    aggressive_option = d.get("aggressive_option")
+    if isinstance(aggressive_option, dict):
+        _q_inplace(aggressive_option, "entry_price")
+
+    return d
 
 def _ema_relation_flag(price, ema) -> str:
     """
@@ -1639,7 +1779,7 @@ def apply_ema_blocks_and_derivatives(d: dict, symbol: str | None) -> None:
     )
 
 
-def _mid_from_range(r):
+def _mid_from_range(r, *, symbol: str | None = None, exchange=None):
     if isinstance(r, dict):
         mn = r.get("min")
         mx = r.get("max")
@@ -1650,7 +1790,7 @@ def _mid_from_range(r):
             return None
         if b < a:
             a, b = b, a
-        return _round_price((a + b) / 2.0)
+        return _round_price((a + b) / 2.0, symbol=symbol, exchange=exchange)
     if isinstance(r, (list, tuple)) and len(r) == 2:
         try:
             a = float(r[0])
@@ -1659,11 +1799,12 @@ def _mid_from_range(r):
             return None
         if b < a:
             a, b = b, a
-        return _round_price((a + b) / 2.0)
+        return _round_price((a + b) / 2.0, symbol=symbol, exchange=exchange)
     return None
 
 
 def apply_entry_prices_from_ranges(d: dict) -> None:
+    symbol = d.get("symbol")
     side = (d.get("side") or d.get("direction") or "").strip().lower()
 
     entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
@@ -1714,18 +1855,18 @@ def apply_entry_prices_from_ranges(d: dict) -> None:
         return hi if side == "long" else lo
 
     if side not in ("long", "short"):
-        neutral_mid = _mid_from_range(neutral_range)
+        neutral_mid = _mid_from_range(neutral_range, symbol=symbol)
         if neutral_mid is None:
-            neutral_mid = _mid_from_range(((entries.get("neutral") or {}).get("range")))
-        agg_mid = _mid_from_range(aggressive_range)
-        cons_mid = _mid_from_range(conservative_range)
+            neutral_mid = _mid_from_range(((entries.get("neutral") or {}).get("range")), symbol=symbol)
+        agg_mid = _mid_from_range(aggressive_range, symbol=symbol)
+        cons_mid = _mid_from_range(conservative_range, symbol=symbol)
         if agg_mid is None:
             agg_mid = neutral_mid
         if cons_mid is None:
             cons_mid = neutral_mid
-        d["entry_price_neutral"] = _round_price(neutral_mid)
-        d["entry_price_aggressive"] = _round_price(agg_mid)
-        d["entry_price_conservative"] = _round_price(cons_mid)
+        d["entry_price_neutral"] = _round_price(neutral_mid, symbol=symbol)
+        d["entry_price_aggressive"] = _round_price(agg_mid, symbol=symbol)
+        d["entry_price_conservative"] = _round_price(cons_mid, symbol=symbol)
         return
 
     neu_mm = _range_minmax(neutral_range)
@@ -1741,9 +1882,9 @@ def apply_entry_prices_from_ranges(d: dict) -> None:
     agg_dir = "up" if side == "long" else "down"
     cons_dir = neu_dir
 
-    neutral_val = _round_price_dir(neutral_anchor, neu_dir)
-    aggressive_val = _round_price_dir(aggressive_anchor, agg_dir)
-    conservative_val = _round_price_dir(conservative_anchor, cons_dir)
+    neutral_val = _round_price_dir(neutral_anchor, neu_dir, symbol=symbol)
+    aggressive_val = _round_price_dir(aggressive_anchor, agg_dir, symbol=symbol)
+    conservative_val = _round_price_dir(conservative_anchor, cons_dir, symbol=symbol)
 
     neutral_val = _clamp_to(neu_mm, neutral_val)
     aggressive_val = _clamp_to(agg_mm, aggressive_val)
@@ -1780,10 +1921,10 @@ def enforce_entry_price_order(d: dict) -> None:
 
     ref = neu
     if ref is None:
-        ref = _as_float(_mid_from_range(d.get("entry_range")))
+        ref = _as_float(_mid_from_range(d.get("entry_range"), symbol=d.get("symbol")))
     if ref is None:
         entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
-        ref = _as_float(_mid_from_range(((entries.get("neutral") or {}).get("range"))))
+        ref = _as_float(_mid_from_range(((entries.get("neutral") or {}).get("range")), symbol=d.get("symbol")))
     if ref is None:
         ref = agg if agg is not None else cons
 
@@ -1812,9 +1953,10 @@ def enforce_entry_price_order(d: dict) -> None:
         if agg < cons:
             agg = cons
 
-    d["entry_price_aggressive"] = _round_price(agg)
-    d["entry_price_neutral"] = _round_price(neu)
-    d["entry_price_conservative"] = _round_price(cons)
+    symbol = d.get("symbol")
+    d["entry_price_aggressive"] = _round_price(agg, symbol=symbol)
+    d["entry_price_neutral"] = _round_price(neu, symbol=symbol)
+    d["entry_price_conservative"] = _round_price(cons, symbol=symbol)
 
 
 def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
@@ -1840,6 +1982,7 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
     if side not in ("long", "short"):
         return d
     is_long = side == "long"
+    symbol = d.get("symbol")
 
     ema_m15 = d.get("ema_m15") if isinstance(d.get("ema_m15"), dict) else {}
     ema_h1 = d.get("ema_h1") if isinstance(d.get("ema_h1"), dict) else {}
@@ -1896,16 +2039,16 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
 
         entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
         bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
-        mid = _mid_from_range(bucket.get("range"))
+        mid = _mid_from_range(bucket.get("range"), symbol=symbol)
         if mid is None:
-            mid = _mid_from_range(d.get("entry_range"))
+            mid = _mid_from_range(d.get("entry_range"), symbol=symbol)
         if mid is not None:
-            d[k] = _round_price(mid)
+            d[k] = _round_price(mid, symbol=symbol)
             return float(mid)
 
         px = _as_float(d.get("price"))
         if px is not None:
-            d[k] = _round_price(px)
+            d[k] = _round_price(px, symbol=symbol)
             return float(px)
         return None
 
@@ -1957,7 +2100,8 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                 sl_val = entry * (0.985 if mode == "conservative" else 0.99)
             else:
                 sl_val = entry * (1.015 if mode == "conservative" else 1.01)
-        sl_val = float(_round_price(sl_val) if _round_price(sl_val) is not None else sl_val)
+        rounded_sl = _round_price(sl_val, symbol=symbol)
+        sl_val = float(rounded_sl if rounded_sl is not None else sl_val)
         sl_by_mode[mode] = sl_val
 
         bucket_in = tp_in.get(mode)
@@ -2020,10 +2164,13 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                     )
                     tvh3 = far_tvh if far_tvh is not None else entry * (1.02 if is_long else 0.98)
 
-            tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
-            tvh2 = float(_round_price(tvh2) if _round_price(tvh2) is not None else tvh2)
+            rounded_tvh1 = _round_price(tvh1, symbol=symbol)
+            rounded_tvh2 = _round_price(tvh2, symbol=symbol)
+            tvh1 = float(rounded_tvh1 if rounded_tvh1 is not None else tvh1)
+            tvh2 = float(rounded_tvh2 if rounded_tvh2 is not None else tvh2)
             tvh3_val = _as_float(tvh3)
-            tvh3 = float(_round_price(tvh3_val) if (tvh3_val is not None and _round_price(tvh3_val) is not None) else tvh3_val) if tvh3_val is not None else None
+            rounded_tvh3 = _round_price(tvh3_val, symbol=symbol) if tvh3_val is not None else None
+            tvh3 = float(rounded_tvh3 if rounded_tvh3 is not None else tvh3_val) if tvh3_val is not None else None
 
             tvh1, tvh2, tvh3 = _ensure_monotonic(entry, tvh1, tvh2, tvh3)
             out_bucket = {"tvh1": tvh1, "tvh2": tvh2, "tvh3": tvh3}
@@ -2054,8 +2201,10 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                     above=thr,
                 )
                 tvh2 = h1_tvh if h1_tvh is not None else entry * (1.02 if is_long else 0.98)
-            tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
-            tvh2 = float(_round_price(tvh2) if _round_price(tvh2) is not None else tvh2)
+            rounded_tvh1 = _round_price(tvh1, symbol=symbol)
+            rounded_tvh2 = _round_price(tvh2, symbol=symbol)
+            tvh1 = float(rounded_tvh1 if rounded_tvh1 is not None else tvh1)
+            tvh2 = float(rounded_tvh2 if rounded_tvh2 is not None else tvh2)
             tvh1, tvh2, _ = _ensure_monotonic(entry, tvh1, tvh2, None)
             out_bucket = {"tvh1": tvh1, "tvh2": tvh2}
 
@@ -2078,13 +2227,15 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                     above=entry,
                 )
                 tvh1 = near_tvh if near_tvh is not None else entry * (1.02 if is_long else 0.98)
-            tvh1 = float(_round_price(tvh1) if _round_price(tvh1) is not None else tvh1)
+            rounded_tvh1 = _round_price(tvh1, symbol=symbol)
+            tvh1 = float(rounded_tvh1 if rounded_tvh1 is not None else tvh1)
             tvh1, _, _ = _ensure_monotonic(entry, tvh1, tvh1, None)
 
             if tvh2_or_trail is None:
                 tvh2_or_trail = "trail"
             elif isinstance(tvh2_or_trail, (int, float)):
-                tvh2_or_trail = float(_round_price(tvh2_or_trail) if _round_price(tvh2_or_trail) is not None else tvh2_or_trail)
+                rounded_tvh2_or_trail = _round_price(tvh2_or_trail, symbol=symbol)
+                tvh2_or_trail = float(rounded_tvh2_or_trail if rounded_tvh2_or_trail is not None else tvh2_or_trail)
             out_bucket = {"tvh1": tvh1, "tvh2_or_trail": tvh2_or_trail}
 
         tp_by_mode[mode] = out_bucket
@@ -2357,9 +2508,12 @@ def validate_active_mode_setup(d: dict) -> dict:
 
             new_mm = _adjust_long() if side == "long" else _adjust_short()
             if new_mm is not None:
+                symbol = d.get("symbol")
+                rounded_min = _round_price(new_mm[0], symbol=symbol)
+                rounded_max = _round_price(new_mm[1], symbol=symbol)
                 new_range = {
-                    "min": float(_round_price(new_mm[0]) if _round_price(new_mm[0]) is not None else new_mm[0]),
-                    "max": float(_round_price(new_mm[1]) if _round_price(new_mm[1]) is not None else new_mm[1]),
+                    "min": float(rounded_min if rounded_min is not None else new_mm[0]),
+                    "max": float(rounded_max if rounded_max is not None else new_mm[1]),
                 }
 
                 d["entry_range"] = new_range
@@ -2368,7 +2522,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                     entries["neutral"] = neu_bucket
                     d["entries"] = entries
 
-                neu_mid = _mid_from_range(new_range)
+                neu_mid = _mid_from_range(new_range, symbol=symbol)
                 if neu_mid is not None:
                     d["entry_price_neutral"] = neu_mid
 
@@ -2386,7 +2540,11 @@ def validate_active_mode_setup(d: dict) -> dict:
                             # Derive from the aggressive mode's own envelope (no shifting).
                             lo, hi = agg_mm
                             anchor = hi if side == "long" else lo
-                            agg_entry = _round_price_dir(anchor, "up" if side == "long" else "down")
+                            agg_entry = _round_price_dir(
+                                anchor,
+                                "up" if side == "long" else "down",
+                                symbol=d.get("symbol"),
+                            )
 
                         neutral_entry = _to_float(d.get("entry_price_neutral"))
                         strict_ok = (
@@ -2498,7 +2656,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     if fetch_price and symbol and not DRY_RUN and not d.get("price"):
         try:
             ticker = get_pair_ticker(symbol)
-            rounded = _round_price(ticker.get("last"))
+            rounded = _round_price(ticker.get("last"), symbol=symbol)
             if rounded is not None:
                 d["price"] = rounded
         except Exception:
@@ -2515,7 +2673,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         if not symbol:
             return None
         try:
-            return _round_price(get_pair_ticker(symbol).get("last"))
+            return _round_price(get_pair_ticker(symbol).get("last"), symbol=symbol)
         except Exception:
             return None
 
@@ -2633,7 +2791,43 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
 
     validate_or_fallback_tvh_by_mode(d)
     _debug_trace_set_entry_range("entry_range_post_tvh", d)
+    try:
+        symbol = d.get("symbol")
+        final_mode = normalize_mode(d.get("mode"))
+
+        sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+        sl_val = _to_float(sl_by_mode.get(final_mode))
+        if sl_val is not None and sl_val:
+            rounded = _round_price(sl_val, symbol=symbol)
+            d["sl"] = float(rounded if rounded is not None else sl_val)
+
+        tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+        tp_bucket = tp_by_mode.get(final_mode) if isinstance(tp_by_mode.get(final_mode), dict) else {}
+
+        tp1_val = _to_float(tp_bucket.get("tvh1"))
+        if tp1_val is not None and tp1_val:
+            rounded = _round_price(tp1_val, symbol=symbol)
+            d["tp1"] = float(rounded if rounded is not None else tp1_val)
+
+        tp2_val = _to_float(tp_bucket.get("tvh2"))
+        if tp2_val is None:
+            tvh2_or_trail = tp_bucket.get("tvh2_or_trail")
+            tp2_val = _to_float(tvh2_or_trail)
+        if tp2_val is not None and tp2_val:
+            rounded = _round_price(tp2_val, symbol=symbol)
+            d["tp2"] = float(rounded if rounded is not None else tp2_val)
+
+        tp3_val = _to_float(tp_bucket.get("tvh3"))
+        if tp3_val is not None and tp3_val:
+            rounded = _round_price(tp3_val, symbol=symbol)
+            d["tp3"] = float(rounded if rounded is not None else tp3_val)
+    except Exception:
+        pass
     validate_active_mode_setup(d)
+    try:
+        quantize_price_levels_to_symbol_precision(d)
+    except Exception:
+        pass
     apply_time_window_policy_variant_b(d)
     return normalize_no_trade(d)
 

@@ -12,6 +12,7 @@ from get_signal_json import (
     normalize_no_trade,
     validate_or_fallback_tvh_by_mode,
     validate_active_mode_setup,
+    _round_price,
 )
 from no_trade_explain import ensure_decision_path
 
@@ -51,16 +52,7 @@ def _apply_ema_guard_text_consistent(d: dict) -> None:
     d["ema_guard"] = _ema_guard_text(state)
 
 
-def _round_price(val):
-    try:
-        v = float(val)
-    except Exception:
-        return None
-    av = abs(v)
-    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
-    return round(v, prec)
-
-def _mid_from_range(r):
+def _mid_from_range(r, *, symbol: str | None = None):
     if isinstance(r, dict):
         mn = r.get("min")
         mx = r.get("max")
@@ -71,7 +63,7 @@ def _mid_from_range(r):
             return None
         if b < a:
             a, b = b, a
-        return _round_price((a + b) / 2.0)
+        return _round_price((a + b) / 2.0, symbol=symbol)
     if isinstance(r, (list, tuple)) and len(r) == 2:
         try:
             a = float(r[0])
@@ -80,10 +72,11 @@ def _mid_from_range(r):
             return None
         if b < a:
             a, b = b, a
-        return _round_price((a + b) / 2.0)
+        return _round_price((a + b) / 2.0, symbol=symbol)
     return None
 
 def _entry_price_by_mode(d: dict, mode: str):
+    symbol = d.get("symbol")
     k = f"entry_price_{mode}"
     if d.get(k) is not None:
         try:
@@ -93,13 +86,13 @@ def _entry_price_by_mode(d: dict, mode: str):
 
     entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
-    mid = _mid_from_range(bucket.get("range"))
+    mid = _mid_from_range(bucket.get("range"), symbol=symbol)
     if mid is not None:
         d[k] = mid
         return float(mid)
 
     # fallback: общий entry_range
-    mid = _mid_from_range(d.get("entry_range"))
+    mid = _mid_from_range(d.get("entry_range"), symbol=symbol)
     if mid is not None:
         d[k] = mid
         return float(mid)
@@ -110,7 +103,7 @@ def _entry_price_by_mode(d: dict, mode: str):
     except Exception:
         px = None
     if px is not None:
-        d[k] = _round_price(px)
+        d[k] = _round_price(px, symbol=symbol)
         return float(px)
     return None
 
