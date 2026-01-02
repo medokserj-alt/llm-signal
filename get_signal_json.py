@@ -2382,6 +2382,63 @@ def validate_active_mode_setup(d: dict) -> dict:
     if final_range is not None:
         d["entry_range"] = final_range
 
+    # ---- Neutral counter-trend gate (structural evidence required) ----
+    # In neutral mode we forbid pure counter-trend fades against a strong H1 trend.
+    # Early reversals are allowed only when there is structural evidence (M15/H1/EMA-guard shifts).
+    if final_mode == "neutral" and not bool(d.get("no_trade")):
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+        fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+        fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+        guard = str(d.get("ema_guard_state") or "").strip().lower()
+
+        def _ensure_aggressive_option_only_if_exists() -> None:
+            agg_entry = _to_float(d.get("entry_price_aggressive"))
+            if agg_entry is None:
+                ab = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else None
+                ar = (ab or {}).get("range") if isinstance(ab, dict) else None
+                if isinstance(ar, dict):
+                    a_min = _to_float(ar.get("min"))
+                    a_max = _to_float(ar.get("max"))
+                    if a_min is not None and a_max is not None:
+                        agg_entry = (min(a_min, a_max) + max(a_min, a_max)) / 2.0
+            if agg_entry is None:
+                return
+            d["aggressive_option"] = {
+                "entry_price": agg_entry,
+                "note": "Контртрендовая идея — допустима только в aggressive.",
+            }
+
+        forbidden = False
+        if side == "short":
+            trend_up_ctx = (vs_h1 == "above") and (fan_h1 == "bull")
+            early_reversal = (
+                (fan_m15 == "bear")
+                or (fan_h1 == "mixed")
+                or (vs_h1 != "above")
+                or (guard != "above_both")
+            )
+            forbidden = bool(trend_up_ctx) and not bool(early_reversal)
+        elif side == "long":
+            trend_down_ctx = (vs_h1 == "below") and (fan_h1 == "bear")
+            early_reversal = (
+                (fan_m15 == "bull")
+                or (fan_h1 == "mixed")
+                or (vs_h1 != "below")
+                or (guard != "below_both")
+            )
+            forbidden = bool(trend_down_ctx) and not bool(early_reversal)
+
+        if forbidden:
+            d["no_trade"] = True
+            reasons = d.setdefault("no_trade_reasons", [])
+            if isinstance(reasons, list) and "counter_trend_neutral_forbidden" not in reasons:
+                reasons.append("counter_trend_neutral_forbidden")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "counter_trend_neutral_forbidden"
+            _ensure_aggressive_option_only_if_exists()
+            return d
+
     # ---- Variant B+2: neutral entry must not be too close to current price ----
     # Hard constraint: do not change mode selection rules, SL/TP/RR; only shape neutral entry geometry + transparency.
     if final_mode == "neutral" and not bool(d.get("no_trade")):

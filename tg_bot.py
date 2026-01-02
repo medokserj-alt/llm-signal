@@ -314,6 +314,51 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
     except Exception:
         meta = None
 
+    if meta is not None:
+        try:
+            rr_val = None
+            rr_by_mode = d.get("rr_by_mode")
+            if isinstance(rr_by_mode, dict):
+                rr_m = rr_by_mode.get(mode)
+                if isinstance(rr_m, (int, float)) and not isinstance(rr_m, bool):
+                    rr_val = float(rr_m)
+            if rr_val is None:
+                rr = d.get("rr")
+                if isinstance(rr, (int, float)) and not isinstance(rr, bool):
+                    rr_val = float(rr)
+            if rr_val is not None:
+                rr_quality = None
+                if rr_val >= 2.0:
+                    rr_quality = "high"
+                elif 1.3 <= rr_val < 2.0:
+                    rr_quality = "medium"
+                else:
+                    rr_quality = "low"
+                if rr_quality is not None:
+                    meta["rr_quality"] = rr_quality
+        except Exception:
+            pass
+
+        news_context = d.get("news_context")
+        if isinstance(news_context, list):
+            pos = 0
+            neg = 0
+            neu = 0
+            for s in news_context:
+                if not isinstance(s, str):
+                    continue
+                pos += s.count("[impact:+]")
+                neg += s.count("[impact:-]")
+                neu += s.count("[impact:neutral]")
+            if pos > neg and pos >= 1:
+                meta["news_bias"] = "positive"
+            elif neg > pos and neg >= 1:
+                meta["news_bias"] = "negative"
+            elif pos == 0 and neg == 0 and neu >= 1:
+                meta["news_bias"] = "neutral"
+            else:
+                meta["news_bias"] = "unknown"
+
     try:
         def _try_float(v):
             if v is None:
