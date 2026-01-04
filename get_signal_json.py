@@ -36,6 +36,14 @@ VALID_MODES = {"aggressive", "neutral", "conservative"}
 NEUTRAL_MIN_DIST_PCT_MAJOR = 0.25  # BTC/, ETH/
 NEUTRAL_MIN_DIST_PCT_ALT = 0.35  # others
 
+# When neutral mode exposes an early aggressive entry option, keep neutral meaningfully farther.
+# Soft shaping only: does not hard-limit the model or change EMA/no_trade/direction logic.
+NEUTRAL_BUFFER_TICKS = 10
+
+# Near-market definition (neutral): if neutral entry is within this many ticks from current price,
+# and no aggressive_option exists, split into (aggressive_option=original) + buffered neutral entry.
+NEUTRAL_NEAR_TICKS = 10
+
 # ---- Debug trace (diagnostics only; gated by env DEBUG_TRACE=1) ----
 _DEBUG_TRACE_ENABLED = os.getenv("DEBUG_TRACE") == "1"
 _DEBUG_TRACE: dict | None = {} if _DEBUG_TRACE_ENABLED else None
@@ -2614,6 +2622,133 @@ def validate_active_mode_setup(d: dict) -> dict:
                                 "entry_price": agg_entry,
                                 "note": "Возможен более ранний вход (aggressive) при повышенном риске.",
                             }
+
+    # ---- Neutral buffer vs aggressive option (soft shaping) ----
+    # When neutral mode is active and an aggressive option exists, keep neutral entry
+    # meaningfully farther than the aggressive entry by a small tick-based buffer.
+    if final_mode == "neutral" and not bool(d.get("no_trade")):
+        # ---- Neutral near-market auto-split (semantic only) ----
+        # If neutral entry is near current price and no aggressive_option exists yet:
+        # - preserve original neutral entry as an explicit aggressive_option;
+        # - move neutral entry farther by NEUTRAL_BUFFER_TICKS.
+        # This does not change EMA/no_trade/direction logic; it only re-labels the early entry.
+        if not isinstance(d.get("aggressive_option"), dict):
+            side = (d.get("side") or d.get("direction") or "").strip().lower()
+            symbol = d.get("symbol")
+            px = _to_float(d.get("price"))
+            n_entry0 = _to_float(d.get("entry_price_neutral"))
+
+            if side in ("long", "short") and px is not None and px > 0 and n_entry0 is not None:
+                prec = _price_precision(symbol, value_hint=px)
+                tick_size = 10 ** (-int(prec))
+                if tick_size > 0:
+                    dist_ticks = abs(float(n_entry0) - float(px)) / float(tick_size)
+                else:
+                    dist_ticks = float("inf")
+
+                if dist_ticks <= float(NEUTRAL_NEAR_TICKS):
+                    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+                    sl_neutral = _to_float(sl_by_mode.get("neutral"))
+
+                    buffer_val = float(NEUTRAL_BUFFER_TICKS) * float(tick_size)
+                    original_entry = _round_price(n_entry0, symbol=symbol)
+                    original_entry = float(original_entry) if original_entry is not None else float(n_entry0)
+
+                    if side == "long":
+                        target = original_entry - buffer_val
+                        cand = _round_price_dir(target, "down", symbol=symbol)
+                    else:  # short
+                        target = original_entry + buffer_val
+                        cand = _round_price_dir(target, "up", symbol=symbol)
+
+                    def _safe_autosplit(px_new: float) -> bool:
+                        if not (math.isfinite(px_new) and px_new > 0):
+                            return False
+                        if sl_neutral is None or not math.isfinite(sl_neutral):
+                            return False
+                        if side == "long" and px_new <= float(sl_neutral):
+                            return False
+                        if side == "short" and px_new >= float(sl_neutral):
+                            return False
+                        # Ensure the neutral move is actually "calmer" vs current price.
+                        if abs(px_new - float(px)) <= abs(original_entry - float(px)) + 1e-12:
+                            return False
+                        return True
+
+                    if cand is not None and _safe_autosplit(float(cand)):
+                        d["aggressive_option"] = {
+                            "entry_price": original_entry,
+                            "note": "Ранний вход (aggressive) при повышенном риске.",
+                        }
+                        d["entry_price_neutral"] = float(cand)
+                        d["neutral_autosplit"] = True
+
+        aggressive_option = d.get("aggressive_option")
+        if isinstance(aggressive_option, dict):
+            side = (d.get("side") or d.get("direction") or "").strip().lower()
+            symbol = d.get("symbol")
+            a_entry = _to_float(aggressive_option.get("entry_price"))
+            if a_entry is None:
+                a_entry = _to_float(d.get("entry_price_aggressive"))
+            n_entry = _to_float(d.get("entry_price_neutral"))
+            if side in ("long", "short") and a_entry is not None and n_entry is not None:
+                a_entry_q = _round_price(a_entry, symbol=symbol)
+                if a_entry_q is None:
+                    a_entry_q = a_entry
+                n_entry_q = _round_price(n_entry, symbol=symbol)
+                if n_entry_q is None:
+                    n_entry_q = n_entry
+
+                prec = _price_precision(symbol, value_hint=a_entry_q)
+                tick = 10 ** (-int(prec))
+                buffer_val = float(NEUTRAL_BUFFER_TICKS) * float(tick)
+
+                def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
+                    if not isinstance(r, dict):
+                        return None
+                    a = _to_float(r.get("min"))
+                    b = _to_float(r.get("max"))
+                    if a is None or b is None:
+                        return None
+                    if b < a:
+                        a, b = b, a
+                    if not (a < b):
+                        return None
+                    return (a, b)
+
+                mm = _range_to_minmax(d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None)
+
+                sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+                sl_neutral = _to_float(sl_by_mode.get("neutral"))
+
+                def _candidate_ok(px: float) -> bool:
+                    if not (math.isfinite(px) and px > 0):
+                        return False
+                    if mm is not None:
+                        lo, hi = mm
+                        if px < lo or px > hi:
+                            return False
+                    if sl_neutral is None or not math.isfinite(sl_neutral):
+                        return False
+                    if side == "long" and px <= sl_neutral:
+                        return False
+                    if side == "short" and px >= sl_neutral:
+                        return False
+                    return True
+
+                # Only adjust if neutral is too close to aggressive relative to the buffer.
+                if side == "long":
+                    max_neutral = float(a_entry_q) - buffer_val
+                    if float(n_entry_q) > max_neutral:
+                        cand = _round_price_dir(max_neutral, "down", symbol=symbol)
+                        if cand is not None and _candidate_ok(float(cand)):
+                            d["entry_price_neutral"] = float(cand)
+                else:  # short
+                    min_neutral = float(a_entry_q) + buffer_val
+                    if float(n_entry_q) < min_neutral:
+                        cand = _round_price_dir(min_neutral, "up", symbol=symbol)
+                        if cand is not None and _candidate_ok(float(cand)):
+                            d["entry_price_neutral"] = float(cand)
 
     mode = final_mode
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
