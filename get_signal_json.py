@@ -44,6 +44,21 @@ NEUTRAL_BUFFER_TICKS = 10
 # and no aggressive_option exists, split into (aggressive_option=original) + buffered neutral entry.
 NEUTRAL_NEAR_TICKS = 10
 
+# ---- Flush gate (neutral must not knife-catch) ----
+# "Flush" is defined relative to ATR(14) on M15 candles.
+# X: two consecutive candles body >= X * ATR(14)
+# Y: one candle body >= Y * ATR(14)
+#
+# Thresholds are intentionally configurable via env for fast tuning without code changes.
+try:
+    FLUSH_BODY_X_ATR = float(os.getenv("FLUSH_BODY_X_ATR") or "1.1")
+except Exception:  # pragma: no cover
+    FLUSH_BODY_X_ATR = 1.1
+try:
+    FLUSH_BODY_Y_ATR = float(os.getenv("FLUSH_BODY_Y_ATR") or "1.8")
+except Exception:  # pragma: no cover
+    FLUSH_BODY_Y_ATR = 1.8
+
 # ---- Debug trace (diagnostics only; gated by env DEBUG_TRACE=1) ----
 _DEBUG_TRACE_ENABLED = os.getenv("DEBUG_TRACE") == "1"
 _DEBUG_TRACE: dict | None = {} if _DEBUG_TRACE_ENABLED else None
@@ -326,6 +341,9 @@ def _fetch_closes_from_market(
         "last_candle_ts": last_candle_ts,
         "last_candle": last_candle,
         "ohlcv_count": len(ohlcv),
+        # Keep only a short tail of OHLCV for derived calculations (ATR/flush), not for full history.
+        # Format is ccxt OHLCV: [ts, open, high, low, close, volume?]
+        "ohlcv_tail": ohlcv[-60:] if isinstance(ohlcv, list) else None,
         "fetched_at": time.time(),
         "closes": closes,
     }
@@ -416,6 +434,7 @@ def get_ema_provenance(period: int, timeframe: str, *, symbol: str) -> dict:
         "timeframe": tf,
         "candles_count": None,
         "last_candle": None,
+        "ohlcv_tail": None,
         "closes_tail": None,
         "symbol": (symbol or "").strip() or None,
         "market": None,
@@ -449,6 +468,7 @@ def get_ema_provenance(period: int, timeframe: str, *, symbol: str) -> dict:
         out["timeframe"] = snap.get("timeframe") or tf
         out["candles_count"] = len(closes)
         out["last_candle"] = snap.get("last_candle")
+        out["ohlcv_tail"] = snap.get("ohlcv_tail")
         try:
             out["closes_tail"] = [float(x) for x in closes[-5:]]
         except Exception:
@@ -485,6 +505,7 @@ def overwrite_ema20_from_provenance(d: dict) -> None:
     d["timeframe_m15"] = prov_m15.get("timeframe") or "15m"
     d["candles_m15_count"] = prov_m15.get("candles_count")
     d["last_candle_m15"] = prov_m15.get("last_candle")
+    d["ohlcv_m15_tail"] = prov_m15.get("ohlcv_tail")
     d["closes_m15_tail"] = prov_m15.get("closes_tail")
 
     prov_h1 = get_ema_provenance(20, "1h", symbol=sym)
@@ -492,6 +513,7 @@ def overwrite_ema20_from_provenance(d: dict) -> None:
     d["timeframe_h1"] = prov_h1.get("timeframe") or "1h"
     d["candles_h1_count"] = prov_h1.get("candles_count")
     d["last_candle_h1"] = prov_h1.get("last_candle")
+    d["ohlcv_h1_tail"] = prov_h1.get("ohlcv_tail")
     d["closes_h1_tail"] = prov_h1.get("closes_tail")
 
 
@@ -525,6 +547,111 @@ def _to_float(x) -> float | None:
     if not math.isfinite(v):
         return None
     return v
+
+
+def _atr14_from_ohlcv_tail(ohlcv_tail) -> float | None:
+    """
+    Simple ATR(14) from a short OHLCV tail (ccxt format):
+      [ts, open, high, low, close, volume?]
+    Uses SMA of the last 14 true ranges (requires >= 15 candles).
+    """
+    if not isinstance(ohlcv_tail, list) or len(ohlcv_tail) < 15:
+        return None
+
+    candles: list[tuple[float, float, float, float]] = []
+    for row in ohlcv_tail:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        try:
+            o = float(row[1])
+            h = float(row[2])
+            l = float(row[3])
+            c = float(row[4])
+        except Exception:
+            continue
+        if not all(math.isfinite(v) for v in (o, h, l, c)):
+            continue
+        candles.append((o, h, l, c))
+
+    if len(candles) < 15:
+        return None
+
+    candles = candles[-15:]
+    trs: list[float] = []
+    prev_close = candles[0][3]
+    for (_o, h, l, c) in candles[1:]:
+        tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        if math.isfinite(tr) and tr >= 0:
+            trs.append(float(tr))
+        prev_close = c
+
+    if len(trs) != 14:
+        return None
+    atr = sum(trs) / 14.0
+    if not (math.isfinite(atr) and atr > 0):
+        return None
+    return float(atr)
+
+
+def _m15_flush_detected(d: dict) -> bool:
+    """
+    Directional flush detector for the planned side:
+    - LONG: bearish flush (dump)
+    - SHORT: bullish flush (pump)
+    """
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return False
+
+    is_long = side == "long"
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+    vs_m15 = str(d.get("price_vs_ema20_m15") or "").strip().lower()
+
+    # Structural fallback (available even without OHLCV tail).
+    if is_long and (fan_m15 == "bear" and vs_m15 == "below"):
+        return True
+    if (not is_long) and (fan_m15 == "bull" and vs_m15 == "above"):
+        return True
+
+    ohlcv_tail = d.get("ohlcv_m15_tail")
+    atr14 = _atr14_from_ohlcv_tail(ohlcv_tail)
+    if atr14 is None:
+        return False
+    if not isinstance(ohlcv_tail, list) or len(ohlcv_tail) < 2:
+        return False
+
+    parsed: list[tuple[float, float]] = []
+    for row in ohlcv_tail[-2:]:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        try:
+            o = float(row[1])
+            c = float(row[4])
+        except Exception:
+            continue
+        if not all(math.isfinite(v) for v in (o, c)):
+            continue
+        parsed.append((o, c))
+
+    if len(parsed) < 2:
+        return False
+
+    def body_in_flush_direction(o: float, c: float) -> float:
+        if is_long:
+            return abs(c - o) if c < o else 0.0
+        return abs(c - o) if c > o else 0.0
+
+    last_body = body_in_flush_direction(parsed[-1][0], parsed[-1][1])
+    prev_body = body_in_flush_direction(parsed[-2][0], parsed[-2][1])
+
+    x = float(FLUSH_BODY_X_ATR)
+    y = float(FLUSH_BODY_Y_ATR)
+    if y > 0 and last_body >= y * atr14:
+        return True
+    if x > 0 and (last_body >= x * atr14 and prev_body >= x * atr14):
+        return True
+
+    return False
 
 
 # ---------- utils ----------
@@ -1458,26 +1585,36 @@ def _price_precision_from_exchange(exchange, symbol: str | None) -> int | None:
 
 
 def _price_precision(symbol: str | None, *, exchange=None, value_hint: float | None = None) -> int:
+    # Rule: for low-price assets (price < 10 USDT), enforce at least 4 decimals
+    # regardless of exchange precision (formatting/quantization only).
+    min_prec_by_price = 0
+    try:
+        if value_hint is not None and math.isfinite(float(value_hint)) and abs(float(value_hint)) < 10.0:
+            min_prec_by_price = 4
+    except Exception:
+        min_prec_by_price = 0
+
     # 1) Prefer exchange market metadata, if already loaded.
     prec = _price_precision_from_exchange(exchange, symbol)
     if prec is not None:
-        return prec
+        return max(int(prec), int(min_prec_by_price))
     # Opportunistically use cached Bybit swap exchange if it already has markets loaded.
     try:
         prec = _price_precision_from_exchange(_EXCHANGES.get("bybit_swap"), symbol)
         if prec is not None:
-            return prec
+            return max(int(prec), int(min_prec_by_price))
     except Exception:
         pass
 
     # 2) Fallback to a small symbol-based map (base token).
     base = _symbol_base(symbol)
     if base and base in _FALLBACK_SYMBOL_PRICE_PRECISION:
-        return int(_FALLBACK_SYMBOL_PRICE_PRECISION[base])
+        return max(int(_FALLBACK_SYMBOL_PRICE_PRECISION[base]), int(min_prec_by_price))
 
     # 3) Final fallback: legacy heuristic by magnitude.
     av = abs(float(value_hint)) if value_hint is not None else 0.0
-    return 2 if av >= 1 else (4 if av >= 0.01 else 6)
+    prec = 2 if av >= 1 else (4 if av >= 0.01 else 6)
+    return max(int(prec), int(min_prec_by_price))
 
 
 def _round_price(val, *, symbol: str | None = None, exchange=None):
@@ -2389,6 +2526,37 @@ def validate_active_mode_setup(d: dict) -> dict:
         final_range = _get_mode_range("neutral")
     if final_range is not None:
         d["entry_range"] = final_range
+
+    # ---- Neutral flush-reversal gate (knife-catch forbidden) ----
+    # Neutral mode must not take reversal trades right after a sharp M15 flush.
+    # Such ideas are allowed only as an aggressive_option.
+    if final_mode == "neutral" and not bool(d.get("no_trade")):
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        if side in ("long", "short") and _m15_flush_detected(d):
+            d["no_trade"] = True
+            reasons = d.setdefault("no_trade_reasons", [])
+            if isinstance(reasons, list) and "flush_reversal_neutral_forbidden" not in reasons:
+                reasons.append("flush_reversal_neutral_forbidden")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "flush_reversal_neutral_forbidden"
+
+            entry_idea = _to_float(d.get("entry_price_neutral"))
+            if entry_idea is None:
+                er = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None
+                if isinstance(er, dict):
+                    a = _to_float(er.get("min"))
+                    b = _to_float(er.get("max"))
+                    if a is not None and b is not None:
+                        entry_idea = (min(a, b) + max(a, b)) / 2.0
+
+            if entry_idea is not None:
+                existing = d.get("aggressive_option")
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing.setdefault("entry_price", entry_idea)
+                existing["note"] = "Разворот после импульсного пролива — допустимо только в aggressive."
+                d["aggressive_option"] = existing
+            return d
 
     # ---- Neutral counter-trend gate (structural evidence required) ----
     # In neutral mode we forbid pure counter-trend fades against a strong H1 trend.

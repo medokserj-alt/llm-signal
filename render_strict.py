@@ -23,6 +23,29 @@ VALID_MODES = {"aggressive", "neutral", "conservative"}
 THRESHOLD_NEAR_PCT = 0.15
 
 
+def format_price(symbol: str | None, x, *, exchange=None) -> str:
+    """
+    Render prices with symbol-aware precision, mirroring get_signal_json._price_precision():
+      - if value_hint < 10 => precision >= 4
+      - else use exchange precision when available
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return str(x)
+    if not math.isfinite(v):
+        return str(x)
+    try:
+        prec = get_signal_json._price_precision(  # type: ignore[attr-defined]
+            symbol if isinstance(symbol, str) else None,
+            exchange=exchange,
+            value_hint=v,
+        )
+    except Exception:
+        prec = 4 if abs(v) < 10 else 2
+    return f"{v:.{int(prec)}f}"
+
+
 def normalize_mode(mode_val) -> str:
     try:
         m = (mode_val or "").strip().lower()
@@ -153,16 +176,7 @@ def main():
     except Exception:
         price_prec = 2
 
-    def fmt_price(x) -> str:
-        try:
-            v = float(x)
-        except Exception:
-            return str(x)
-        if not math.isfinite(v):
-            return str(x)
-        return f"{v:.{int(price_prec)}f}"
-
-    price = fmt_price(data.get("price", ""))
+    price = format_price(symbol if isinstance(symbol, str) else None, data.get("price", ""))
 
     mode = normalize_mode(data.get("mode"))
     requested_mode_raw = data.get("requested_mode") if isinstance(data, dict) else None
@@ -426,7 +440,7 @@ def main():
             raw_dir = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")
             side_key = (raw_dir or "").strip().lower() if isinstance(raw_dir, str) else ""
 
-            entry_line = f"Вход: {fmt_price(entry_val)}"
+            entry_line = f"Вход: {format_price(symbol if isinstance(symbol, str) else None, entry_val)}"
             px = _as_float(data.get("price"))
             if px is not None and px > 0 and entry_val is not None:
                 delta_pct = abs(entry_val - px) / px * 100.0
@@ -456,7 +470,7 @@ def main():
                     a_entry = _valid_price(data.get("entry_price_aggressive"))
                 if a_entry is not None:
                     lines.append(
-                        f"⚡ Возможен агрессивный вход: {fmt_price(a_entry)} (повышенный риск)."
+                        f"⚡ Возможен агрессивный вход: {format_price(symbol if isinstance(symbol, str) else None, a_entry)} (повышенный риск)."
                     )
                     if data.get("neutral_autosplit") is True:
                         lines.append(
@@ -476,21 +490,23 @@ def main():
                             side_ok = float(entry_val) >= float(a_entry) + buf
                     if side_ok and data.get("neutral_autosplit") is not True:
                         lines.append("ℹ️ Neutral-вход выставлен с запасом относительно aggressive.")
-            lines.append(f"SL: {fmt_price(sl_val)}")
+            lines.append(f"SL: {format_price(symbol if isinstance(symbol, str) else None, sl_val)}")
             if mode == "aggressive":
-                lines.append(f"TP1: {fmt_price(tp1_val)}")
-                lines.append(f"TP2: {fmt_price(tp2_val)}")
+                lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")
+                lines.append(f"TP2: {format_price(symbol if isinstance(symbol, str) else None, tp2_val)}")
                 if tp3_val is not None:
-                    lines.append(f"TP3: {fmt_price(tp3_val)}")
+                    lines.append(f"TP3: {format_price(symbol if isinstance(symbol, str) else None, tp3_val)}")
             elif mode == "neutral":
-                lines.append(f"TP1: {fmt_price(tp1_val)}")
-                lines.append(f"TP2: {fmt_price(tp2_val)}")
+                lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")
+                lines.append(f"TP2: {format_price(symbol if isinstance(symbol, str) else None, tp2_val)}")
             else:
-                lines.append(f"TP1: {fmt_price(tp1_val)}")
+                lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")
                 if tp2_or_trail == "trail":
                     lines.append("TP2_or_trail: trail")
                 else:
-                    lines.append(f"TP2_or_trail: {fmt_price(tp2_or_trail)}")
+                    lines.append(
+                        f"TP2_or_trail: {format_price(symbol if isinstance(symbol, str) else None, tp2_or_trail)}"
+                    )
             lines.append(f"RR: 1:{fmt(rr_val)}")
             lines.append(f"План выхода: {exit_plan}")
             lines.append("")

@@ -1005,8 +1005,6 @@ async def handle_symbol(update,context):
                     channel_id=target,
                     symbol_hint=symbol,
                 )
-                if sig_v1:
-                    asyncio.create_task(_send_signal_to_aia_background(sig_v1))
 
         await msg.edit_text(
             format_done(
