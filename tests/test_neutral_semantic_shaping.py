@@ -120,7 +120,7 @@ class TestNeutralSemanticShaping(unittest.TestCase):
         out = _render_text(d)
         self.assertIn("⚡ Возможен агрессивный вход:", out)
         self.assertIn("(повышенный риск).", out)
-        self.assertIn("ℹ️ Neutral-вход более аккуратный, чем агрессивный", out)
+        self.assertIn("ℹ️ Neutral-вход выставлен с запасом относительно aggressive.", out)
         self.assertNotRegex(out, r"\\d\\s*–\\s*\\d")
 
 
