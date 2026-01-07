@@ -853,13 +853,79 @@ def _tw_risk_off_stress(d: dict) -> bool:
     mc = d.get("market_context")
     return isinstance(mc, str) and ("risk-off" in mc.lower())
 
+def _tw_append_unique(d: dict, key: str, value: str) -> None:
+    xs = d.get(key)
+    if not isinstance(xs, list):
+        return
+    if value not in xs:
+        xs.append(value)
+
+
+def _tw_has_any_reason(d: dict, *needles: str) -> bool:
+    reasons = d.get("no_trade_reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return False
+    for r in reasons:
+        if not isinstance(r, str):
+            continue
+        low = r.strip().lower()
+        for n in needles:
+            if low == n or n in low:
+                return True
+    return False
+
+
+def _tw_neutral_green_lane(d: dict) -> bool:
+    """
+    “Green lane” inside time_window for neutral:
+    allow only exceptionally good continuation + stable conditions.
+    Uses existing facts only (no EMA/RR/SL/TP changes).
+    """
+    if bool(d.get("no_trade")):
+        return False
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return False
+
+    vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+    fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+
+    continuation = False
+    if side == "long":
+        continuation = (vs_h1 == "above") and (fan_h1 == "bull") and (fan_m15 == "bull")
+    elif side == "short":
+        continuation = (vs_h1 == "below") and (fan_h1 == "bear") and (fan_m15 == "bear")
+    if not continuation:
+        return False
+
+    warnings = d.get("warnings")
+    if isinstance(warnings, list):
+        wl = " ".join(str(w or "").strip().lower() for w in warnings)
+        if any(k in wl for k in ("impulse_no_exhale", "phase_between", "ema_between_m15_h1", "ema_source_suspect")):
+            return False
+        if re.search(r"overextended_(no_exhale|h1)\b", wl):
+            return False
+
+    if _tw_structure_stress(d):
+        return False
+    if _tw_news_stress(d.get("news_context")):
+        return False
+    if _tw_volatility_stress(warnings):
+        return False
+    if _tw_risk_off_stress(d):
+        return False
+
+    return True
+
 
 def apply_time_window_policy_variant_b(d: dict) -> None:
     """
-    “Опасные окна” (time_window) — вариант B:
-    - aggressive: игнорирует окна полностью
-    - neutral: в окнах по умолчанию ТОЛЬКО warning; no_trade только при stress
-    - conservative: в окнах всегда no_trade
+    Time-window policy (updated):
+    - aggressive: block ONLY on extreme conditions; otherwise allow but force wait_confirm (+ caution warning)
+    - neutral: block by default, but allow a “green lane” for exceptionally good continuation+stable setups
+    - conservative: always no_trade inside time_window
     """
     mode = normalize_mode(d.get("mode"))
 
@@ -874,21 +940,32 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
     d.setdefault("no_trade_hint", "")
 
     if mode == "aggressive":
-        reasons_before = d.get("no_trade_reasons") if isinstance(d.get("no_trade_reasons"), list) else []
-        hint_before = d.get("no_trade_hint") if isinstance(d.get("no_trade_hint"), str) else ""
-        had_tw = any(isinstance(r, str) and "time_window" in r for r in reasons_before) or ("time_window" in hint_before.lower())
+        _tw_append_unique(d, "warnings", "time_window_low_liquidity")
+        _tw_append_unique(d, "warnings", "time_window_caution_aggressive")
 
-        _tw_clear_artifacts(d)
-        if had_tw and bool(d.get("no_trade")):
-            reasons = d.get("no_trade_reasons") if isinstance(d.get("no_trade_reasons"), list) else []
-            hint = d.get("no_trade_hint") if isinstance(d.get("no_trade_hint"), str) else ""
-            if not reasons and not hint:
-                d["no_trade"] = False
+        # Never “enter now” inside time_window in aggressive mode.
+        d["entry_mode"] = "wait_confirm"
+
+        warnings = d.get("warnings")
+        stress_news = _tw_news_stress(d.get("news_context"))
+        stress_vol = _tw_volatility_stress(warnings)
+        stress_struct = _tw_structure_stress(d)
+        stress_risk_off = _tw_risk_off_stress(d)
+        stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
+
+        flush_extreme = _tw_has_any_reason(d, "flush_knife_aggressive_extreme") or bool(d.get("flush_knife_aggressive_extreme"))
+        invalid_setup = _tw_has_any_reason(d, "invalid_mode_setup")
+
+        extreme_block = bool(stress or flush_extreme or invalid_setup)
+        if extreme_block:
+            d["no_trade"] = True
+            _tw_append_unique(d, "no_trade_reasons", "time_window_extreme_block")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "time_window_extreme_block"
         return
 
     warnings = d.get("warnings")
-    if isinstance(warnings, list) and "time_window_low_liquidity" not in warnings:
-        warnings.append("time_window_low_liquidity")
+    _tw_append_unique(d, "warnings", "time_window_low_liquidity")
 
     if mode == "conservative":
         d["no_trade"] = True
@@ -898,41 +975,15 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
         d["no_trade_hint"] = "Опасное окно времени (пониженная ликвидность): режим conservative — без сделок."
         return
 
-    stress_news = _tw_news_stress(d.get("news_context"))
-    stress_vol = _tw_volatility_stress(d.get("warnings"))
-    stress_struct = _tw_structure_stress(d)
-    stress_risk_off = _tw_risk_off_stress(d)
-    stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
-
-    if stress:
-        d["no_trade"] = True
-        reasons = d.get("no_trade_reasons")
-        if isinstance(reasons, list) and "time_window" not in reasons:
-            reasons.append("time_window")
-        tags = []
-        if stress_news:
-            tags.append("news")
-        if stress_vol:
-            tags.append("volatility")
-        if stress_struct:
-            tags.append("chaotic")
-        if stress_risk_off:
-            tags.append("risk-off")
-        tag_str = "/".join(tags) if tags else "stress"
-        d["no_trade_hint"] = f"Опасное окно времени + стресс-условия ({tag_str}): режим neutral — пропустить сделку."
+    # neutral: time_window is an active blocker by default
+    if _tw_neutral_green_lane(d):
+        _tw_append_unique(d, "warnings", "time_window_green_lane")
         return
 
-    # В окне, но без stress: time_window сам по себе не отключает neutral.
-    if bool(d.get("no_trade")):
-        reasons = d.get("no_trade_reasons")
-        if isinstance(reasons, list):
-            had_tw = any(isinstance(r, str) and "time_window" in r for r in reasons)
-            d["no_trade_reasons"] = [
-                r for r in reasons if not (isinstance(r, str) and "time_window" in r)
-            ]
-            if had_tw and not d["no_trade_reasons"]:
-                d["no_trade"] = False
-                d["no_trade_hint"] = ""
+    d["no_trade"] = True
+    _tw_append_unique(d, "no_trade_reasons", "time_window")
+    if not (d.get("no_trade_hint") or "").strip():
+        d["no_trade_hint"] = "time_window"
 
 
 def _normalize_side(d: dict) -> None:
@@ -1837,7 +1888,11 @@ def apply_direction_guard(d: dict) -> None:
         return
 
     emode = (d.get("entry_mode") or "").strip().lower()
-    if emode in ("now", "market"):
+    # In general we avoid emitting direction-guard warnings for "enter now" to keep output lean.
+    # Aggressive mode is special-cased: we still want the warning so the later validator can
+    # discipline "enter now" behavior against explicit EMA structure.
+    mode = normalize_mode(d.get("mode"))
+    if emode in ("now", "market") and mode != "aggressive":
         return
 
     try:
@@ -2421,15 +2476,25 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
     d["exit_plan_by_mode"] = exit_plan_by_mode
 
     if not rr_ok_for_active_mode:
-        d["no_trade"] = True
-        reasons = d.get("no_trade_reasons")
-        if not isinstance(reasons, list):
-            reasons = []
-        if "недостаточный RR для входа" not in reasons:
-            reasons.append("недостаточный RR для входа")
-        d["no_trade_reasons"] = reasons
-        if not (d.get("no_trade_hint") or "").strip():
-            d["no_trade_hint"] = "недостаточный RR для входа"
+        if active_mode == "aggressive":
+            d.setdefault("warnings", [])
+            if isinstance(d.get("warnings"), list) and "low_rr_aggressive" not in d["warnings"]:
+                d["warnings"].append("low_rr_aggressive")
+            # В aggressive это не блокер: снижаем ожидания, просим подтверждение, но не выключаем сигнал.
+            if (d.get("entry_mode") or "").strip().lower() == "now":
+                d["entry_mode"] = "wait_confirm"
+            if d.get("confidence") not in ("Low", "Medium", "High"):
+                d["confidence"] = "Low"
+        else:
+            d["no_trade"] = True
+            reasons = d.get("no_trade_reasons")
+            if not isinstance(reasons, list):
+                reasons = []
+            if "недостаточный RR для входа" not in reasons:
+                reasons.append("недостаточный RR для входа")
+            d["no_trade_reasons"] = reasons
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "недостаточный RR для входа"
 
     return d
 
@@ -2527,6 +2592,196 @@ def validate_active_mode_setup(d: dict) -> dict:
     if final_range is not None:
         d["entry_range"] = final_range
 
+    # ---- Aggressive extreme blockers + disciplined countertrend handling ----
+    if final_mode == "aggressive" and not bool(d.get("no_trade")):
+        if bool(d.get("risk_off")):
+            d["no_trade"] = True
+            reasons = d.setdefault("no_trade_reasons", [])
+            if isinstance(reasons, list) and "risk_off" not in reasons:
+                reasons.append("risk_off")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "risk_off"
+            return d
+
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+        fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+        fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+
+        def _has_reversal_evidence() -> bool:
+            if side == "short":
+                return bool((fan_h1 == "mixed") or (fan_m15 == "bear") or (vs_h1 != "above"))
+            if side == "long":
+                return bool((fan_h1 == "mixed") or (fan_m15 == "bull") or (vs_h1 != "below"))
+            return False
+
+        # Explicit EMA direction guard: aggressive can be earlier, but must not "enter now"
+        # against EMA structure without reversal confirmation.
+        try:
+            warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+            has_dir_guard = "dir_guard_forced_short_by_ema" in warnings
+        except Exception:
+            has_dir_guard = False
+        if side == "long" and has_dir_guard:
+            d.setdefault("warnings", [])
+            note = "Направление против EMA-структуры — требуется подтверждение разворота."
+            if isinstance(d.get("warnings"), list) and note not in d["warnings"]:
+                d["warnings"].append(note)
+            if not _has_reversal_evidence():
+                em = (d.get("entry_mode") or "").strip().lower()
+                if em in ("now", "market"):
+                    d["entry_mode"] = "wait_confirm"
+
+        if side in ("long", "short") and _m15_flush_detected(d) and not _has_reversal_evidence():
+            d["no_trade"] = True
+            reasons = d.setdefault("no_trade_reasons", [])
+            if isinstance(reasons, list) and "flush_knife_aggressive_extreme" not in reasons:
+                reasons.append("flush_knife_aggressive_extreme")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "flush_knife_aggressive_extreme"
+            return d
+
+        strong_h1_up = (vs_h1 == "above") and (fan_h1 == "bull")
+        strong_h1_down = (vs_h1 == "below") and (fan_h1 == "bear")
+        countertrend = (side == "short" and strong_h1_up) or (side == "long" and strong_h1_down)
+        if countertrend and not _has_reversal_evidence():
+            d.setdefault("warnings", [])
+            if isinstance(d.get("warnings"), list) and "countertrend_aggressive_needs_evidence" not in d["warnings"]:
+                d["warnings"].append("countertrend_aggressive_needs_evidence")
+            em = (d.get("entry_mode") or "").strip().lower()
+            if em in ("now", "market"):
+                d["entry_mode"] = "wait_confirm"
+            if d.get("confidence") == "High":
+                d["confidence"] = "Medium"
+            if not (d.get("confirmation_rules") or ""):
+                d["confirmation_rules"] = (
+                    "Контртренд без подтверждения: дождаться разворота EMA-fan на M15 / "
+                    "смешанного состояния на H1 / закрепления цены относительно EMA20(H1)."
+                )
+
+    # ---- DAY/MID soft-bias override note (intraday facts can dominate) ----
+    try:
+        ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+        day_bias = (ctx.get("day_bias") or "").strip().lower()
+        mid_bias = (ctx.get("mid_bias") or "").strip().lower()
+        bias = day_bias if day_bias in ("long", "short") else (mid_bias if mid_bias in ("long", "short") else "")
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+        fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+        strong_contradiction = bool(
+            (bias == "long" and vs_h1 == "below" and fan_h1 != "bull")
+            or (bias == "short" and vs_h1 == "above" and fan_h1 != "bear")
+        )
+        if bias in ("long", "short") and side in ("long", "short") and strong_contradiction and side != bias:
+            if isinstance(ctx, dict):
+                ctx["override_note"] = "⚠️ Расхождение с DAY/MID: intraday структура важнее, торгуем по текущей фазе."
+                d["day_mid_context"] = ctx
+    except Exception:
+        pass
+
+    # ---- Neutral (STRICT): forbid counter-trend completely ----
+    # Strong H1 context (existing fields):
+    # - Uptrend: price_vs_ema20_h1 == "above" AND ema_fan_h1_state == "bull"
+    # - Downtrend: price_vs_ema20_h1 == "below" AND ema_fan_h1_state == "bear"
+    if final_mode == "neutral" and not bool(d.get("no_trade")):
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+        fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+
+        def _ensure_aggressive_option_from_existing_idea(note: str) -> None:
+            existing = d.get("aggressive_option")
+            if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
+                existing["note"] = note
+                d["aggressive_option"] = existing
+                return
+
+            entry = _to_float(d.get("entry_price_aggressive"))
+            if entry is None:
+                ab = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else None
+                ar = (ab or {}).get("range") if isinstance(ab, dict) else None
+                if isinstance(ar, dict):
+                    a_min = _to_float(ar.get("min"))
+                    a_max = _to_float(ar.get("max"))
+                    if a_min is not None and a_max is not None:
+                        entry = (min(a_min, a_max) + max(a_min, a_max)) / 2.0
+            if entry is None:
+                entry = _to_float(d.get("entry_price_neutral"))
+            if entry is None:
+                er = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None
+                if isinstance(er, dict):
+                    e_min = _to_float(er.get("min"))
+                    e_max = _to_float(er.get("max"))
+                    if e_min is not None and e_max is not None:
+                        entry = (min(e_min, e_max) + max(e_min, e_max)) / 2.0
+            if entry is None:
+                return
+
+            d["aggressive_option"] = {
+                "entry_price": float(entry),
+                "note": note,
+            }
+
+        uptrend_ctx = (vs_h1 == "above") and (fan_h1 == "bull")
+        downtrend_ctx = (vs_h1 == "below") and (fan_h1 == "bear")
+        forbidden = bool((side == "short" and uptrend_ctx) or (side == "long" and downtrend_ctx))
+
+        if forbidden:
+            d["no_trade"] = True
+            reasons = d.setdefault("no_trade_reasons", [])
+            if isinstance(reasons, list) and "counter_trend_neutral_forbidden" not in reasons:
+                reasons.append("counter_trend_neutral_forbidden")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "counter_trend_neutral_forbidden"
+            _ensure_aggressive_option_from_existing_idea("Контртрендовая идея — допустима только в aggressive.")
+            return d
+
+    # ---- Neutral (STRICT): require stabilization (avoid reversals / knife catches) ----
+    if final_mode == "neutral" and not bool(d.get("no_trade")):
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        vs_m15 = str(d.get("price_vs_ema20_m15") or "").strip().lower()
+        vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+        fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+        fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+        warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else None
+
+        wrong_side_both = False
+        if side == "long":
+            wrong_side_both = (vs_m15 == "below") and (vs_h1 == "below")
+        elif side == "short":
+            wrong_side_both = (vs_m15 == "above") and (vs_h1 == "above")
+
+        if wrong_side_both:
+            stabilization = False
+            # Conservative interpretation: only count evidence when explicitly present.
+            if isinstance(warnings, list) and "impulse_no_exhale" not in warnings:
+                stabilization = True
+            if side == "long" and fan_m15 and fan_m15 != "bear":
+                stabilization = True
+            if side == "short" and fan_m15 and fan_m15 != "bull":
+                stabilization = True
+            if fan_h1 == "mixed":
+                stabilization = True
+
+            if not stabilization:
+                d["no_trade"] = True
+                reasons = d.setdefault("no_trade_reasons", [])
+                if isinstance(reasons, list) and "neutral_continuation_unstable_forbidden" not in reasons:
+                    reasons.append("neutral_continuation_unstable_forbidden")
+                if not (d.get("no_trade_hint") or "").strip():
+                    d["no_trade_hint"] = "neutral_continuation_unstable_forbidden"
+
+                existing = d.get("aggressive_option")
+                if not (isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None):
+                    entry = _to_float(d.get("entry_price_aggressive"))
+                    if entry is None:
+                        entry = _to_float(d.get("entry_price_neutral"))
+                    if entry is not None:
+                        d["aggressive_option"] = {
+                            "entry_price": float(entry),
+                            "note": "Контртрендовая идея — допустима только в aggressive.",
+                        }
+                return d
+
     # ---- Neutral flush-reversal gate (knife-catch forbidden) ----
     # Neutral mode must not take reversal trades right after a sharp M15 flush.
     # Such ideas are allowed only as an aggressive_option.
@@ -2556,63 +2811,6 @@ def validate_active_mode_setup(d: dict) -> dict:
                 existing.setdefault("entry_price", entry_idea)
                 existing["note"] = "Разворот после импульсного пролива — допустимо только в aggressive."
                 d["aggressive_option"] = existing
-            return d
-
-    # ---- Neutral counter-trend gate (structural evidence required) ----
-    # In neutral mode we forbid pure counter-trend fades against a strong H1 trend.
-    # Early reversals are allowed only when there is structural evidence (M15/H1/EMA-guard shifts).
-    if final_mode == "neutral" and not bool(d.get("no_trade")):
-        side = (d.get("side") or d.get("direction") or "").strip().lower()
-        vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
-        fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
-        fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
-        guard = str(d.get("ema_guard_state") or "").strip().lower()
-
-        def _ensure_aggressive_option_only_if_exists() -> None:
-            agg_entry = _to_float(d.get("entry_price_aggressive"))
-            if agg_entry is None:
-                ab = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else None
-                ar = (ab or {}).get("range") if isinstance(ab, dict) else None
-                if isinstance(ar, dict):
-                    a_min = _to_float(ar.get("min"))
-                    a_max = _to_float(ar.get("max"))
-                    if a_min is not None and a_max is not None:
-                        agg_entry = (min(a_min, a_max) + max(a_min, a_max)) / 2.0
-            if agg_entry is None:
-                return
-            d["aggressive_option"] = {
-                "entry_price": agg_entry,
-                "note": "Контртрендовая идея — допустима только в aggressive.",
-            }
-
-        forbidden = False
-        if side == "short":
-            trend_up_ctx = (vs_h1 == "above") and (fan_h1 == "bull")
-            early_reversal = (
-                (fan_m15 == "bear")
-                or (fan_h1 == "mixed")
-                or (vs_h1 != "above")
-                or (guard != "above_both")
-            )
-            forbidden = bool(trend_up_ctx) and not bool(early_reversal)
-        elif side == "long":
-            trend_down_ctx = (vs_h1 == "below") and (fan_h1 == "bear")
-            early_reversal = (
-                (fan_m15 == "bull")
-                or (fan_h1 == "mixed")
-                or (vs_h1 != "below")
-                or (guard != "below_both")
-            )
-            forbidden = bool(trend_down_ctx) and not bool(early_reversal)
-
-        if forbidden:
-            d["no_trade"] = True
-            reasons = d.setdefault("no_trade_reasons", [])
-            if isinstance(reasons, list) and "counter_trend_neutral_forbidden" not in reasons:
-                reasons.append("counter_trend_neutral_forbidden")
-            if not (d.get("no_trade_hint") or "").strip():
-                d["no_trade_hint"] = "counter_trend_neutral_forbidden"
-            _ensure_aggressive_option_only_if_exists()
             return d
 
     # ---- Variant B+2: neutral entry must not be too close to current price ----
@@ -2795,62 +2993,6 @@ def validate_active_mode_setup(d: dict) -> dict:
     # When neutral mode is active and an aggressive option exists, keep neutral entry
     # meaningfully farther than the aggressive entry by a small tick-based buffer.
     if final_mode == "neutral" and not bool(d.get("no_trade")):
-        # ---- Neutral near-market auto-split (semantic only) ----
-        # If neutral entry is near current price and no aggressive_option exists yet:
-        # - preserve original neutral entry as an explicit aggressive_option;
-        # - move neutral entry farther by NEUTRAL_BUFFER_TICKS.
-        # This does not change EMA/no_trade/direction logic; it only re-labels the early entry.
-        if not isinstance(d.get("aggressive_option"), dict):
-            side = (d.get("side") or d.get("direction") or "").strip().lower()
-            symbol = d.get("symbol")
-            px = _to_float(d.get("price"))
-            n_entry0 = _to_float(d.get("entry_price_neutral"))
-
-            if side in ("long", "short") and px is not None and px > 0 and n_entry0 is not None:
-                prec = _price_precision(symbol, value_hint=px)
-                tick_size = 10 ** (-int(prec))
-                if tick_size > 0:
-                    dist_ticks = abs(float(n_entry0) - float(px)) / float(tick_size)
-                else:
-                    dist_ticks = float("inf")
-
-                if dist_ticks <= float(NEUTRAL_NEAR_TICKS):
-                    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
-                    sl_neutral = _to_float(sl_by_mode.get("neutral"))
-
-                    buffer_val = float(NEUTRAL_BUFFER_TICKS) * float(tick_size)
-                    original_entry = _round_price(n_entry0, symbol=symbol)
-                    original_entry = float(original_entry) if original_entry is not None else float(n_entry0)
-
-                    if side == "long":
-                        target = original_entry - buffer_val
-                        cand = _round_price_dir(target, "down", symbol=symbol)
-                    else:  # short
-                        target = original_entry + buffer_val
-                        cand = _round_price_dir(target, "up", symbol=symbol)
-
-                    def _safe_autosplit(px_new: float) -> bool:
-                        if not (math.isfinite(px_new) and px_new > 0):
-                            return False
-                        if sl_neutral is None or not math.isfinite(sl_neutral):
-                            return False
-                        if side == "long" and px_new <= float(sl_neutral):
-                            return False
-                        if side == "short" and px_new >= float(sl_neutral):
-                            return False
-                        # Ensure the neutral move is actually "calmer" vs current price.
-                        if abs(px_new - float(px)) <= abs(original_entry - float(px)) + 1e-12:
-                            return False
-                        return True
-
-                    if cand is not None and _safe_autosplit(float(cand)):
-                        d["aggressive_option"] = {
-                            "entry_price": original_entry,
-                            "note": "Ранний вход (aggressive) при повышенном риске.",
-                        }
-                        d["entry_price_neutral"] = float(cand)
-                        d["neutral_autosplit"] = True
-
         aggressive_option = d.get("aggressive_option")
         if isinstance(aggressive_option, dict):
             side = (d.get("side") or d.get("direction") or "").strip().lower()
@@ -2917,6 +3059,42 @@ def validate_active_mode_setup(d: dict) -> dict:
                         cand = _round_price_dir(min_neutral, "up", symbol=symbol)
                         if cand is not None and _candidate_ok(float(cand)):
                             d["entry_price_neutral"] = float(cand)
+
+        # ---- Neutral near-market risk gate (STRICT) ----
+        # Neutral must be continuation/patient only; near-market entries belong to aggressive.
+        try:
+            side = (d.get("side") or d.get("direction") or "").strip().lower()
+            px = _to_float(d.get("price"))
+            n_entry = _to_float(d.get("entry_price_neutral"))
+            symbol = d.get("symbol")
+            if side in ("long", "short") and px is not None and px > 0 and n_entry is not None:
+                prec = _price_precision(symbol, value_hint=px)
+                tick_size = 10 ** (-int(prec))
+                if tick_size > 0:
+                    dist_ticks = abs(float(n_entry) - float(px)) / float(tick_size)
+                else:
+                    dist_ticks = float("inf")
+
+                if dist_ticks <= float(NEUTRAL_NEAR_TICKS):
+                    d["no_trade"] = True
+                    reasons = d.setdefault("no_trade_reasons", [])
+                    if isinstance(reasons, list) and "neutral_too_close_risky" not in reasons:
+                        reasons.append("neutral_too_close_risky")
+                    if not (d.get("no_trade_hint") or "").strip():
+                        d["no_trade_hint"] = "neutral_too_close_risky"
+
+                    existing = d.get("aggressive_option")
+                    if not (isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None):
+                        a_entry = _to_float(d.get("entry_price_aggressive"))
+                        if a_entry is None:
+                            a_entry = float(n_entry)
+                        d["aggressive_option"] = {
+                            "entry_price": float(a_entry),
+                            "note": "Слишком близко к рынку — допустимо только в aggressive.",
+                        }
+                    return d
+        except Exception:
+            pass
 
     mode = final_mode
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}

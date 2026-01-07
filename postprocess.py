@@ -90,6 +90,36 @@ def apply_day_mid_context(d: dict, day_txt: str | None, mid_txt: str | None) -> 
 
     d["day_mid_context"] = ctx
 
+def apply_day_mid_intraday_override_note(d: dict) -> None:
+    """
+    DAY/MID — это bias (prior), а не жёсткий фильтр.
+    Если intraday структура сильно противоречит DAY/MID и мы торгуем против bias — добавляем короткую пометку.
+    """
+    ctx = d.get("day_mid_context")
+    if not isinstance(ctx, dict):
+        return
+    day_bias = str(ctx.get("day_bias") or "").strip().lower()
+    mid_bias = str(ctx.get("mid_bias") or "").strip().lower()
+    bias = day_bias if day_bias in ("long", "short") else (mid_bias if mid_bias in ("long", "short") else "")
+    if bias not in ("long", "short"):
+        return
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short") or side == bias:
+        return
+
+    vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+    fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+    strong_contradiction = bool(
+        (bias == "long" and vs_h1 == "below" and fan_h1 != "bull")
+        or (bias == "short" and vs_h1 == "above" and fan_h1 != "bear")
+    )
+    if not strong_contradiction:
+        return
+
+    ctx["override_note"] = "⚠️ Расхождение с DAY/MID: intraday структура важнее, торгуем по текущей фазе."
+    d["day_mid_context"] = ctx
+
 def apply_adx_guard(d: dict) -> None:
     """
     ADX guard — пока только stub: JSON-форма под будущий фильтр силы тренда.
@@ -268,6 +298,67 @@ def _tw_risk_off_stress(d: dict) -> bool:
     mc = d.get("market_context")
     return isinstance(mc, str) and ("risk-off" in mc.lower())
 
+def _tw_append_unique(d: dict, key: str, value: str) -> None:
+    xs = d.get(key)
+    if not isinstance(xs, list):
+        return
+    if value not in xs:
+        xs.append(value)
+
+
+def _tw_has_any_reason(d: dict, *needles: str) -> bool:
+    reasons = d.get("no_trade_reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return False
+    for r in reasons:
+        if not isinstance(r, str):
+            continue
+        low = r.strip().lower()
+        for n in needles:
+            if low == n or n in low:
+                return True
+    return False
+
+
+def _tw_neutral_green_lane(d: dict) -> bool:
+    if bool(d.get("no_trade")):
+        return False
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return False
+
+    vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+    fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+
+    continuation = False
+    if side == "long":
+        continuation = (vs_h1 == "above") and (fan_h1 == "bull") and (fan_m15 == "bull")
+    elif side == "short":
+        continuation = (vs_h1 == "below") and (fan_h1 == "bear") and (fan_m15 == "bear")
+    if not continuation:
+        return False
+
+    warnings = d.get("warnings")
+    if isinstance(warnings, list):
+        wl = " ".join(str(w or "").strip().lower() for w in warnings)
+        if any(k in wl for k in ("impulse_no_exhale", "phase_between", "ema_between_m15_h1", "ema_source_suspect")):
+            return False
+        if re.search(r"overextended_(no_exhale|h1)\b", wl):
+            return False
+
+    if _tw_structure_stress(d):
+        return False
+    if _tw_news_stress(d.get("news_context")):
+        return False
+    if _tw_volatility_stress(warnings):
+        return False
+    if _tw_risk_off_stress(d):
+        return False
+
+    return True
+
 
 def apply_time_window_policy_variant_b(d: dict) -> None:
     mode = (d.get("mode") or "").strip().lower()
@@ -283,28 +374,28 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
     d.setdefault("no_trade_hint", "")
 
     if mode == "aggressive":
-        # Игнорируем окна полностью.
-        reasons_before = d.get("no_trade_reasons") if isinstance(d.get("no_trade_reasons"), list) else []
-        hint_before = d.get("no_trade_hint") if isinstance(d.get("no_trade_hint"), str) else ""
-        had_tw = any(isinstance(r, str) and "time_window" in r for r in reasons_before) or ("time_window" in hint_before.lower())
+        _tw_append_unique(d, "warnings", "time_window_low_liquidity")
+        _tw_append_unique(d, "warnings", "time_window_caution_aggressive")
+        d["entry_mode"] = "wait_confirm"
 
-        if isinstance(d.get("warnings"), list):
-            d["warnings"] = [
-                w for w in d["warnings"] if not (isinstance(w, str) and "time_window" in w)
-            ]
-        if isinstance(d.get("no_trade_reasons"), list):
-            d["no_trade_reasons"] = [
-                r for r in d["no_trade_reasons"] if not (isinstance(r, str) and "time_window" in r)
-            ]
-        if isinstance(d.get("no_trade_hint"), str) and "time_window" in d["no_trade_hint"].lower():
-            d["no_trade_hint"] = ""
-        if had_tw and bool(d.get("no_trade")) and not d.get("no_trade_reasons") and not d.get("no_trade_hint"):
-            d["no_trade"] = False
+        warnings = d.get("warnings")
+        stress_news = _tw_news_stress(d.get("news_context"))
+        stress_vol = _tw_volatility_stress(warnings)
+        stress_struct = _tw_structure_stress(d)
+        stress_risk_off = _tw_risk_off_stress(d)
+        stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
+
+        flush_extreme = _tw_has_any_reason(d, "flush_knife_aggressive_extreme") or bool(d.get("flush_knife_aggressive_extreme"))
+        invalid_setup = _tw_has_any_reason(d, "invalid_mode_setup")
+
+        if bool(stress or flush_extreme or invalid_setup):
+            d["no_trade"] = True
+            _tw_append_unique(d, "no_trade_reasons", "time_window_extreme_block")
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = "time_window_extreme_block"
         return
 
-    warnings = d.get("warnings")
-    if isinstance(warnings, list) and "time_window_low_liquidity" not in warnings:
-        warnings.append("time_window_low_liquidity")
+    _tw_append_unique(d, "warnings", "time_window_low_liquidity")
 
     if mode == "conservative":
         d["no_trade"] = True
@@ -314,40 +405,15 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
         d["no_trade_hint"] = "Опасное окно времени (пониженная ликвидность): режим conservative — без сделок."
         return
 
-    # neutral
-    stress_news = _tw_news_stress(d.get("news_context"))
-    stress_vol = _tw_volatility_stress(d.get("warnings"))
-    stress_struct = _tw_structure_stress(d)
-    stress_risk_off = _tw_risk_off_stress(d)
-    stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
-
-    if stress:
-        d["no_trade"] = True
-        reasons = d.get("no_trade_reasons")
-        if isinstance(reasons, list) and "time_window" not in reasons:
-            reasons.append("time_window")
-        tags = []
-        if stress_news:
-            tags.append("news")
-        if stress_vol:
-            tags.append("volatility")
-        if stress_struct:
-            tags.append("chaotic")
-        if stress_risk_off:
-            tags.append("risk-off")
-        tag_str = "/".join(tags) if tags else "stress"
-        d["no_trade_hint"] = f"Опасное окно времени + стресс-условия ({tag_str}): режим neutral — пропустить сделку."
+    # neutral: time_window is an active blocker by default
+    if _tw_neutral_green_lane(d):
+        _tw_append_unique(d, "warnings", "time_window_green_lane")
         return
 
-    # в окне, но без stress → только warning
-    if bool(d.get("no_trade")) and isinstance(d.get("no_trade_reasons"), list):
-        had_tw = any(isinstance(r, str) and "time_window" in r for r in d["no_trade_reasons"])
-        d["no_trade_reasons"] = [
-            r for r in d["no_trade_reasons"] if not (isinstance(r, str) and "time_window" in r)
-        ]
-        if had_tw and not d["no_trade_reasons"]:
-            d["no_trade"] = False
-            d["no_trade_hint"] = ""
+    d["no_trade"] = True
+    _tw_append_unique(d, "no_trade_reasons", "time_window")
+    if not (d.get("no_trade_hint") or "").strip():
+        d["no_trade_hint"] = "time_window"
 
 def process(d: dict, day_txt: str | None = None, mid_txt: str | None = None) -> dict:
     """
@@ -361,6 +427,7 @@ def process(d: dict, day_txt: str | None = None, mid_txt: str | None = None) -> 
     """
     apply_ema_guard(d)
     apply_day_mid_context(d, day_txt, mid_txt)
+    apply_day_mid_intraday_override_note(d)
     apply_adx_guard(d)
     ensure_no_trade_defaults(d)
     build_entries_if_missing(d)
