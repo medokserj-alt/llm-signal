@@ -57,8 +57,22 @@ class TestNeutralCounterTrendGate(unittest.TestCase):
         d["ema_fan_m15_state"] = "bear"
         out = get_signal_json.validate_active_mode_setup(d)
 
-        self.assertFalse(bool(out.get("no_trade")))
-        self.assertNotIn("counter_trend_neutral_forbidden", out.get("no_trade_reasons") or [])
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("counter_trend_neutral_forbidden", out.get("no_trade_reasons") or [])
+
+    def test_neutral_counter_trend_forbidden_for_long_in_strong_h1_downtrend(self) -> None:
+        d = _base_neutral_short_payload()
+        d["side"] = "long"
+        d["price_vs_ema20_h1"] = "below"
+        d["ema_fan_h1_state"] = "bear"
+        d["entry_price_neutral"] = 99.25
+        d["entry_price_aggressive"] = 99.75
+
+        out = get_signal_json.validate_active_mode_setup(d)
+
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("counter_trend_neutral_forbidden", out.get("no_trade_reasons") or [])
+        self.assertIsInstance(out.get("aggressive_option"), dict)
 
 
 if __name__ == "__main__":

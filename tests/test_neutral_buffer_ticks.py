@@ -18,8 +18,9 @@ class TestNeutralBufferTicks(unittest.TestCase):
                 "conservative": {"enabled": True, "range": {"min": 0.4970, "max": 0.4985}},
             },
             "entry_range": {"min": 0.4980, "max": 0.5020},
-            # Too close to aggressive (only 5 ticks away).
-            "entry_price_neutral": 0.4995,
+            # Far enough from market (avoid strict-neutral near-market rejection),
+            # but still must satisfy neutral buffer vs aggressive.
+            "entry_price_neutral": 0.4988,
             "entry_price_aggressive": 0.5000,
             "aggressive_option": {"entry_price": 0.5000, "note": "aggressive"},
             "sl_by_mode": {"neutral": 0.4950},

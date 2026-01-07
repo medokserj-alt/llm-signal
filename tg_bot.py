@@ -28,6 +28,36 @@ FALLBACK_CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL")
 
 AIA_BASE_URL = "http://127.0.0.1:8002"
 AIA_TIMEOUT_SEC = 2.5
+AIA_TEST_CHANNEL_ID = os.getenv("AIA_TEST_CHANNEL_ID")
+
+def _parse_env_int(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or not s.lstrip("-").isdigit():
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+_AIA_TEST_CHANNEL_ID_INT = _parse_env_int(AIA_TEST_CHANNEL_ID)
+
+def _should_send_to_aia_for_target(target) -> bool:
+    test_id = _AIA_TEST_CHANNEL_ID_INT
+    if test_id is None:
+        return True
+    if isinstance(target, int):
+        return target == test_id
+    if target is None:
+        return False
+    s = str(target).strip()
+    if s.lstrip("-").isdigit():
+        try:
+            return int(s) == test_id
+        except Exception:
+            return False
+    return s == str(test_id)
 
 # ============== ACCESS CONTROL ==============
 
@@ -856,7 +886,7 @@ async def handle_full(update,context):
                 await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+part0)
                 if "📌 Сигнал не выдан" in part0:
                     payload = _build_no_trade_decision_payload(uid, tg_text=part0, symbol_hint=None)
-                    if payload:
+                    if payload and _should_send_to_aia_for_target(target):
                         asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
                 published_at = _utc_now_z()
                 signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
@@ -868,7 +898,7 @@ async def handle_full(update,context):
                     channel_id=target,
                     symbol_hint=None,
                 )
-                if sig_v1:
+                if sig_v1 and _should_send_to_aia_for_target(target):
                     asyncio.create_task(_send_signal_to_aia_background(sig_v1))
 
         mode_label = MODE_LABELS.get(get_user_mode(uid), MODE_LABELS["neutral"])
@@ -993,7 +1023,7 @@ async def handle_symbol(update,context):
                 await context.bot.send_message(chat_id=target, text="📣 Сигнал\n\n"+part0)
                 if "📌 Сигнал не выдан" in part0:
                     payload = _build_no_trade_decision_payload(uid, tg_text=part0, symbol_hint=symbol)
-                    if payload:
+                    if payload and _should_send_to_aia_for_target(target):
                         asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
                 published_at = _utc_now_z()
                 signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)

@@ -149,6 +149,12 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "для LONG: цена ниже EMA20(M15/H1)"
     if low == "ema_guard_above_both_short":
         return "для SHORT: цена выше EMA20(M15/H1)"
+    if low == "counter_trend_neutral_forbidden":
+        return "контртренд запрещён в neutral (только continuation)"
+    if low == "neutral_continuation_unstable_forbidden":
+        return "нет стабилизации/подтверждения для continuation (риск разворота)"
+    if low == "neutral_too_close_risky":
+        return "neutral-вход слишком близко к текущей цене (слишком рискованно)"
 
     return k
 
@@ -284,6 +290,12 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Для LONG: цена должна закрепиться выше EMA20(M15) и EMA20(H1).")
         if low == "ema_guard_above_both_short":
             add("– Для SHORT: цена должна закрепиться ниже EMA20(M15) и EMA20(H1).")
+        if low == "counter_trend_neutral_forbidden":
+            add("– Дождаться сделки по тренду на H1 или перейти в aggressive (на свой риск).")
+        if low == "neutral_continuation_unstable_forbidden":
+            add("– Дождаться признаков стабилизации: «выдох»/откат на M15 и ослабление тренда на H1.")
+        if low == "neutral_too_close_risky":
+            add("– Дождаться более дальнего (пациентного) уровня входа, не у текущей цены.")
 
     if not out:
         add("– Дождаться формирования более чистой структуры/подтверждения по M15.")
@@ -346,4 +358,13 @@ def format_no_trade_message(d: dict) -> str:
     lines.extend(needs)
     lines.append("")
     lines.append("Статус: рынок в фазе ожидания, бот продолжает мониторинг.")
+
+    aggressive_option = d.get("aggressive_option")
+    if isinstance(aggressive_option, dict):
+        entry = aggressive_option.get("entry_price")
+        note = str(aggressive_option.get("note") or "").strip()
+        if entry is not None:
+            suffix = f" — {note}" if note else ""
+            lines.append("")
+            lines.append(f"⚡ Aggressive option: {entry}{suffix}")
     return "\n".join(lines)

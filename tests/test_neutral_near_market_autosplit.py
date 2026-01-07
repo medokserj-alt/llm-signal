@@ -4,7 +4,7 @@ import get_signal_json
 
 
 class TestNeutralNearMarketAutoSplit(unittest.TestCase):
-    def test_neutral_near_market_creates_aggressive_option_and_buffers_neutral(self) -> None:
+    def test_neutral_near_market_is_rejected_and_shows_aggressive_option_only(self) -> None:
         d = {
             "no_trade": False,
             "mode": "neutral",
@@ -23,23 +23,22 @@ class TestNeutralNearMarketAutoSplit(unittest.TestCase):
         }
 
         tick = 10 ** (-get_signal_json._price_precision("XRP/USDT", value_hint=0.5))
-        buf = get_signal_json.NEUTRAL_BUFFER_TICKS * tick
         original_entry = float(d["entry_price_neutral"])
 
         out = get_signal_json.validate_active_mode_setup(d)
         self.assertEqual(out.get("mode"), "neutral")
 
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("neutral_too_close_risky", out.get("no_trade_reasons") or [])
+
         self.assertIsInstance(out.get("aggressive_option"), dict)
         a_entry = float(out["aggressive_option"]["entry_price"])
-        n_entry = float(out["entry_price_neutral"])
-
         self.assertAlmostEqual(a_entry, original_entry, places=7)
-        self.assertGreaterEqual(a_entry - n_entry + 1e-12, buf)
 
+        # Still near-market => neutral is rejected in strict-neutral.
         px = float(out["price"])
-        dist_ticks = abs(n_entry - px) / tick
-        self.assertGreater(dist_ticks, get_signal_json.NEUTRAL_NEAR_TICKS)
-        self.assertIs(out.get("neutral_autosplit"), True)
+        dist_ticks = abs(original_entry - px) / tick
+        self.assertLessEqual(dist_ticks, get_signal_json.NEUTRAL_NEAR_TICKS)
 
 
 if __name__ == "__main__":

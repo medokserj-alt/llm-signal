@@ -435,6 +435,14 @@ def main():
                 if reason:
                     lines.append(f"Причина: {reason}")
             lines.append(f"Направление: {_direction_badge(data) or '—'}")
+            try:
+                ctx = data.get("day_mid_context")
+                if isinstance(ctx, dict):
+                    note = (ctx.get("override_note") or "").strip()
+                    if note:
+                        lines.append(note)
+            except Exception:
+                pass
 
             raw_side = data.get("side")
             raw_dir = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")
