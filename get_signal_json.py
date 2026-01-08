@@ -1666,6 +1666,17 @@ def apply_ema_exhale_filter(d: dict) -> None:
     # IMPULSE: догоняющий вход без выдоха
     if is_impulse:
         if mode == "aggressive":
+            # Special-case: if there is a confirmed micro phase-flip on M15 for the proposed direction,
+            # aggressive should adapt tactics (wait_confirm) rather than be blocked.
+            try:
+                if _compute_phase_flip_m15(d):
+                    d["entry_mode"] = "wait_confirm"
+                    if isinstance(warnings, list) and "phase_flip_wait_confirm" not in warnings:
+                        warnings.append("phase_flip_wait_confirm")
+                    return
+            except Exception:
+                pass
+
             _disable_aggressive_entry()
             _tighten_conservative_size_hint()
             return
@@ -1681,6 +1692,295 @@ def apply_ema_exhale_filter(d: dict) -> None:
         return
 
     return
+
+
+US_SESSION_UTC_WINDOW_DEFAULT = "14:00-21:00"
+
+
+def _parse_utc_window_minutes(spec: str) -> tuple[int, int] | None:
+    """
+    Parses "HH:MM-HH:MM" into (start_min, end_min) minutes from midnight UTC.
+    End is treated as exclusive. Supports windows that may cross midnight.
+    """
+    try:
+        s = str(spec or "").strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    m = re.findall(r"(\d{1,2}):(\d{2})", s)
+    if len(m) < 2:
+        return None
+    (h1s, m1s), (h2s, m2s) = m[0], m[1]
+    try:
+        h1, m1 = int(h1s), int(m1s)
+        h2, m2 = int(h2s), int(m2s)
+    except Exception:
+        return None
+    if not (0 <= h1 <= 23 and 0 <= m1 <= 59 and 0 <= h2 <= 23 and 0 <= m2 <= 59):
+        return None
+    return h1 * 60 + m1, h2 * 60 + m2
+
+
+def _utc_minutes_from_signal_time(d: dict) -> int | None:
+    """
+    Best-effort UTC minutes:
+    - prefer last_candle_m15.ts (exchange candle timestamp),
+    - fallback to parsing time_msk (Europe/Moscow) and converting to UTC.
+    """
+    try:
+        lc = d.get("last_candle_m15")
+        if isinstance(lc, dict) and lc.get("ts") is not None:
+            ts_ms = int(lc.get("ts"))
+            dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=ZoneInfo("UTC"))
+            return int(dt.hour) * 60 + int(dt.minute)
+    except Exception:
+        pass
+
+    try:
+        s = str(d.get("time_msk") or "").strip()
+    except Exception:
+        s = ""
+    if not s:
+        return None
+
+    try:
+        m = re.search(r"(?:(\d{1,2})\.(\d{1,2})\.(\d{4})\s*,\s*)?(\d{1,2}):(\d{2})", s)
+        if not m:
+            return None
+        dd = int(m.group(1) or datetime.now(ZoneInfo("Europe/Moscow")).day)
+        mm = int(m.group(2) or datetime.now(ZoneInfo("Europe/Moscow")).month)
+        yy = int(m.group(3) or datetime.now(ZoneInfo("Europe/Moscow")).year)
+        hh = int(m.group(4))
+        mi = int(m.group(5))
+        dt_msk = datetime(yy, mm, dd, hh, mi, tzinfo=ZoneInfo("Europe/Moscow"))
+        dt_utc = dt_msk.astimezone(ZoneInfo("UTC"))
+        return int(dt_utc.hour) * 60 + int(dt_utc.minute)
+    except Exception:
+        return None
+
+
+def _is_in_utc_window(mins_utc: int, start_min: int, end_min: int) -> bool:
+    if not (0 <= mins_utc < 24 * 60):
+        return False
+    start_min = int(start_min) % (24 * 60)
+    end_min = int(end_min) % (24 * 60)
+    if start_min == end_min:
+        return False
+    if start_min < end_min:
+        return start_min <= mins_utc < end_min
+    return mins_utc >= start_min or mins_utc < end_min
+
+
+def _is_us_session(d: dict) -> bool:
+    """
+    Simple configurable US session flag.
+    Default window is 14:00–21:00 UTC, configurable via env US_SESSION_UTC_WINDOW="HH:MM-HH:MM".
+    """
+    try:
+        spec = os.getenv("US_SESSION_UTC_WINDOW", US_SESSION_UTC_WINDOW_DEFAULT)
+    except Exception:
+        spec = US_SESSION_UTC_WINDOW_DEFAULT
+    window = _parse_utc_window_minutes(spec) or _parse_utc_window_minutes(US_SESSION_UTC_WINDOW_DEFAULT)
+    if not window:
+        return False
+    mins_utc = _utc_minutes_from_signal_time(d)
+    if mins_utc is None:
+        return False
+    return _is_in_utc_window(mins_utc, window[0], window[1])
+
+
+def _compute_phase_flip_m15(d: dict) -> bool:
+    """
+    Phase-flip (micro-phase change) on M15 for the proposed trade direction:
+    - SHORT ideas: true if price_vs_ema20_m15 == "above" and last 2 M15 closes are above ema20_m15
+    - LONG ideas:  true if price_vs_ema20_m15 == "below" and last 2 M15 closes are below ema20_m15
+    """
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return False
+
+    vs_m15 = str(d.get("price_vs_ema20_m15") or "").strip().lower()
+    ema20_m15 = _to_float(d.get("ema20_m15"))
+    closes = d.get("closes_m15_tail")
+    if ema20_m15 is None or not isinstance(closes, list) or len(closes) < 2:
+        return False
+
+    last2: list[float] = []
+    for x in closes[-2:]:
+        v = _to_float(x)
+        if v is None:
+            return False
+        last2.append(v)
+
+    if side == "short":
+        if vs_m15 != "above":
+            return False
+        return bool(last2[0] > ema20_m15 and last2[1] > ema20_m15)
+    # side == "long"
+    if vs_m15 != "below":
+        return False
+    return bool(last2[0] < ema20_m15 and last2[1] < ema20_m15)
+
+
+def _compute_impulse_proxy(d: dict) -> bool:
+    """
+    Impulse proxy: reuse existing computed signals (warnings + flush proxies).
+    """
+    warnings = d.get("warnings")
+    wl = ""
+    if isinstance(warnings, list):
+        wl = " ".join(str(w or "").strip().lower() for w in warnings)
+    if any(k in wl for k in ("impulse_no_exhale", "phase_between", "ema_between_m15_h1")):
+        return True
+    if _m15_flush_detected(d):
+        return True
+    if bool(d.get("flush_knife_aggressive_extreme")):
+        return True
+    reasons = d.get("no_trade_reasons")
+    if isinstance(reasons, list):
+        rl = " ".join(str(r or "").strip().lower() for r in reasons)
+        if "flush" in rl or "knife" in rl or "impulse" in rl:
+            return True
+    return False
+
+
+def _append_unique_str(d: dict, key: str, value: str) -> None:
+    if not value:
+        return
+    xs = d.get(key)
+    if not isinstance(xs, list):
+        return
+    if value not in xs:
+        xs.append(value)
+
+
+def _set_no_trade_primary_reason(d: dict, reason: str) -> None:
+    d["no_trade"] = True
+    reasons = d.get("no_trade_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    # Waiting-confirmation is a generic placeholder; phase-flip reasons should be primary when present.
+    reasons = [r for r in reasons if str(r or "").strip() and str(r).strip() != "waiting_confirmation"]
+    reasons = [reason] + [r for r in reasons if r != reason]
+    d["no_trade_reasons"] = reasons
+    d["no_trade_hint"] = reason
+
+
+def _ensure_aggressive_option_note(d: dict, note: str, *, force: bool = False) -> None:
+    if not note:
+        return
+    entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+    agg = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else {}
+    enabled = agg.get("enabled", True) is not False
+    if not enabled and not force:
+        return
+
+    entry = _to_float(d.get("entry_price_aggressive"))
+    if entry is None:
+        # Fall back to existing entry_range anchor (no new math).
+        er = agg.get("range") if isinstance(agg.get("range"), dict) else None
+        if isinstance(er, dict):
+            e_min = _to_float(er.get("min"))
+            e_max = _to_float(er.get("max"))
+            if e_min is not None and e_max is not None:
+                entry = (min(e_min, e_max) + max(e_min, e_max)) / 2.0
+    if entry is None:
+        return
+
+    d["aggressive_option"] = {"entry_price": float(entry), "note": note}
+
+
+def apply_phase_flip_modifier(d: dict) -> None:
+    """
+    Phase-flip modifier (micro-phase change) based on EMA20(M15) behavior.
+    Uses only existing computed data (EMA flags, closes_m15_tail, warnings, flush proxies).
+    Does NOT modify EMA/ATR provenance or SL/TP/RR math.
+    """
+    if not isinstance(d, dict):
+        return
+
+    phase_flip_m15 = _compute_phase_flip_m15(d)
+    impulse_proxy = _compute_impulse_proxy(d)
+    is_us_session = _is_us_session(d)
+
+    # Persist to top-level JSON (required for logs/last.json consumers).
+    # Always booleans; if inputs are missing, compute_* helpers return False.
+    d["phase_flip_m15"] = bool(phase_flip_m15)
+    d["impulse_proxy"] = bool(impulse_proxy)
+    d["is_us_session"] = bool(is_us_session)
+
+    dbg = d.setdefault("debug", {})
+    if isinstance(dbg, dict):
+        dbg["phase_flip_m15"] = bool(phase_flip_m15)
+        dbg["impulse_proxy"] = bool(impulse_proxy)
+        dbg["is_us_session"] = bool(is_us_session)
+
+    if not (phase_flip_m15 and impulse_proxy):
+        return
+
+    mode = normalize_mode(d.get("mode"))
+
+    # NEUTRAL: hard stop during US session; soft wait outside.
+    if mode == "neutral":
+        if is_us_session:
+            _set_no_trade_primary_reason(d, "us_session_phase_flip_neutral_pause")
+            _ensure_aggressive_option_note(
+                d,
+                "US-сессия: идёт перераспределение/выдох после импульса — neutral пауза; "
+                "trade допустим только в aggressive при подтверждении.",
+                force=True,
+            )
+        else:
+            _set_no_trade_primary_reason(d, "phase_flip_neutral_wait")
+            _ensure_aggressive_option_note(
+                d,
+                "Идёт перераспределение/выдох после импульса — neutral ждёт подтверждение; "
+                "trade возможен только при подтверждении (или в aggressive с осторожностью).",
+                force=True,
+            )
+
+        # Do NOT emit neutral continuation levels when paused.
+        try:
+            d.pop("entry_price_neutral", None)
+            d.pop("sl", None)
+            d.pop("tp1", None)
+            d.pop("tp2", None)
+            d.pop("tp3", None)
+        except Exception:
+            pass
+        return
+
+    # AGGRESSIVE: do not block, adapt tactics.
+    if mode == "aggressive" and not bool(d.get("no_trade")):
+        # Allow aggressive to stay tradable: do not auto-fallback solely due to ema_guard disables
+        # when a confirmed phase flip is present (tactical adaptation).
+        entries = d.get("entries") if isinstance(d.get("entries"), dict) else None
+        if isinstance(entries, dict):
+            agg = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else None
+            if isinstance(agg, dict) and agg.get("enabled") is False:
+                disabled_by = agg.get("disabled_by")
+                tags: list[str] = []
+                if isinstance(disabled_by, str) and disabled_by.strip():
+                    tags = [disabled_by.strip()]
+                elif isinstance(disabled_by, list):
+                    tags = [str(x).strip() for x in disabled_by if str(x).strip()]
+                allowed = {"ema_guard_between", "ema_guard_above_both_short", "ema_guard_below_both_long"}
+                if tags and all(t in allowed for t in tags):
+                    agg["enabled"] = True
+                    entries["aggressive"] = agg
+                    d["entries"] = entries
+
+        d["entry_mode"] = "wait_confirm"
+        d.setdefault("warnings", [])
+        _append_unique_str(d, "warnings", "phase_flip_wait_confirm")
+        if is_us_session:
+            _append_unique_str(
+                d,
+                "warnings",
+                "US-сессия: перераспределение после импульса — возможны ложные движения",
+            )
+        return
 
 
 _FALLBACK_SYMBOL_PRICE_PRECISION: dict[str, int] = {
@@ -3688,6 +3988,13 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
             d["tp3"] = float(rounded if rounded is not None else tp3_val)
     except Exception:
         pass
+
+    # Phase-flip modifier (micro-phase change): can pause neutral or force aggressive wait_confirm.
+    try:
+        apply_phase_flip_modifier(d)
+    except Exception:
+        pass
+
     validate_active_mode_setup(d)
     try:
         quantize_price_levels_to_symbol_precision(d)
