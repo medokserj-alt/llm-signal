@@ -67,9 +67,9 @@ class TestNeutralSemanticShaping(unittest.TestCase):
         self.assertIsNotNone(aggressive_option.get("entry_price"))
         self.assertGreater(float(aggressive_option.get("entry_price")), float(out.get("entry_price_neutral")))
 
-    def test_neutral_entry_never_closer_than_aggressive(self) -> None:
+    def test_neutral_inverted_entries_falls_back_when_vol_offset_unsafe(self) -> None:
         env_min = 99.6
-        env_max = 100.0
+        env_max = 99.8
         price = 100.0
 
         d = {
@@ -84,7 +84,7 @@ class TestNeutralSemanticShaping(unittest.TestCase):
                 "conservative": {"enabled": True, "range": {"min": 99.0, "max": 99.5}},
             },
             "entry_range": {"min": env_min, "max": env_max},
-            "entry_price_neutral": 99.8,
+            "entry_price_neutral": 99.7,
             "entry_price_aggressive": 99.7,
             "sl_by_mode": {"neutral": 98.5},
             "tp_by_mode": {"neutral": {"tvh1": 101.0, "tvh2": 102.0}},
@@ -94,8 +94,9 @@ class TestNeutralSemanticShaping(unittest.TestCase):
 
         out = get_signal_json.validate_active_mode_setup(d)
         self.assertEqual(out.get("mode"), "neutral")
-        # If entries are inverted (neutral not more conservative than aggressive), do not show an aggressive option.
-        self.assertNotIn("aggressive_option", out)
+        self.assertFalse(bool(out.get("no_trade")))
+        self.assertEqual(float(out.get("entry_price_neutral")), 99.7)
+        self.assertIn("neutral_offset_skipped_unsafe", out.get("warnings") or [])
 
     def test_renderer_renders_aggressive_option_line(self) -> None:
         d = {

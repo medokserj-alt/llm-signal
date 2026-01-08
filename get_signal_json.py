@@ -36,6 +36,13 @@ VALID_MODES = {"aggressive", "neutral", "conservative"}
 NEUTRAL_MIN_DIST_PCT_MAJOR = 0.25  # BTC/, ETH/
 NEUTRAL_MIN_DIST_PCT_ALT = 0.35  # others
 
+# ---- Neutral volatility-aware spacing (adaptive calmer entry) ----
+# Applies only to entry_price_neutral placement; does not change EMA/provenance, direction, SL/TP/RR math, or gates.
+NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR = 0.005  # 0.50%
+NEUTRAL_VOL_MIN_OFFSET_PCT_ALT = 0.007  # 0.70%
+NEUTRAL_VOL_K_ATR_MAJOR = 1.0
+NEUTRAL_VOL_K_ATR_ALT = 1.2
+
 # When neutral mode exposes an early aggressive entry option, keep neutral meaningfully farther.
 # Soft shaping only: does not hard-limit the model or change EMA/no_trade/direction logic.
 NEUTRAL_BUFFER_TICKS = 10
@@ -591,6 +598,98 @@ def _atr14_from_ohlcv_tail(ohlcv_tail) -> float | None:
     if not (math.isfinite(atr) and atr > 0):
         return None
     return float(atr)
+
+
+def _symbol_is_major(symbol: str | None) -> bool:
+    sym = (symbol or "").strip().upper()
+    return sym.startswith("BTC/") or sym.startswith("ETH/") or sym.startswith("BTCUSDT") or sym.startswith("ETHUSDT")
+
+
+def _m15_volatility_metrics(d: dict) -> tuple[float | None, float | None]:
+    """
+    Returns (atr14_m15, range_pct_m15) where range_pct_m15 is computed from the last 20 candles:
+      (max_high - min_low) / price
+    """
+    if not isinstance(d, dict):
+        return (None, None)
+    ohlcv_tail = d.get("ohlcv_m15_tail")
+    if not isinstance(ohlcv_tail, list) or len(ohlcv_tail) < 20:
+        return (None, None)
+
+    atr14 = _atr14_from_ohlcv_tail(ohlcv_tail)
+
+    px = _to_float(d.get("price"))
+    if px is None or not (math.isfinite(px) and px > 0):
+        return (atr14, None)
+
+    highs: list[float] = []
+    lows: list[float] = []
+    for row in ohlcv_tail[-20:]:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        h = _to_float(row[2])
+        l = _to_float(row[3])
+        if h is None or l is None:
+            continue
+        highs.append(float(h))
+        lows.append(float(l))
+    if not highs or not lows:
+        return (atr14, None)
+    rng = max(highs) - min(lows)
+    if not (math.isfinite(rng) and rng > 0):
+        return (atr14, None)
+    return (atr14, float(rng) / float(px))
+
+
+def ensure_aggressive_option(d: dict, *, entries: dict | None, note: str) -> None:
+    """
+    Ensures d["aggressive_option"] exists with a single concrete entry price.
+    Uses only already computed fields / existing envelopes; does not change aggressive entry placement logic.
+    """
+    if not isinstance(d, dict):
+        return
+
+    existing = d.get("aggressive_option")
+    if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
+        if isinstance(note, str) and note.strip():
+            existing["note"] = note.strip()
+        d["aggressive_option"] = existing
+        return
+
+    entry = _to_float(d.get("entry_price_aggressive"))
+    if entry is None:
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        if isinstance(entries, dict):
+            ab = entries.get("aggressive") if isinstance(entries.get("aggressive"), dict) else None
+            ar = (ab or {}).get("range") if isinstance(ab, dict) else None
+            if isinstance(ar, dict):
+                a_min = _to_float(ar.get("min"))
+                a_max = _to_float(ar.get("max"))
+                if a_min is not None and a_max is not None:
+                    lo, hi = (min(a_min, a_max), max(a_min, a_max))
+                    if side == "long":
+                        entry = hi
+                    elif side == "short":
+                        entry = lo
+                    else:
+                        entry = (lo + hi) / 2.0
+    if entry is None:
+        entry = _to_float(d.get("entry_price_neutral"))
+    if entry is None:
+        er = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None
+        if isinstance(er, dict):
+            e_min = _to_float(er.get("min"))
+            e_max = _to_float(er.get("max"))
+            if e_min is not None and e_max is not None:
+                entry = (min(e_min, e_max) + max(e_min, e_max)) / 2.0
+
+    if entry is None:
+        return
+
+    out_note = note.strip() if isinstance(note, str) and note.strip() else ""
+    d["aggressive_option"] = {"entry_price": float(entry)}
+    if out_note:
+        d["aggressive_option"]["note"] = out_note
 
 
 def _m15_flush_detected(d: dict) -> bool:
@@ -2989,29 +3088,46 @@ def validate_active_mode_setup(d: dict) -> dict:
                                 "note": "Возможен более ранний вход (aggressive) при повышенном риске.",
                             }
 
-    # ---- Neutral buffer vs aggressive option (soft shaping) ----
-    # When neutral mode is active and an aggressive option exists, keep neutral entry
-    # meaningfully farther than the aggressive entry by a small tick-based buffer.
-    if final_mode == "neutral" and not bool(d.get("no_trade")):
-        aggressive_option = d.get("aggressive_option")
-        if isinstance(aggressive_option, dict):
+        # ---- Neutral volatility-aware entry spacing (adaptive calmer entry) ----
+        # Applies only to entry_price_neutral geometry relative to current price; does not touch EMA/direction/SL/TP/RR math.
+        if final_mode == "neutral" and not bool(d.get("no_trade")):
             side = (d.get("side") or d.get("direction") or "").strip().lower()
-            symbol = d.get("symbol")
-            a_entry = _to_float(aggressive_option.get("entry_price"))
-            if a_entry is None:
-                a_entry = _to_float(d.get("entry_price_aggressive"))
-            n_entry = _to_float(d.get("entry_price_neutral"))
-            if side in ("long", "short") and a_entry is not None and n_entry is not None:
-                a_entry_q = _round_price(a_entry, symbol=symbol)
-                if a_entry_q is None:
-                    a_entry_q = a_entry
-                n_entry_q = _round_price(n_entry, symbol=symbol)
-                if n_entry_q is None:
-                    n_entry_q = n_entry
+            px = _to_float(d.get("price"))
+            neu0 = _to_float(d.get("entry_price_neutral"))
+            if side in ("long", "short") and px is not None and px > 0 and neu0 is not None:
+                atr14, range_pct = _m15_volatility_metrics(d)
+                d["atr14_m15"] = float(atr14) if atr14 is not None else None
+                if range_pct is not None:
+                    d["vol_m15"] = float(range_pct)
 
-                prec = _price_precision(symbol, value_hint=a_entry_q)
-                tick = 10 ** (-int(prec))
-                buffer_val = float(NEUTRAL_BUFFER_TICKS) * float(tick)
+                is_major = _symbol_is_major(str(d.get("symbol") or ""))
+                min_pct = NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR if is_major else NEUTRAL_VOL_MIN_OFFSET_PCT_ALT
+                k_atr = NEUTRAL_VOL_K_ATR_MAJOR if is_major else NEUTRAL_VOL_K_ATR_ALT
+
+                base_abs = float(min_pct) * float(px)
+                vol_abs = None
+                if atr14 is not None and math.isfinite(float(atr14)) and float(atr14) > 0:
+                    vol_abs = float(atr14)
+                elif range_pct is not None and math.isfinite(float(range_pct)) and float(range_pct) > 0:
+                    vol_abs = float(range_pct) * float(px)
+
+                offset_abs = base_abs if vol_abs is None else max(base_abs, float(k_atr) * float(vol_abs))
+                if not (math.isfinite(offset_abs) and offset_abs > 0):
+                    offset_abs = base_abs
+
+                d["neutral_offset_abs"] = float(offset_abs)
+                d["neutral_offset_pct"] = float(offset_abs) / float(px) * 100.0
+
+                target_from_current = float(px) - float(offset_abs) if side == "long" else float(px) + float(offset_abs)
+                cand_raw = (
+                    min(float(neu0), target_from_current) if side == "long" else max(float(neu0), target_from_current)
+                )
+                cand = _round_price_dir(cand_raw, "down" if side == "long" else "up", symbol=d.get("symbol"))
+                if cand is None:
+                    cand = cand_raw
+
+                sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+                sl_neutral = _to_float(sl_by_mode.get("neutral"))
 
                 def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
                     if not isinstance(r, dict):
@@ -3028,37 +3144,98 @@ def validate_active_mode_setup(d: dict) -> dict:
 
                 mm = _range_to_minmax(d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None)
 
-                sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
-                sl_neutral = _to_float(sl_by_mode.get("neutral"))
+                invalid = False
+                if not (math.isfinite(float(cand)) and float(cand) > 0):
+                    invalid = True
+                if mm is not None:
+                    lo, hi = mm
+                    if float(cand) < float(lo) or float(cand) > float(hi):
+                        invalid = True
+                if sl_neutral is None or not (math.isfinite(float(sl_neutral)) and float(sl_neutral) > 0):
+                    invalid = True
+                if not invalid:
+                    if side == "long" and float(cand) <= float(sl_neutral):
+                        invalid = True
+                    if side == "short" and float(cand) >= float(sl_neutral):
+                        invalid = True
 
-                def _candidate_ok(px: float) -> bool:
-                    if not (math.isfinite(px) and px > 0):
-                        return False
-                    if mm is not None:
-                        lo, hi = mm
-                        if px < lo or px > hi:
+                if invalid:
+                    warnings = d.setdefault("warnings", [])
+                    if isinstance(warnings, list) and "neutral_offset_skipped_unsafe" not in warnings:
+                        warnings.append("neutral_offset_skipped_unsafe")
+                else:
+                    d["entry_price_neutral"] = float(cand)
+
+        # ---- Neutral buffer vs aggressive option (soft shaping) ----
+        # When neutral mode is active and an aggressive option exists, keep neutral entry
+        # meaningfully farther than the aggressive entry by a small tick-based buffer.
+        if final_mode == "neutral" and not bool(d.get("no_trade")):
+            aggressive_option = d.get("aggressive_option")
+            if isinstance(aggressive_option, dict):
+                side = (d.get("side") or d.get("direction") or "").strip().lower()
+                symbol = d.get("symbol")
+                a_entry = _to_float(aggressive_option.get("entry_price"))
+                if a_entry is None:
+                    a_entry = _to_float(d.get("entry_price_aggressive"))
+                n_entry = _to_float(d.get("entry_price_neutral"))
+                if side in ("long", "short") and a_entry is not None and n_entry is not None:
+                    a_entry_q = _round_price(a_entry, symbol=symbol)
+                    if a_entry_q is None:
+                        a_entry_q = a_entry
+                    n_entry_q = _round_price(n_entry, symbol=symbol)
+                    if n_entry_q is None:
+                        n_entry_q = n_entry
+
+                    prec = _price_precision(symbol, value_hint=a_entry_q)
+                    tick = 10 ** (-int(prec))
+                    buffer_val = float(NEUTRAL_BUFFER_TICKS) * float(tick)
+
+                    def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
+                        if not isinstance(r, dict):
+                            return None
+                        a = _to_float(r.get("min"))
+                        b = _to_float(r.get("max"))
+                        if a is None or b is None:
+                            return None
+                        if b < a:
+                            a, b = b, a
+                        if not (a < b):
+                            return None
+                        return (a, b)
+
+                    mm = _range_to_minmax(d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None)
+
+                    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+                    sl_neutral = _to_float(sl_by_mode.get("neutral"))
+
+                    def _candidate_ok(px: float) -> bool:
+                        if not (math.isfinite(px) and px > 0):
                             return False
-                    if sl_neutral is None or not math.isfinite(sl_neutral):
-                        return False
-                    if side == "long" and px <= sl_neutral:
-                        return False
-                    if side == "short" and px >= sl_neutral:
-                        return False
-                    return True
+                        if mm is not None:
+                            lo, hi = mm
+                            if px < lo or px > hi:
+                                return False
+                        if sl_neutral is None or not math.isfinite(sl_neutral):
+                            return False
+                        if side == "long" and px <= sl_neutral:
+                            return False
+                        if side == "short" and px >= sl_neutral:
+                            return False
+                        return True
 
-                # Only adjust if neutral is too close to aggressive relative to the buffer.
-                if side == "long":
-                    max_neutral = float(a_entry_q) - buffer_val
-                    if float(n_entry_q) > max_neutral:
-                        cand = _round_price_dir(max_neutral, "down", symbol=symbol)
-                        if cand is not None and _candidate_ok(float(cand)):
-                            d["entry_price_neutral"] = float(cand)
-                else:  # short
-                    min_neutral = float(a_entry_q) + buffer_val
-                    if float(n_entry_q) < min_neutral:
-                        cand = _round_price_dir(min_neutral, "up", symbol=symbol)
-                        if cand is not None and _candidate_ok(float(cand)):
-                            d["entry_price_neutral"] = float(cand)
+                    # Only adjust if neutral is too close to aggressive relative to the buffer.
+                    if side == "long":
+                        max_neutral = float(a_entry_q) - buffer_val
+                        if float(n_entry_q) > max_neutral:
+                            cand = _round_price_dir(max_neutral, "down", symbol=symbol)
+                            if cand is not None and _candidate_ok(float(cand)):
+                                d["entry_price_neutral"] = float(cand)
+                    else:  # short
+                        min_neutral = float(a_entry_q) + buffer_val
+                        if float(n_entry_q) < min_neutral:
+                            cand = _round_price_dir(min_neutral, "up", symbol=symbol)
+                            if cand is not None and _candidate_ok(float(cand)):
+                                d["entry_price_neutral"] = float(cand)
 
         # ---- Neutral near-market risk gate (STRICT) ----
         # Neutral must be continuation/patient only; near-market entries belong to aggressive.
