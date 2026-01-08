@@ -515,6 +515,7 @@ def main():
                     lines.append(
                         f"TP2_or_trail: {format_price(symbol if isinstance(symbol, str) else None, tp2_or_trail)}"
                     )
+                lines.append("Горизонт: 1–3 дня (conservative)")
             lines.append(f"RR: 1:{fmt(rr_val)}")
             lines.append(f"План выхода: {exit_plan}")
             lines.append("")

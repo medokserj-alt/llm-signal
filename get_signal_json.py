@@ -1071,6 +1071,8 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
         reasons = d.get("no_trade_reasons")
         if isinstance(reasons, list) and "time_window" not in reasons:
             reasons.append("time_window")
+        if isinstance(reasons, list) and "time_window_conservative" not in reasons:
+            reasons.append("time_window_conservative")
         d["no_trade_hint"] = "Опасное окно времени (пониженная ликвидность): режим conservative — без сделок."
         return
 
@@ -2606,6 +2608,9 @@ def validate_active_mode_setup(d: dict) -> dict:
     - при невалидности помечает no_trade с понятным комментарием.
     """
     if bool(d.get("no_trade")):
+        # Even when blocked upstream, conservative keeps a fixed horizon contract.
+        if normalize_mode(d.get("mode")) == "conservative":
+            d["intended_horizon_hours"] = {"min": 24, "max": 72}
         return d
 
     mode = normalize_mode(d.get("mode"))
@@ -3273,6 +3278,140 @@ def validate_active_mode_setup(d: dict) -> dict:
         except Exception:
             pass
 
+    # ---- Conservative: true MID-term, high-confidence gate (MID -> DAY -> local) ----
+    if final_mode == "conservative":
+        # JSON contract for the mode horizon (even if blocked).
+        # Some pipelines pre-fill the key with null; treat that as missing.
+        if d.get("intended_horizon_hours") != {"min": 24, "max": 72}:
+            d["intended_horizon_hours"] = {"min": 24, "max": 72}
+
+        # Conservative should not auto-suggest aggressive options (even when blocked).
+        try:
+            d.pop("aggressive_option", None)
+        except Exception:
+            pass
+
+    if final_mode == "conservative" and not bool(d.get("no_trade")):
+
+        def _block_cons(reason: str, hint: str) -> dict:
+            d["no_trade"] = True
+            reasons = d.setdefault("no_trade_reasons", [])
+            if isinstance(reasons, list) and reason not in reasons:
+                reasons.append(reason)
+            if not (d.get("no_trade_hint") or "").strip():
+                d["no_trade_hint"] = reason if reason else hint
+            return d
+
+        ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+        mid_bias = str((ctx or {}).get("mid_bias") or "").strip().lower()
+        if mid_bias not in ("long", "short"):
+            return _block_cons(
+                "conservative_requires_mid_bias",
+                "Conservative требует явный MID bias (long/short).",
+            )
+
+        # MID alignment (hard): the planned side must match MID bias.
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        if side in ("long", "short") and side != mid_bias:
+            return _block_cons(
+                "conservative_requires_mid_bias",
+                "Направление не совпадает с MID bias — conservative пропускает.",
+            )
+
+        # DAY alignment: same as MID or neutral (not opposite).
+        day_bias = str((ctx or {}).get("day_bias") or "").strip().lower()
+        if day_bias in ("long", "short") and day_bias != mid_bias:
+            return _block_cons(
+                "conservative_day_mid_conflict",
+                "DAY bias противоречит MID — conservative пропускает.",
+            )
+
+        # Local stabilization (hard): no flush/knife + no impulse-no-exhale + no adverse fan.
+        warnings = d.get("warnings")
+        if isinstance(warnings, list):
+            wl = " ".join(str(w or "").strip().lower() for w in warnings)
+            if "impulse_no_exhale" in wl:
+                return _block_cons(
+                    "conservative_local_not_stable",
+                    "Локально нет стабилизации после импульса (impulse_no_exhale).",
+                )
+
+        if _m15_flush_detected(d):
+            return _block_cons(
+                "conservative_local_not_stable",
+                "Локально риск flush/knife — conservative пропускает.",
+            )
+
+        adverse_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+        adverse_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+        if mid_bias == "long":
+            if adverse_m15 == "bear" or adverse_h1 == "bear":
+                return _block_cons(
+                    "conservative_local_not_stable",
+                    "EMA fan против направления (bear для LONG) — conservative пропускает.",
+                )
+        else:
+            if adverse_m15 == "bull" or adverse_h1 == "bull":
+                return _block_cons(
+                    "conservative_local_not_stable",
+                    "EMA fan против направления (bull для SHORT) — conservative пропускает.",
+                )
+
+        # Entry placement (hard): deeper than neutral and not near-market.
+        price_val = _to_float(d.get("price"))
+        symbol = str(d.get("symbol") or "")
+
+        cons_entry = _to_float(d.get("entry_price_conservative"))
+        if cons_entry is None:
+            entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+            cb = entries.get("conservative") if isinstance(entries.get("conservative"), dict) else {}
+            cons_entry = _mid_from_range(cb.get("range"), symbol=symbol)
+
+        neu_entry = _to_float(d.get("entry_price_neutral"))
+        if neu_entry is None:
+            entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+            nb = entries.get("neutral") if isinstance(entries.get("neutral"), dict) else {}
+            neu_entry = _mid_from_range(nb.get("range"), symbol=symbol)
+
+        if cons_entry is not None and neu_entry is not None:
+            deeper_ok = (mid_bias == "long" and cons_entry < neu_entry) or (
+                mid_bias == "short" and cons_entry > neu_entry
+            )
+            if not deeper_ok:
+                return _block_cons(
+                    "conservative_entry_too_close",
+                    "Conservative-вход должен быть глубже neutral.",
+                )
+
+        if price_val is not None and price_val > 0 and cons_entry is not None:
+            threshold_pct = (
+                NEUTRAL_MIN_DIST_PCT_MAJOR
+                if (symbol.startswith("BTC/") or symbol.startswith("ETH/"))
+                else NEUTRAL_MIN_DIST_PCT_ALT
+            )
+            dist_pct = abs(cons_entry - price_val) / price_val * 100.0
+            if dist_pct < float(threshold_pct):
+                return _block_cons(
+                    "conservative_entry_too_close",
+                    "Conservative-вход слишком близко к текущей цене.",
+                )
+
+        # If conservative uses trail as the farther target, explicitly set the 1–3 day horizon in text.
+        try:
+            tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+            tp_bucket = tp_by_mode.get("conservative") if isinstance(tp_by_mode.get("conservative"), dict) else {}
+            tvh2_or_trail = tp_bucket.get("tvh2_or_trail")
+            is_trail = isinstance(tvh2_or_trail, str) and tvh2_or_trail.strip().lower() == "trail"
+            if is_trail:
+                ep_by_mode = d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else {}
+                txt = str(ep_by_mode.get("conservative") or "").strip()
+                low = txt.lower()
+                if txt and ("1–3" not in txt and "1-3" not in txt and "дн" not in low and "24" not in low and "72" not in low):
+                    ep_by_mode["conservative"] = (txt + " Горизонт: 1–3 дня.").strip()
+                    d["exit_plan_by_mode"] = ep_by_mode
+        except Exception:
+            pass
+
     mode = final_mode
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
 
@@ -3476,6 +3615,17 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
 
     apply_direction_guard(d)
     _normalize_day_mid_context(d)
+
+    # Conservative direction: follow MID bias (primary) to avoid long/short default bias.
+    try:
+        if normalize_mode(d.get("mode")) == "conservative":
+            ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+            mid_bias = str((ctx or {}).get("mid_bias") or "").strip().lower()
+            if mid_bias in ("long", "short"):
+                d["side"] = mid_bias
+    except Exception:
+        pass
+
     d.setdefault(
         "adx_guard",
         {

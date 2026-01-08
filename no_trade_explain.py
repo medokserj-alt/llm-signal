@@ -135,6 +135,8 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "нет подтверждённого отката/«выдоха» после импульса (M15)"
     if low in {"time_window", "time_window_low_liquidity"}:
         return "риск-окно по времени/ликвидности"
+    if low == "time_window_conservative":
+        return "риск-окно по времени/ликвидности (conservative: без сделок)"
     if low == "risk_off":
         return "режим risk-off (повышенный риск рынка)"
     if low == "low_rr":
@@ -155,6 +157,14 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "нет стабилизации/подтверждения для continuation (риск разворота)"
     if low == "neutral_too_close_risky":
         return "neutral-вход слишком близко к текущей цене (слишком рискованно)"
+    if low == "conservative_requires_mid_bias":
+        return "для conservative нужен явный MID bias (long/short)"
+    if low == "conservative_day_mid_conflict":
+        return "DAY bias противоречит MID — conservative пропускает"
+    if low == "conservative_local_not_stable":
+        return "нет локальной стабилизации (M15/H1) для conservative"
+    if low == "conservative_entry_too_close":
+        return "conservative-вход недостаточно глубокий/слишком близко к рынку"
 
     return k
 
@@ -218,10 +228,14 @@ def classify_reason(reason_key: str) -> str:
         "ema_guard_below_both_long",
         "ema_guard_above_both_short",
         "entry_not_anchored_to_ema20_m15",
+        "conservative_requires_mid_bias",
+        "conservative_day_mid_conflict",
+        "conservative_local_not_stable",
+        "conservative_entry_too_close",
     }:
         return "Structural"
 
-    if k in {"time_window", "risk_off", "time_window_low_liquidity"}:
+    if k in {"time_window", "risk_off", "time_window_low_liquidity", "time_window_conservative"}:
         return "Risk"
 
     if k in {"mode_disabled", "invalid_mode_setup"} or k.startswith("ema_guard_"):
@@ -249,6 +263,8 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "для SHORT цена выше EMA20 на M15 и H1 — агрессивный вход заблокирован фильтром."
     if low == "time_window":
         return "сейчас риск-окно по времени/ликвидности (без ухудшения качества входа сделку пропускаем)."
+    if low == "time_window_conservative":
+        return "сейчас риск-окно по времени/ликвидности; в conservative сделки не открываем."
     if low == "low_rr":
         return "недостаточный R:R при текущем входе/SL/целях."
     if low == "invalid_mode_setup":
@@ -261,6 +277,14 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "недостаточно надёжного сетапа по текущей структуре."
     if low == "no_trade_hint":
         return "условия входа сейчас не соответствуют требованиям стратегии."
+    if low == "conservative_requires_mid_bias":
+        return "для conservative требуется явный MID bias (long/short); при нейтрали MID — сделку пропускаем."
+    if low == "conservative_day_mid_conflict":
+        return "DAY bias противоречит MID; conservative требует согласованности MID→DAY."
+    if low == "conservative_local_not_stable":
+        return "нет локальных признаков стабилизации (нет impulse-no-exhale, нет flush/knife, fan не против)."
+    if low == "conservative_entry_too_close":
+        return "вход недостаточно глубокий (слишком близко к рынку) — для conservative нужен более пациентный уровень."
     # allow disabled_by tags to surface for transparency (trader-readable mapping above covers common ones)
     return k
 
@@ -284,6 +308,8 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Выйти из зоны между EMA20(M15) и EMA20(H1) и сформировать направленную структуру.")
         if low == "time_window":
             add("– Дождаться выхода из риск-окна по времени / ликвидности.")
+        if low == "time_window_conservative":
+            add("– Дождаться выхода из риск-окна по времени / ликвидности (для conservative это обязательно).")
         if low == "low_rr":
             add("– Улучшить R:R: более выгодный вход (глубже откат) или более понятная цель без роста риска.")
         if low == "ema_guard_below_both_long":
@@ -296,6 +322,14 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Дождаться признаков стабилизации: «выдох»/откат на M15 и ослабление тренда на H1.")
         if low == "neutral_too_close_risky":
             add("– Дождаться более дальнего (пациентного) уровня входа, не у текущей цены.")
+        if low == "conservative_requires_mid_bias":
+            add("– Нужен явный MID bias (long/short) и работа строго по нему.")
+        if low == "conservative_day_mid_conflict":
+            add("– DAY bias должен совпадать с MID или быть нейтральным (не против).")
+        if low == "conservative_local_not_stable":
+            add("– Дождаться стабилизации на M15/H1: без flush/knife, без impulse-no-exhale, fan не против.")
+        if low == "conservative_entry_too_close":
+            add("– Нужен более глубокий вход (дальше от текущей цены) и глубже neutral.")
 
     if not out:
         add("– Дождаться формирования более чистой структуры/подтверждения по M15.")
