@@ -443,6 +443,9 @@ def main():
                         lines.append(note)
             except Exception:
                 pass
+            wl = " ".join(w.lower() for w in _iter_warnings(data))
+            if mode == "aggressive" and "phase_flip_wait_confirm" in wl:
+                lines.append("⚠️ Phase flip по M15: вход только после подтверждения (wait_confirm).")
 
             raw_side = data.get("side")
             raw_dir = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")

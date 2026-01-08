@@ -133,6 +133,10 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "цена в зоне между EMA20(M15) и EMA20(H1)"
     if low in {"impulse_no_exhale", "waiting_confirmation"}:
         return "нет подтверждённого отката/«выдоха» после импульса (M15)"
+    if low == "phase_flip_neutral_wait":
+        return "phase flip по EMA20(M15) после импульса — neutral ждёт подтверждение"
+    if low == "us_session_phase_flip_neutral_pause":
+        return "US-сессия + phase flip по EMA20(M15) — neutral пауза (риск перераспределения)"
     if low in {"time_window", "time_window_low_liquidity"}:
         return "риск-окно по времени/ликвидности"
     if low == "time_window_conservative":
@@ -222,6 +226,8 @@ def classify_reason(reason_key: str) -> str:
     if k in {
         "waiting_confirmation",
         "impulse_no_exhale",
+        "phase_flip_neutral_wait",
+        "us_session_phase_flip_neutral_pause",
         "phase_between",
         "ema_between_m15_h1",
         "ema_guard_between",
@@ -255,6 +261,10 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "нет подтверждённой фазы выдоха после импульса на M15 (вход догоняет движение)."
     if low == "waiting_confirmation":
         return "ожидание подтверждения структуры/отката (фаза выдоха ещё не сформирована)."
+    if low == "phase_flip_neutral_wait":
+        return "подтверждён micro-phase flip по EMA20(M15) после импульса — в neutral ждём подтверждение продолжения."
+    if low == "us_session_phase_flip_neutral_pause":
+        return "US-сессия + подтверждён micro-phase flip по EMA20(M15) после импульса — neutral ставим на паузу (риск перераспределения)."
     if low in {"phase_between", "ema_between_m15_h1", "ema_guard_between"}:
         return "цена/вход в зоне неопределённости между EMA20(M15) и EMA20(H1) — повышенный риск пилы."
     if low == "ema_guard_below_both_long":
@@ -304,6 +314,8 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
         low = (rk or "").strip().lower()
         if low in {"impulse_no_exhale", "waiting_confirmation"}:
             add("– Сформировать откат/«выдох» к EMA20(M15) и подтвердить структуру (без догоняющего входа).")
+        if low in {"phase_flip_neutral_wait", "us_session_phase_flip_neutral_pause"}:
+            add("– Дождаться подтверждения продолжения: возврат на «правильную» сторону EMA20(M15) и/или закрепление после перераспределения.")
         if low in {"phase_between", "ema_between_m15_h1", "ema_guard_between"}:
             add("– Выйти из зоны между EMA20(M15) и EMA20(H1) и сформировать направленную структуру.")
         if low == "time_window":
