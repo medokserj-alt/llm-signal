@@ -125,7 +125,7 @@ class TestAggressiveTradeOriented(unittest.TestCase):
 
         self.assertEqual(out.get("entry_mode"), "wait_confirm")
         self.assertIn("dir_guard_forced_short_by_ema", out.get("warnings") or [])
-        self.assertIn("Направление против EMA-структуры", "\n".join(out.get("warnings") or []))
+        self.assertIn("aggressive_direction_conflict_with_ema_wait_confirm", out.get("warnings") or [])
 
     def test_aggressive_dir_guard_with_reversal_evidence_may_enter_now(self) -> None:
         d = {
@@ -150,9 +150,9 @@ class TestAggressiveTradeOriented(unittest.TestCase):
 
         out = get_signal_json.validate_active_mode_setup(d)
 
-        self.assertEqual(out.get("entry_mode"), "now")
+        self.assertEqual(out.get("entry_mode"), "wait_confirm")
         self.assertIn("dir_guard_forced_short_by_ema", out.get("warnings") or [])
-        self.assertIn("Направление против EMA-структуры", "\n".join(out.get("warnings") or []))
+        self.assertIn("aggressive_direction_conflict_with_ema_wait_confirm", out.get("warnings") or [])
 
     def test_day_mid_is_bias_intraday_can_override_with_note(self) -> None:
         d = {

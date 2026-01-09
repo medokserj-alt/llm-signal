@@ -2415,6 +2415,15 @@ def apply_direction_guard(d: dict) -> None:
             note = ema_guard.get("note") or ema_guard.get("comment")
             if not note:
                 ema_guard["comment"] = "long_against_ema_downtrend"
+    elif price > em15 and price > em1h and side == "short":
+        warnings = d.setdefault("warnings", [])
+        if "dir_guard_forced_long_by_ema" not in warnings:
+            warnings.append("dir_guard_forced_long_by_ema")
+        ema_guard = d.get("ema_guard")
+        if isinstance(ema_guard, dict):
+            note = ema_guard.get("note") or ema_guard.get("comment")
+            if not note:
+                ema_guard["comment"] = "short_against_ema_uptrend"
 
 
 def _is_num(x) -> bool:
@@ -3063,6 +3072,29 @@ def validate_active_mode_setup(d: dict) -> dict:
             )
             return d
 
+        # ---- Neutral (STRICT): hard block EMA-direction conflicts ----
+        # If the direction guard already flagged an EMA-structure conflict, neutral must not trade it.
+        # In that case we emit ONLY an aggressive_option (if it exists) and strip neutral trade levels.
+        warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+        side_now = (d.get("side") or d.get("direction") or "").strip().lower()
+        ema_conflict = bool(
+            (side_now == "long" and "dir_guard_forced_short_by_ema" in warnings)
+            or (side_now == "short" and "dir_guard_forced_long_by_ema" in warnings)
+        )
+        if ema_conflict:
+            d["no_trade_reason"] = "neutral_direction_conflict_with_ema"
+            _set_no_trade_primary_reason(d, "neutral_direction_conflict_with_ema")
+            _strip_neutral_trade_payload()
+            try:
+                _ensure_aggressive_option_note(
+                    d,
+                    "Neutral запрещён против EMA-структуры; возможен только aggressive (лучше wait_confirm).",
+                    force=True,
+                )
+            except Exception:
+                pass
+            return d
+
     if bool(d.get("no_trade")):
         # Even when blocked upstream, conservative keeps a fixed horizon contract.
         if normalize_mode(d.get("mode")) == "conservative":
@@ -3175,22 +3207,21 @@ def validate_active_mode_setup(d: dict) -> dict:
                 return bool((fan_h1 == "mixed") or (fan_m15 == "bull") or (vs_h1 != "below"))
             return False
 
-        # Explicit EMA direction guard: aggressive can be earlier, but must not "enter now"
-        # against EMA structure without reversal confirmation.
-        try:
-            warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
-            has_dir_guard = "dir_guard_forced_short_by_ema" in warnings
-        except Exception:
-            has_dir_guard = False
-        if side == "long" and has_dir_guard:
+        # Explicit EMA direction guard: aggressive can still give signals, but must not auto-enter
+        # against EMA structure (no blind knife-catching). Confirmation is mandatory.
+        warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+        ema_conflict = bool(
+            (side == "long" and "dir_guard_forced_short_by_ema" in warnings)
+            or (side == "short" and "dir_guard_forced_long_by_ema" in warnings)
+        )
+        if ema_conflict:
             d.setdefault("warnings", [])
-            note = "Направление против EMA-структуры — требуется подтверждение разворота."
-            if isinstance(d.get("warnings"), list) and note not in d["warnings"]:
-                d["warnings"].append(note)
-            if not _has_reversal_evidence():
-                em = (d.get("entry_mode") or "").strip().lower()
-                if em in ("now", "market"):
-                    d["entry_mode"] = "wait_confirm"
+            if (
+                isinstance(d.get("warnings"), list)
+                and "aggressive_direction_conflict_with_ema_wait_confirm" not in d["warnings"]
+            ):
+                d["warnings"].append("aggressive_direction_conflict_with_ema_wait_confirm")
+            d["entry_mode"] = "wait_confirm"
 
         if side in ("long", "short") and _m15_flush_detected(d) and not _has_reversal_evidence():
             d["no_trade"] = True

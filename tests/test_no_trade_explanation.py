@@ -51,6 +51,27 @@ class TestNoTradeExplanation(unittest.TestCase):
         self.assertRegex(out, r"–\s+")
         self.assertIn("EMA20", out)
 
+    def test_neutral_no_trade_renders_explicit_aggressive_option_line(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "XRP/USDT",
+            "price": 2.2,
+            "mode": "neutral",
+            "no_trade": True,
+            "no_trade_reasons": ["neutral_too_close_risky"],
+            "no_trade_hint": "слишком близко к текущей цене",
+            "side": "short",
+            "entries": {"neutral": {"enabled": True}},
+            "aggressive_option": {"entry_price": 2.13},
+        }
+
+        out = _render_text(d)
+
+        self.assertIn("⚡ Aggressive option:", out)
+        self.assertIn("XRP/USDT", out)
+        self.assertIn("SHORT", out)
+        self.assertIn("entry 2.1300", out)
+
 
 if __name__ == "__main__":
     unittest.main()

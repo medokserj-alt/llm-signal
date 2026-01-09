@@ -451,6 +451,49 @@ def main():
                     "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️"
                 )
 
+            # wait_confirm explanation (any mode): trader-oriented actionable checklist.
+            em_raw = (data.get("entry_mode") or "").strip().lower()
+            if em_raw in ("wait_confirm", "confirm", "wait-confirm", "wc"):
+                side_key_tmp = (
+                    (data.get("side") or data.get("direction") or "").strip().lower()
+                    if isinstance((data.get("side") or data.get("direction") or ""), str)
+                    else ""
+                )
+                lines.append("⏳ Вход только после подтверждения:")
+                if "aggressive_direction_conflict_with_ema_wait_confirm" in wl:
+                    lines.append("⚠️ Направление против EMA-структуры — подтверждение обязательно.")
+
+                rules_raw = data.get("confirmation_rules")
+                rules: list[str] = []
+                if isinstance(rules_raw, list):
+                    for it in rules_raw:
+                        s = _one_line(str(it))
+                        if s:
+                            rules.append(s.lstrip("-• ").strip())
+                elif isinstance(rules_raw, str):
+                    parts = [p.strip() for p in re.split(r"[;\n]+", rules_raw) if p.strip()]
+                    for p in parts:
+                        rules.append(p.lstrip("-• ").strip())
+
+                if rules:
+                    for r in rules[:3]:
+                        lines.append(f"- {r}")
+                else:
+                    if side_key_tmp == "short":
+                        lines.append("- цена удерживается ниже ключевой зоны (EMA20(M15) / локальная база) 1–2 свечи")
+                        lines.append("- объём не падает на падении")
+                        lines.append("- нет нового локального максимума")
+                    else:  # long (default)
+                        lines.append("- цена удерживается выше ключевой зоны (EMA20(M15) / локальная база) 1–2 свечи")
+                        lines.append("- объём не падает на росте")
+                        lines.append("- нет нового локального минимума")
+
+                lines.append("Отмена:")
+                if side_key_tmp == "short":
+                    lines.append("- пробой локального максимума или закреп выше EMA20(M15)")
+                else:
+                    lines.append("- пробой локального минимума или закреп ниже EMA20(M15)")
+
             raw_side = data.get("side")
             raw_dir = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")
             side_key = (raw_dir or "").strip().lower() if isinstance(raw_dir, str) else ""

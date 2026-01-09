@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Any
+
+import get_signal_json
 
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
@@ -44,6 +47,27 @@ def _iter_str_list(x: Any) -> list[str]:
             if s:
                 out.append(s)
     return out
+
+
+def format_price(symbol: str | None, x, *, exchange=None) -> str:
+    """
+    Render prices with symbol-aware precision, mirroring get_signal_json._price_precision().
+    """
+    try:
+        v = float(x)
+    except Exception:
+        return str(x)
+    if not math.isfinite(v):
+        return str(x)
+    try:
+        prec = get_signal_json._price_precision(  # type: ignore[attr-defined]
+            symbol if isinstance(symbol, str) else None,
+            exchange=exchange,
+            value_hint=v,
+        )
+    except Exception:
+        prec = 4 if abs(v) < 10 else 2
+    return f"{v:.{int(prec)}f}"
 
 
 def _get_warnings(d: dict) -> list[str]:
@@ -422,8 +446,28 @@ def format_no_trade_message(d: dict) -> str:
     lines.append("")
     lines.append("Статус: рынок в фазе ожидания, бот продолжает мониторинг.")
 
+    mode = normalize_mode(d.get("mode"))
     aggressive_option = d.get("aggressive_option")
-    if isinstance(aggressive_option, dict):
+    if mode == "neutral" and isinstance(aggressive_option, dict):
+        entry = aggressive_option.get("entry_price")
+        if entry is not None:
+            symbol_val = d.get("symbol")
+            symbol = symbol_val if isinstance(symbol_val, str) and symbol_val.strip() else "?"
+
+            raw_side = aggressive_option.get("side")
+            if not (isinstance(raw_side, str) and raw_side.strip()):
+                raw_side = d.get("side")
+            if not (isinstance(raw_side, str) and raw_side.strip()):
+                raw_side = d.get("direction")
+
+            side_key = raw_side.strip().lower() if isinstance(raw_side, str) else ""
+            side = {"long": "LONG", "short": "SHORT", "buy": "LONG", "sell": "SHORT"}.get(side_key)
+            if side:
+                lines.append("")
+                lines.append(
+                    f"⚡ Aggressive option: {symbol} {side} entry {format_price(symbol, entry)}"
+                )
+    elif isinstance(aggressive_option, dict):
         entry = aggressive_option.get("entry_price")
         note = str(aggressive_option.get("note") or "").strip()
         if entry is not None:
