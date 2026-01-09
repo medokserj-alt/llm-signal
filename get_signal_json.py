@@ -1921,36 +1921,6 @@ def apply_phase_flip_modifier(d: dict) -> None:
 
     mode = normalize_mode(d.get("mode"))
 
-    # NEUTRAL: hard stop during US session; soft wait outside.
-    if mode == "neutral":
-        if is_us_session:
-            _set_no_trade_primary_reason(d, "us_session_phase_flip_neutral_pause")
-            _ensure_aggressive_option_note(
-                d,
-                "US-сессия: идёт перераспределение/выдох после импульса — neutral пауза; "
-                "trade допустим только в aggressive при подтверждении.",
-                force=True,
-            )
-        else:
-            _set_no_trade_primary_reason(d, "phase_flip_neutral_wait")
-            _ensure_aggressive_option_note(
-                d,
-                "Идёт перераспределение/выдох после импульса — neutral ждёт подтверждение; "
-                "trade возможен только при подтверждении (или в aggressive с осторожностью).",
-                force=True,
-            )
-
-        # Do NOT emit neutral continuation levels when paused.
-        try:
-            d.pop("entry_price_neutral", None)
-            d.pop("sl", None)
-            d.pop("tp1", None)
-            d.pop("tp2", None)
-            d.pop("tp3", None)
-        except Exception:
-            pass
-        return
-
     # AGGRESSIVE: do not block, adapt tactics.
     if mode == "aggressive" and not bool(d.get("no_trade")):
         # Allow aggressive to stay tradable: do not auto-fallback solely due to ema_guard disables
@@ -2907,6 +2877,48 @@ def validate_active_mode_setup(d: dict) -> dict:
     - НЕ меняет торговую логику и НЕ пересчитывает уровни;
     - при невалидности помечает no_trade с понятным комментарием.
     """
+    def _strip_neutral_trade_payload() -> None:
+        d.pop("entry_price_neutral", None)
+        try:
+            sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else None
+            if isinstance(sl_by_mode, dict):
+                sl_by_mode.pop("neutral", None)
+            tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else None
+            if isinstance(tp_by_mode, dict):
+                tp_by_mode.pop("neutral", None)
+            rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else None
+            if isinstance(rr_by_mode, dict):
+                rr_by_mode.pop("neutral", None)
+            ep_by_mode = d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else None
+            if isinstance(ep_by_mode, dict):
+                ep_by_mode.pop("neutral", None)
+        except Exception:
+            pass
+        # Legacy single-mode fields (suppress in no-trade payload).
+        for k in ("sl", "tp1", "tp2", "tp3"):
+            d.pop(k, None)
+
+    def _ensure_aggressive_option_only(note: str) -> None:
+        # Use existing math only; do not derive new levels.
+        try:
+            _ensure_aggressive_option_note(d, note, force=True)
+        except Exception:
+            pass
+
+    # Neutral gate (must apply even if upstream already set no_trade, e.g. waiting_confirmation).
+    # Condition: impulse + phase flip detected, but price has NOT reclaimed EMA20(M15).
+    mode_now = normalize_mode(d.get("mode"))
+    if mode_now == "neutral":
+        vs_m15_now = str(d.get("price_vs_ema20_m15") or "").strip().lower()
+        if bool(d.get("impulse_proxy")) and bool(d.get("phase_flip_m15")) and vs_m15_now != "above":
+            _set_no_trade_primary_reason(d, "neutral_flip_without_reclaim_forbidden")
+            _strip_neutral_trade_payload()
+            _ensure_aggressive_option_only(
+                "Разворот после импульса (phase flip) без закрепления выше EMA20(M15): "
+                "neutral запрещён; допустимо только в aggressive (лучше wait_confirm)."
+            )
+            return d
+
     if bool(d.get("no_trade")):
         # Even when blocked upstream, conservative keeps a fixed horizon contract.
         if normalize_mode(d.get("mode")) == "conservative":
@@ -3147,6 +3159,15 @@ def validate_active_mode_setup(d: dict) -> dict:
         fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
         fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
         warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else None
+        # Gate can still trigger here if mode fell back into neutral during validation.
+        if bool(d.get("impulse_proxy")) and bool(d.get("phase_flip_m15")) and vs_m15 != "above":
+            _set_no_trade_primary_reason(d, "neutral_flip_without_reclaim_forbidden")
+            _strip_neutral_trade_payload()
+            _ensure_aggressive_option_only(
+                "Разворот после импульса (phase flip) без закрепления выше EMA20(M15): "
+                "neutral запрещён; допустимо только в aggressive (лучше wait_confirm)."
+            )
+            return d
 
         wrong_side_both = False
         if side == "long":

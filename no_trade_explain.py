@@ -137,6 +137,8 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "phase flip по EMA20(M15) после импульса — neutral ждёт подтверждение"
     if low == "us_session_phase_flip_neutral_pause":
         return "US-сессия + phase flip по EMA20(M15) — neutral пауза (риск перераспределения)"
+    if low == "neutral_flip_without_reclaim_forbidden":
+        return "разворот после импульса (phase flip) без закрепления выше EMA20(M15) — neutral запрещён"
     if low in {"time_window", "time_window_low_liquidity"}:
         return "риск-окно по времени/ликвидности"
     if low == "time_window_conservative":
@@ -228,6 +230,7 @@ def classify_reason(reason_key: str) -> str:
         "impulse_no_exhale",
         "phase_flip_neutral_wait",
         "us_session_phase_flip_neutral_pause",
+        "neutral_flip_without_reclaim_forbidden",
         "phase_between",
         "ema_between_m15_h1",
         "ema_guard_between",
@@ -265,6 +268,8 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "подтверждён micro-phase flip по EMA20(M15) после импульса — в neutral ждём подтверждение продолжения."
     if low == "us_session_phase_flip_neutral_pause":
         return "US-сессия + подтверждён micro-phase flip по EMA20(M15) после импульса — neutral ставим на паузу (риск перераспределения)."
+    if low == "neutral_flip_without_reclaim_forbidden":
+        return "разворот после импульса (phase flip) без закрепления выше EMA20(M15): neutral запрещён; допустимо только в aggressive (лучше wait_confirm)."
     if low in {"phase_between", "ema_between_m15_h1", "ema_guard_between"}:
         return "цена/вход в зоне неопределённости между EMA20(M15) и EMA20(H1) — повышенный риск пилы."
     if low == "ema_guard_below_both_long":
@@ -334,6 +339,8 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Дождаться признаков стабилизации: «выдох»/откат на M15 и ослабление тренда на H1.")
         if low == "neutral_too_close_risky":
             add("– Дождаться более дальнего (пациентного) уровня входа, не у текущей цены.")
+        if low == "neutral_flip_without_reclaim_forbidden":
+            add("– Дождаться закрепления цены выше EMA20(M15) или рассматривать только aggressive (лучше wait_confirm).")
         if low == "conservative_requires_mid_bias":
             add("– Нужен явный MID bias (long/short) и работа строго по нему.")
         if low == "conservative_day_mid_conflict":

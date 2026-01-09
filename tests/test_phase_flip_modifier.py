@@ -41,7 +41,7 @@ class TestPhaseFlipModifier(unittest.TestCase):
             self.assertIn(k, d)
             self.assertIsInstance(d.get(k), bool)
 
-    def test_neutral_impulse_proxy_phase_flip_us_session_pauses(self) -> None:
+    def test_neutral_impulse_proxy_phase_flip_us_session_does_not_autoblock(self) -> None:
         closes_15m = [100.0] * 58 + [101.0, 101.0]
         closes_1h = [200.0] * 60
         old_fetch = _patch_fetch_closes(closes_15m, closes_1h)
@@ -54,21 +54,28 @@ class TestPhaseFlipModifier(unittest.TestCase):
                 "mode": "neutral",
                 "entry_mode": "limit",
                 "entry_range": {"min": 101.2, "max": 101.6},
+                "entries": {"neutral": {"enabled": True, "range": {"min": 101.2, "max": 101.6}}},
+                "entry_price_neutral": 101.4,
+                "sl_by_mode": {"neutral": 105.0},
+                "tp_by_mode": {"neutral": {"tvh1": 99.0, "tvh2": 98.0}},
+                "rr_by_mode": {"neutral": 1.2},
+                "exit_plan_by_mode": {"neutral": "plan"},
+                "ema20_m15": 100.0,
+                "price_vs_ema20_m15": "above",
                 "warnings": ["impulse_no_exhale"],
             }
             out = get_signal_json.finalize_signal(d, hints={}, fetch_price=False)
             self.assertTrue(bool(out.get("no_trade")))
-            self.assertIn("us_session_phase_flip_neutral_pause", out.get("no_trade_reasons") or [])
-            self.assertIsNone(out.get("entry_price_neutral"))
+            self.assertIn("waiting_confirmation", out.get("no_trade_reasons") or [])
+            self.assertNotIn("neutral_flip_without_reclaim_forbidden", out.get("no_trade_reasons") or [])
             dbg = out.get("debug") or {}
             self.assertTrue(bool(dbg.get("is_us_session")))
             self.assertTrue(bool(dbg.get("phase_flip_m15")))
             self.assertTrue(bool(dbg.get("impulse_proxy")))
-            self.assertIn("US-сессия", str((out.get("aggressive_option") or {}).get("note") or ""))
         finally:
             get_signal_json._fetch_closes_from_market = old_fetch  # type: ignore[assignment]
 
-    def test_neutral_impulse_proxy_phase_flip_outside_us_waits(self) -> None:
+    def test_neutral_impulse_proxy_phase_flip_outside_us_does_not_autoblock(self) -> None:
         closes_15m = [100.0] * 58 + [101.0, 101.0]
         closes_1h = [200.0] * 60
         old_fetch = _patch_fetch_closes(closes_15m, closes_1h)
@@ -81,12 +88,20 @@ class TestPhaseFlipModifier(unittest.TestCase):
                 "mode": "neutral",
                 "entry_mode": "limit",
                 "entry_range": {"min": 101.2, "max": 101.6},
+                "entries": {"neutral": {"enabled": True, "range": {"min": 101.2, "max": 101.6}}},
+                "entry_price_neutral": 101.4,
+                "sl_by_mode": {"neutral": 105.0},
+                "tp_by_mode": {"neutral": {"tvh1": 99.0, "tvh2": 98.0}},
+                "rr_by_mode": {"neutral": 1.2},
+                "exit_plan_by_mode": {"neutral": "plan"},
+                "ema20_m15": 100.0,
+                "price_vs_ema20_m15": "above",
                 "warnings": ["impulse_no_exhale"],
             }
             out = get_signal_json.finalize_signal(d, hints={}, fetch_price=False)
             self.assertTrue(bool(out.get("no_trade")))
-            self.assertIn("phase_flip_neutral_wait", out.get("no_trade_reasons") or [])
-            self.assertIsNone(out.get("entry_price_neutral"))
+            self.assertIn("waiting_confirmation", out.get("no_trade_reasons") or [])
+            self.assertNotIn("neutral_flip_without_reclaim_forbidden", out.get("no_trade_reasons") or [])
             dbg = out.get("debug") or {}
             self.assertFalse(bool(dbg.get("is_us_session")))
             self.assertTrue(bool(dbg.get("phase_flip_m15")))
