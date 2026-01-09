@@ -16,7 +16,7 @@ class TestNeutralNearMarketAutoSplit(unittest.TestCase):
             },
             # Near-market neutral (1 tick away for XRP-like tick=0.0001).
             "entry_price_neutral": 0.4999,
-            "sl_by_mode": {"neutral": 0.4950},
+            "sl_by_mode": {"neutral": 0.4900},
             "tp_by_mode": {"neutral": {"tvh1": 0.5100, "tvh2": 0.5200}},
             "rr_by_mode": {"neutral": 1.0},
             "exit_plan_by_mode": {"neutral": "plan"},
@@ -26,11 +26,11 @@ class TestNeutralNearMarketAutoSplit(unittest.TestCase):
         self.assertEqual(out.get("mode"), "neutral")
 
         self.assertFalse(bool(out.get("no_trade")))
-        self.assertAlmostEqual(float(out.get("neutral_offset_pct")), 0.7, places=6)
+        self.assertAlmostEqual(float(out.get("neutral_offset_pct")), 1.0, places=6)
 
         px = float(out["price"])
         n_entry = float(out["entry_price_neutral"])
-        self.assertLessEqual(n_entry, px - px * 0.007)
+        self.assertLessEqual(n_entry, px - px * 0.010)
 
 
 if __name__ == "__main__":

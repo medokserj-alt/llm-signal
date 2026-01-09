@@ -34,9 +34,34 @@ def _base_conservative_long_payload() -> dict:
 
 
 class TestConservativeModeGates(unittest.TestCase):
-    def test_conservative_blocked_when_mid_bias_missing_or_neutral(self) -> None:
+    def test_conservative_blocked_when_mid_bias_neutral_and_day_bias_missing(self) -> None:
         d = _base_conservative_long_payload()
-        d["day_mid_context"] = {"day_bias": "neutral", "mid_bias": "neutral", "notes": None}
+        d["day_mid_context"] = {"day_bias": "", "mid_bias": "neutral", "notes": None}
+
+        out = get_signal_json.validate_active_mode_setup(d)
+
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("conservative_requires_mid_bias", out.get("no_trade_reasons") or [])
+
+    def test_conservative_allowed_when_mid_bias_neutral_but_day_and_local_align(self) -> None:
+        d = _base_conservative_long_payload()
+        d["day_mid_context"] = {"day_bias": "long", "mid_bias": "neutral", "notes": None}
+        d["warnings"] = []
+        d["impulse_proxy"] = False
+        d["ema_fan_m15_state"] = "bull"
+        d["ema_fan_h1_state"] = "bull"
+        d["price_vs_ema20_h1"] = "above"
+
+        out = get_signal_json.validate_active_mode_setup(d)
+
+        self.assertFalse(bool(out.get("no_trade")))
+        self.assertEqual(out.get("intended_horizon_hours"), {"min": 24, "max": 72})
+
+    def test_conservative_blocked_when_mid_bias_neutral_and_local_unstable(self) -> None:
+        d = _base_conservative_long_payload()
+        d["day_mid_context"] = {"day_bias": "long", "mid_bias": "neutral", "notes": None}
+        d["warnings"] = []
+        d["impulse_proxy"] = True
 
         out = get_signal_json.validate_active_mode_setup(d)
 

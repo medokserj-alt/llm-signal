@@ -38,10 +38,10 @@ NEUTRAL_MIN_DIST_PCT_ALT = 0.35  # others
 
 # ---- Neutral volatility-aware spacing (adaptive calmer entry) ----
 # Applies only to entry_price_neutral placement; does not change EMA/provenance, direction, SL/TP/RR math, or gates.
-NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR = 0.005  # 0.50%
-NEUTRAL_VOL_MIN_OFFSET_PCT_ALT = 0.007  # 0.70%
-NEUTRAL_VOL_K_ATR_MAJOR = 1.0
-NEUTRAL_VOL_K_ATR_ALT = 1.2
+NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR = 0.008  # 0.80%
+NEUTRAL_VOL_MIN_OFFSET_PCT_ALT = 0.010  # 1.00%
+NEUTRAL_VOL_K_ATR_MAJOR = 1.2
+NEUTRAL_VOL_K_ATR_ALT = 1.3
 
 # When neutral mode exposes an early aggressive entry option, keep neutral meaningfully farther.
 # Soft shaping only: does not hard-limit the model or change EMA/no_trade/direction logic.
@@ -49,7 +49,7 @@ NEUTRAL_BUFFER_TICKS = 10
 
 # Near-market definition (neutral): if neutral entry is within this many ticks from current price,
 # and no aggressive_option exists, split into (aggressive_option=original) + buffered neutral entry.
-NEUTRAL_NEAR_TICKS = 10
+NEUTRAL_NEAR_TICKS = 20
 
 # ---- Flush gate (neutral must not knife-catch) ----
 # "Flush" is defined relative to ATR(14) on M15 candles.
@@ -2773,7 +2773,14 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
         m: str(ep_in.get(m) or plan_default).strip() for m in VALID_MODES
     }
 
-    rr_min_by_mode = {"aggressive": 1.0, "neutral": 1.5, "conservative": 2.0}
+    # RR policy:
+    # - aggressive: permissive (may still proceed with warnings)
+    # - neutral: standard
+    # - conservative: strict, but should be producible:
+    #   * with numeric TP2 target: require higher RR
+    #   * with trail: require minimal RR to TP1 (trail handles the rest)
+    rr_min_by_mode = {"aggressive": 1.0, "neutral": 1.5, "conservative": 1.5}
+    conservative_min_rr_tp1_trail = 1.0
     active_mode = normalize_mode(d.get("mode"))
     rr_ok_for_active_mode = True
 
@@ -2947,8 +2954,21 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
         rr_val = _rr(entry, sl_val, rr_target) if rr_target is not None else None
         rr_by_mode[mode] = float(round(rr_val, 3)) if rr_val is not None else 0.0
 
-        if mode == active_mode and (rr_val is None or rr_val < rr_min_by_mode[mode]):
+        min_rr_required = rr_min_by_mode[mode]
+        is_conservative_trail = False
+        if mode == "conservative":
+            tvh2_or_trail = out_bucket.get("tvh2_or_trail")
+            is_conservative_trail = isinstance(tvh2_or_trail, str) and tvh2_or_trail.strip().lower() == "trail"
+            if is_conservative_trail:
+                min_rr_required = float(conservative_min_rr_tp1_trail)
+
+        if mode == active_mode and (rr_val is None or rr_val < min_rr_required):
             rr_ok_for_active_mode = False
+        elif mode == active_mode and mode == "conservative" and is_conservative_trail:
+            # Conservative with trail: we accept minimal RR to TP1 and assume trailing takes over.
+            d.setdefault("warnings", [])
+            if isinstance(d.get("warnings"), list) and "conservative_trail_rr_assumed" not in d["warnings"]:
+                d["warnings"].append("conservative_trail_rr_assumed")
 
     # Если TP3 отключён (mixed/против направления) — не показываем TP3 в плане выхода, используем trail.
     try:
@@ -3568,53 +3588,101 @@ def validate_active_mode_setup(d: dict) -> dict:
                 d["neutral_offset_abs"] = float(offset_abs)
                 d["neutral_offset_pct"] = float(offset_abs) / float(px) * 100.0
 
-                target_from_current = float(px) - float(offset_abs) if side == "long" else float(px) + float(offset_abs)
-                cand_raw = (
-                    min(float(neu0), target_from_current) if side == "long" else max(float(neu0), target_from_current)
+                offset_needed = (
+                    (side == "long" and float(neu0) > float(px) - float(offset_abs))
+                    or (side == "short" and float(neu0) < float(px) + float(offset_abs))
                 )
-                cand = _round_price_dir(cand_raw, "down" if side == "long" else "up", symbol=d.get("symbol"))
-                if cand is None:
-                    cand = cand_raw
+                if offset_needed:
+                    target_from_current = (
+                        float(px) - float(offset_abs) if side == "long" else float(px) + float(offset_abs)
+                    )
+                    cand_raw = (
+                        min(float(neu0), target_from_current)
+                        if side == "long"
+                        else max(float(neu0), target_from_current)
+                    )
+                    cand = _round_price_dir(cand_raw, "down" if side == "long" else "up", symbol=d.get("symbol"))
+                    if cand is None:
+                        cand = cand_raw
 
-                sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
-                sl_neutral = _to_float(sl_by_mode.get("neutral"))
+                    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+                    sl_neutral = _to_float(sl_by_mode.get("neutral"))
 
-                def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
-                    if not isinstance(r, dict):
-                        return None
-                    a = _to_float(r.get("min"))
-                    b = _to_float(r.get("max"))
-                    if a is None or b is None:
-                        return None
-                    if b < a:
-                        a, b = b, a
-                    if not (a < b):
-                        return None
-                    return (a, b)
+                    def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
+                        if not isinstance(r, dict):
+                            return None
+                        a = _to_float(r.get("min"))
+                        b = _to_float(r.get("max"))
+                        if a is None or b is None:
+                            return None
+                        if b < a:
+                            a, b = b, a
+                        if not (a < b):
+                            return None
+                        return (a, b)
 
-                mm = _range_to_minmax(d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None)
+                    mm = _range_to_minmax(d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None)
 
-                invalid = False
-                if not (math.isfinite(float(cand)) and float(cand) > 0):
-                    invalid = True
-                if mm is not None:
-                    lo, hi = mm
-                    if float(cand) < float(lo) or float(cand) > float(hi):
+                    invalid = False
+                    if not (math.isfinite(float(cand)) and float(cand) > 0):
                         invalid = True
-                if sl_neutral is None or not (math.isfinite(float(sl_neutral)) and float(sl_neutral) > 0):
-                    invalid = True
-                if not invalid:
-                    if side == "long" and float(cand) <= float(sl_neutral):
+                    if mm is not None:
+                        lo, hi = mm
+                        if float(cand) < float(lo) or float(cand) > float(hi):
+                            invalid = True
+                    if sl_neutral is None or not (math.isfinite(float(sl_neutral)) and float(sl_neutral) > 0):
                         invalid = True
-                    if side == "short" and float(cand) >= float(sl_neutral):
-                        invalid = True
+                    if not invalid:
+                        if side == "long" and float(cand) <= float(sl_neutral):
+                            invalid = True
+                        if side == "short" and float(cand) >= float(sl_neutral):
+                            invalid = True
 
-                if invalid:
-                    warnings = d.setdefault("warnings", [])
-                    if isinstance(warnings, list) and "neutral_offset_skipped_unsafe" not in warnings:
-                        warnings.append("neutral_offset_skipped_unsafe")
-                else:
-                    d["entry_price_neutral"] = float(cand)
+                    if invalid:
+                        d["no_trade"] = True
+                        reasons = d.setdefault("no_trade_reasons", [])
+                        if isinstance(reasons, list) and "neutral_no_good_entry_volatility" not in reasons:
+                            reasons.append("neutral_no_good_entry_volatility")
+                        if not (d.get("no_trade_hint") or "").strip():
+                            d["no_trade_hint"] = "neutral_no_good_entry_volatility"
+
+                        # Strip neutral trade levels from output: neutral cannot be safely deep.
+                        d.pop("entry_price_neutral", None)
+                        try:
+                            sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else None
+                            if isinstance(sl_by_mode, dict):
+                                sl_by_mode.pop("neutral", None)
+                            tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else None
+                            if isinstance(tp_by_mode, dict):
+                                tp_by_mode.pop("neutral", None)
+                            rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else None
+                            if isinstance(rr_by_mode, dict):
+                                rr_by_mode.pop("neutral", None)
+                            ep_by_mode = (
+                                d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else None
+                            )
+                            if isinstance(ep_by_mode, dict):
+                                ep_by_mode.pop("neutral", None)
+                        except Exception:
+                            pass
+                        for k in ("sl", "tp1", "tp2", "tp3"):
+                            d.pop(k, None)
+
+                        # Suggest aggressive (only if it already exists as an entry idea).
+                        existing = d.get("aggressive_option")
+                        a_entry = None
+                        if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
+                            a_entry = _to_float(existing.get("entry_price"))
+                        else:
+                            a_entry = _to_float(d.get("entry_price_aggressive"))
+                        if a_entry is not None:
+                            d["aggressive_option"] = {
+                                "entry_price": float(a_entry),
+                                "note": "Neutral не удалось поставить безопасный глубокий вход; если хотите торговать — рассмотрите aggressive.",
+                            }
+                        return d
+                    else:
+                        d["entry_price_neutral"] = float(cand)
 
         # ---- Neutral buffer vs aggressive option (soft shaping) ----
         # When neutral mode is active and an aggressive option exists, keep neutral entry
@@ -3688,7 +3756,8 @@ def validate_active_mode_setup(d: dict) -> dict:
                                 d["entry_price_neutral"] = float(cand)
 
         # ---- Neutral near-market risk gate (STRICT) ----
-        # Neutral must be continuation/patient only; near-market entries belong to aggressive.
+        # Neutral must be continuation/patient only; if the entry is still near-market,
+        # shift it farther using the already-computed volatility-aware offset.
         try:
             side = (d.get("side") or d.get("direction") or "").strip().lower()
             px = _to_float(d.get("price"))
@@ -3703,23 +3772,96 @@ def validate_active_mode_setup(d: dict) -> dict:
                     dist_ticks = float("inf")
 
                 if dist_ticks <= float(NEUTRAL_NEAR_TICKS):
-                    d["no_trade"] = True
-                    reasons = d.setdefault("no_trade_reasons", [])
-                    if isinstance(reasons, list) and "neutral_too_close_risky" not in reasons:
-                        reasons.append("neutral_too_close_risky")
-                    if not (d.get("no_trade_hint") or "").strip():
-                        d["no_trade_hint"] = "neutral_too_close_risky"
+                    offset_abs = _to_float(d.get("neutral_offset_abs"))
+                    if offset_abs is None or not (math.isfinite(float(offset_abs)) and float(offset_abs) > 0):
+                        is_major = _symbol_is_major(str(symbol or ""))
+                        min_pct = NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR if is_major else NEUTRAL_VOL_MIN_OFFSET_PCT_ALT
+                        offset_abs = float(min_pct) * float(px)
 
-                    existing = d.get("aggressive_option")
-                    if not (isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None):
-                        a_entry = _to_float(d.get("entry_price_aggressive"))
-                        if a_entry is None:
-                            a_entry = float(n_entry)
-                        d["aggressive_option"] = {
-                            "entry_price": float(a_entry),
-                            "note": "Слишком близко к рынку — допустимо только в aggressive.",
-                        }
-                    return d
+                    target_raw = float(px) - float(offset_abs) if side == "long" else float(px) + float(offset_abs)
+                    target = _round_price_dir(target_raw, "down" if side == "long" else "up", symbol=symbol)
+                    if target is None:
+                        target = target_raw
+
+                    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+                    sl_neutral = _to_float(sl_by_mode.get("neutral"))
+
+                    def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
+                        if not isinstance(r, dict):
+                            return None
+                        a = _to_float(r.get("min"))
+                        b = _to_float(r.get("max"))
+                        if a is None or b is None:
+                            return None
+                        if b < a:
+                            a, b = b, a
+                        if not (a < b):
+                            return None
+                        return (a, b)
+
+                    mm = _range_to_minmax(d.get("entry_range") if isinstance(d.get("entry_range"), dict) else None)
+
+                    unsafe = False
+                    if not (math.isfinite(float(target)) and float(target) > 0):
+                        unsafe = True
+                    if mm is not None:
+                        lo, hi = mm
+                        if float(target) < float(lo) or float(target) > float(hi):
+                            unsafe = True
+                    if sl_neutral is None or not (math.isfinite(float(sl_neutral)) and float(sl_neutral) > 0):
+                        unsafe = True
+                    if not unsafe:
+                        if side == "long" and not (float(target) > float(sl_neutral)):
+                            unsafe = True
+                        if side == "short" and not (float(target) < float(sl_neutral)):
+                            unsafe = True
+
+                    if unsafe:
+                        d["no_trade"] = True
+                        reasons = d.setdefault("no_trade_reasons", [])
+                        if isinstance(reasons, list) and "neutral_no_good_entry_volatility" not in reasons:
+                            reasons.append("neutral_no_good_entry_volatility")
+                        if not (d.get("no_trade_hint") or "").strip():
+                            d["no_trade_hint"] = "neutral_no_good_entry_volatility"
+
+                        # Strip neutral trade levels from output: neutral cannot be safely deep.
+                        d.pop("entry_price_neutral", None)
+                        try:
+                            if isinstance(sl_by_mode, dict):
+                                sl_by_mode.pop("neutral", None)
+                            tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else None
+                            if isinstance(tp_by_mode, dict):
+                                tp_by_mode.pop("neutral", None)
+                            rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else None
+                            if isinstance(rr_by_mode, dict):
+                                rr_by_mode.pop("neutral", None)
+                            ep_by_mode = (
+                                d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else None
+                            )
+                            if isinstance(ep_by_mode, dict):
+                                ep_by_mode.pop("neutral", None)
+                        except Exception:
+                            pass
+                        for k in ("sl", "tp1", "tp2", "tp3"):
+                            d.pop(k, None)
+
+                        existing = d.get("aggressive_option")
+                        a_entry = None
+                        if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
+                            a_entry = _to_float(existing.get("entry_price"))
+                        else:
+                            a_entry = _to_float(d.get("entry_price_aggressive"))
+                        if a_entry is not None:
+                            d["aggressive_option"] = {
+                                "entry_price": float(a_entry),
+                                "note": "Neutral не удалось поставить безопасный глубокий вход; если хотите торговать — рассмотрите aggressive.",
+                            }
+                        return d
+
+                    d["entry_price_neutral"] = float(target)
+                    warnings = d.setdefault("warnings", [])
+                    if isinstance(warnings, list) and "neutral_entry_shifted_by_volatility" not in warnings:
+                        warnings.append("neutral_entry_shifted_by_volatility")
         except Exception:
             pass
 
@@ -3749,57 +3891,111 @@ def validate_active_mode_setup(d: dict) -> dict:
 
         ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
         mid_bias = str((ctx or {}).get("mid_bias") or "").strip().lower()
-        if mid_bias not in ("long", "short"):
-            return _block_cons(
-                "conservative_requires_mid_bias",
-                "Conservative требует явный MID bias (long/short).",
-            )
-
-        # MID alignment (hard): the planned side must match MID bias.
-        side = (d.get("side") or d.get("direction") or "").strip().lower()
-        if side in ("long", "short") and side != mid_bias:
-            return _block_cons(
-                "conservative_requires_mid_bias",
-                "Направление не совпадает с MID bias — conservative пропускает.",
-            )
-
-        # DAY alignment: same as MID or neutral (not opposite).
         day_bias = str((ctx or {}).get("day_bias") or "").strip().lower()
-        if day_bias in ("long", "short") and day_bias != mid_bias:
+
+        # Proposed side for conservative (may come from MID, but MID can be neutral/missing).
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        if side not in ("long", "short"):
             return _block_cons(
-                "conservative_day_mid_conflict",
-                "DAY bias противоречит MID — conservative пропускает.",
+                "conservative_requires_mid_bias",
+                "Conservative требует явный side (long/short).",
             )
+
+        mid_is_explicit = mid_bias in ("long", "short")
+        effective_side = mid_bias if mid_is_explicit else side
+
+        # MID alignment:
+        # - If MID bias is explicit: enforce it strictly (as before).
+        # - If MID bias is neutral/missing: allow only when DAY+local are strongly aligned.
+        if mid_is_explicit:
+            if side != mid_bias:
+                return _block_cons(
+                    "conservative_requires_mid_bias",
+                    "Направление не совпадает с MID bias — conservative пропускает.",
+                )
+            # DAY alignment: same as MID or neutral (not opposite).
+            if day_bias in ("long", "short") and day_bias != mid_bias:
+                return _block_cons(
+                    "conservative_day_mid_conflict",
+                    "DAY bias противоречит MID — conservative пропускает.",
+                )
+        else:
+            # DAY must not oppose the proposed side; neutral is allowed only with strong local alignment.
+            if day_bias in ("long", "short") and day_bias != side:
+                return _block_cons(
+                    "conservative_requires_mid_bias",
+                    "MID bias нейтрален/отсутствует, а DAY bias против направления — conservative пропускает.",
+                )
+            if day_bias not in ("long", "short", "neutral"):
+                return _block_cons(
+                    "conservative_requires_mid_bias",
+                    "MID bias нейтрален/отсутствует и DAY bias не задан — conservative пропускает.",
+                )
 
         # Local stabilization (hard): no flush/knife + no impulse-no-exhale + no adverse fan.
         warnings = d.get("warnings")
         if isinstance(warnings, list):
             wl = " ".join(str(w or "").strip().lower() for w in warnings)
             if "impulse_no_exhale" in wl:
-                return _block_cons(
-                    "conservative_local_not_stable",
-                    "Локально нет стабилизации после импульса (impulse_no_exhale).",
+                reason = "conservative_local_not_stable" if mid_is_explicit else "conservative_requires_mid_bias"
+                hint = (
+                    "Локально нет стабилизации после импульса (impulse_no_exhale)."
+                    if mid_is_explicit
+                    else "MID bias нейтрален/отсутствует, а локально нет стабилизации после импульса (impulse_no_exhale)."
                 )
+                return _block_cons(reason, hint)
+
+        if bool(d.get("impulse_proxy")):
+            reason = "conservative_local_not_stable" if mid_is_explicit else "conservative_requires_mid_bias"
+            hint = (
+                "Есть признаки импульса (impulse_proxy) — conservative пропускает."
+                if mid_is_explicit
+                else "MID bias нейтрален/отсутствует, а локально есть признаки импульса (impulse_proxy) — conservative пропускает."
+            )
+            return _block_cons(reason, hint)
 
         if _m15_flush_detected(d):
-            return _block_cons(
-                "conservative_local_not_stable",
-                "Локально риск flush/knife — conservative пропускает.",
+            reason = "conservative_local_not_stable" if mid_is_explicit else "conservative_requires_mid_bias"
+            hint = (
+                "Локально риск flush/knife — conservative пропускает."
+                if mid_is_explicit
+                else "MID bias нейтрален/отсутствует, а локально риск flush/knife — conservative пропускает."
             )
+            return _block_cons(reason, hint)
 
         adverse_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
         adverse_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
-        if mid_bias == "long":
+        if effective_side == "long":
             if adverse_m15 == "bear" or adverse_h1 == "bear":
-                return _block_cons(
-                    "conservative_local_not_stable",
-                    "EMA fan против направления (bear для LONG) — conservative пропускает.",
+                reason = "conservative_local_not_stable" if mid_is_explicit else "conservative_requires_mid_bias"
+                hint = (
+                    "EMA fan против направления (bear для LONG) — conservative пропускает."
+                    if mid_is_explicit
+                    else "MID bias нейтрален/отсутствует, а EMA fan против направления (bear для LONG) — conservative пропускает."
                 )
+                return _block_cons(reason, hint)
         else:
             if adverse_m15 == "bull" or adverse_h1 == "bull":
+                reason = "conservative_local_not_stable" if mid_is_explicit else "conservative_requires_mid_bias"
+                hint = (
+                    "EMA fan против направления (bull для SHORT) — conservative пропускает."
+                    if mid_is_explicit
+                    else "MID bias нейтрален/отсутствует, а EMA fan против направления (bull для SHORT) — conservative пропускает."
+                )
+                return _block_cons(reason, hint)
+
+        # When MID is neutral/missing, additionally require that H1 context is not adverse.
+        if not mid_is_explicit:
+            vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+            if effective_side == "long" and vs_h1 == "below":
                 return _block_cons(
-                    "conservative_local_not_stable",
-                    "EMA fan против направления (bull для SHORT) — conservative пропускает.",
+                    "conservative_requires_mid_bias",
+                    "MID bias нейтрален/отсутствует, но цена ниже EMA20(H1) — conservative пропускает.",
+                )
+            if effective_side == "short" and vs_h1 == "above":
+                return _block_cons(
+                    "conservative_requires_mid_bias",
+                    "MID bias нейтрален/отсутствует, но цена выше EMA20(H1) — conservative пропускает.",
                 )
 
         # Entry placement (hard): deeper than neutral and not near-market.
@@ -3819,8 +4015,8 @@ def validate_active_mode_setup(d: dict) -> dict:
             neu_entry = _mid_from_range(nb.get("range"), symbol=symbol)
 
         if cons_entry is not None and neu_entry is not None:
-            deeper_ok = (mid_bias == "long" and cons_entry < neu_entry) or (
-                mid_bias == "short" and cons_entry > neu_entry
+            deeper_ok = (effective_side == "long" and cons_entry < neu_entry) or (
+                effective_side == "short" and cons_entry > neu_entry
             )
             if not deeper_ok:
                 return _block_cons(

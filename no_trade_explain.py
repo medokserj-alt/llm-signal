@@ -165,6 +165,8 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "нет стабилизации/подтверждения для continuation (риск разворота)"
     if low == "neutral_too_close_risky":
         return "neutral-вход слишком близко к текущей цене (слишком рискованно)"
+    if low == "neutral_no_good_entry_volatility":
+        return "не удалось поставить безопасный глубокий neutral-вход (волатильность/границы уровней)"
     if low == "conservative_requires_mid_bias":
         return "для conservative нужен явный MID bias (long/short)"
     if low == "conservative_day_mid_conflict":
@@ -345,6 +347,8 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Дождаться признаков стабилизации: «выдох»/откат на M15 и ослабление тренда на H1.")
         if low == "neutral_too_close_risky":
             add("– Дождаться более дальнего (пациентного) уровня входа, не у текущей цены.")
+        if low == "neutral_no_good_entry_volatility":
+            add("– Нужен более глубокий и безопасный уровень входа (не пересекающий SL/диапазон); иначе — только aggressive на свой риск.")
         if low == "neutral_flip_without_reclaim_forbidden":
             add("– Дождаться закрепления цены выше EMA20(M15) или рассматривать только aggressive (лучше wait_confirm).")
         if low == "conservative_requires_mid_bias":

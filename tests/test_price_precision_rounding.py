@@ -49,21 +49,31 @@ class TestPricePrecisionRounding(unittest.TestCase):
         get_signal_json._fetch_closes_from_market = fake_fetch  # type: ignore[assignment]
         try:
             d = {
+                "no_trade": False,
+                "time_msk": "01.01.2025, 12:00",
                 "symbol": "XRP/USDT",
                 "price": 1.87,
                 "direction": "long",
                 "entry_mode": "limit",
-                "entry_range": {"min": 1.8688, "max": 1.8699},
+                "entry_range": {"min": 1.8450, "max": 1.8550},
+                "entry_price_neutral": 1.8450,
+                "entry_price_aggressive": 1.8550,
                 "sl": 1.84,
                 "tp1": 1.87,
                 "tp2": 1.9,
-                "sl_by_mode": {"neutral": 1.8464},
+                "entries": {
+                    "neutral": {"enabled": True, "range": {"min": 1.8450, "max": 1.8550}},
+                    "aggressive": {"enabled": True},
+                },
+                "sl_by_mode": {"neutral": 1.8264},
                 "tp_by_mode": {"neutral": {"tvh1": 1.9, "tvh2": 1.93}},
+                "rr_by_mode": {"neutral": 1.0},
+                "exit_plan_by_mode": {"neutral": "plan"},
             }
             out = get_signal_json.finalize_signal(d, hints={}, fetch_price=False)
 
             self.assertEqual(out.get("mode"), "neutral")
-            self.assertEqual(f"{float(out['sl']):.4f}", "1.8464")
+            self.assertEqual(f"{float(out['sl']):.4f}", "1.8264")
             self.assertEqual(float(out["tp1"]), 1.9)
             self.assertEqual(float(out["tp2"]), 1.93)
         finally:

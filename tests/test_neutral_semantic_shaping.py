@@ -60,12 +60,14 @@ class TestNeutralSemanticShaping(unittest.TestCase):
         dist_pct = abs(entry_mid - price) / price * 100.0
         self.assertGreaterEqual(dist_pct, get_signal_json.NEUTRAL_MIN_DIST_PCT_MAJOR)
 
+        # With stricter neutral volatility spacing, if the envelope cannot accommodate a safe deep entry,
+        # neutral must no_trade and suggest aggressive instead of issuing a near-aggressive neutral.
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("neutral_no_good_entry_volatility", out.get("no_trade_reasons") or [])
+        self.assertIsNone(out.get("entry_price_neutral"))
         aggressive_option = out.get("aggressive_option")
         self.assertIsInstance(aggressive_option, dict)
-        self.assertIn("note", aggressive_option)
-        self.assertIn("aggressive", aggressive_option.get("note") or "")
         self.assertIsNotNone(aggressive_option.get("entry_price"))
-        self.assertGreater(float(aggressive_option.get("entry_price")), float(out.get("entry_price_neutral")))
 
     def test_neutral_inverted_entries_falls_back_when_vol_offset_unsafe(self) -> None:
         env_min = 99.6
@@ -94,9 +96,12 @@ class TestNeutralSemanticShaping(unittest.TestCase):
 
         out = get_signal_json.validate_active_mode_setup(d)
         self.assertEqual(out.get("mode"), "neutral")
-        self.assertFalse(bool(out.get("no_trade")))
-        self.assertEqual(float(out.get("entry_price_neutral")), 99.7)
-        self.assertIn("neutral_offset_skipped_unsafe", out.get("warnings") or [])
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("neutral_no_good_entry_volatility", out.get("no_trade_reasons") or [])
+        self.assertIsNone(out.get("entry_price_neutral"))
+        aggressive_option = out.get("aggressive_option")
+        self.assertIsInstance(aggressive_option, dict)
+        self.assertIsNotNone(aggressive_option.get("entry_price"))
 
     def test_renderer_renders_aggressive_option_line(self) -> None:
         d = {
