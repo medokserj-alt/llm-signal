@@ -446,6 +446,10 @@ def main():
             wl = " ".join(w.lower() for w in _iter_warnings(data))
             if mode == "aggressive" and "phase_flip_wait_confirm" in wl:
                 lines.append("⚠️ Phase flip по M15: вход только после подтверждения (wait_confirm).")
+            if mode == "aggressive" and bool(data.get("is_us_open_block")):
+                lines.append(
+                    "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️"
+                )
 
             raw_side = data.get("side")
             raw_dir = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")

@@ -1695,6 +1695,8 @@ def apply_ema_exhale_filter(d: dict) -> None:
 
 
 US_SESSION_UTC_WINDOW_DEFAULT = "14:00-21:00"
+US_OPEN_BLOCK_UTC_WINDOW = "14:00-16:30"  # 17:00–19:30 MSK
+US_SESSION_LATE_UTC_WINDOW = "16:30-21:00"  # 19:30–24:00 MSK
 
 
 def _parse_utc_window_minutes(spec: str) -> tuple[int, int] | None:
@@ -1782,6 +1784,34 @@ def _is_us_session(d: dict) -> bool:
     except Exception:
         spec = US_SESSION_UTC_WINDOW_DEFAULT
     window = _parse_utc_window_minutes(spec) or _parse_utc_window_minutes(US_SESSION_UTC_WINDOW_DEFAULT)
+    if not window:
+        return False
+    mins_utc = _utc_minutes_from_signal_time(d)
+    if mins_utc is None:
+        return False
+    return _is_in_utc_window(mins_utc, window[0], window[1])
+
+
+def _is_us_open_block(d: dict) -> bool:
+    """
+    Phase 1: US open initial activity window in MSK (17:00–19:30 MSK).
+    Implemented in UTC: 14:00–16:30 UTC.
+    """
+    window = _parse_utc_window_minutes(US_OPEN_BLOCK_UTC_WINDOW)
+    if not window:
+        return False
+    mins_utc = _utc_minutes_from_signal_time(d)
+    if mins_utc is None:
+        return False
+    return _is_in_utc_window(mins_utc, window[0], window[1])
+
+
+def _is_us_session_late(d: dict) -> bool:
+    """
+    Phase 2: late US window in MSK (19:30–24:00 MSK).
+    Implemented in UTC: 16:30–21:00 UTC.
+    """
+    window = _parse_utc_window_minutes(US_SESSION_LATE_UTC_WINDOW)
     if not window:
         return False
     mins_utc = _utc_minutes_from_signal_time(d)
@@ -1903,18 +1933,24 @@ def apply_phase_flip_modifier(d: dict) -> None:
     phase_flip_m15 = _compute_phase_flip_m15(d)
     impulse_proxy = _compute_impulse_proxy(d)
     is_us_session = _is_us_session(d)
+    is_us_open_block = _is_us_open_block(d)
+    is_us_session_late = _is_us_session_late(d)
 
     # Persist to top-level JSON (required for logs/last.json consumers).
     # Always booleans; if inputs are missing, compute_* helpers return False.
     d["phase_flip_m15"] = bool(phase_flip_m15)
     d["impulse_proxy"] = bool(impulse_proxy)
     d["is_us_session"] = bool(is_us_session)
+    d["is_us_open_block"] = bool(is_us_open_block)
+    d["is_us_session_late"] = bool(is_us_session_late)
 
     dbg = d.setdefault("debug", {})
     if isinstance(dbg, dict):
         dbg["phase_flip_m15"] = bool(phase_flip_m15)
         dbg["impulse_proxy"] = bool(impulse_proxy)
         dbg["is_us_session"] = bool(is_us_session)
+        dbg["is_us_open_block"] = bool(is_us_open_block)
+        dbg["is_us_session_late"] = bool(is_us_session_late)
 
     if not (phase_flip_m15 and impulse_proxy):
         return
@@ -1952,6 +1988,94 @@ def apply_phase_flip_modifier(d: dict) -> None:
             )
         return
 
+
+def _drop_trade_levels_for_mode(d: dict, mode: str) -> None:
+    """
+    Output shaping helper: remove mode-specific trade levels (entry/SL/TP/RR/plan)
+    when a policy blocks that mode (no impact on internal logic).
+    """
+    mode = normalize_mode(mode)
+    if mode not in VALID_MODES:
+        return
+
+    # Mode-specific derived fields used by rendering.
+    d.pop(f"entry_price_{mode}", None)
+
+    sl_by_mode = d.get("sl_by_mode")
+    if isinstance(sl_by_mode, dict):
+        sl_by_mode.pop(mode, None)
+        d["sl_by_mode"] = sl_by_mode
+
+    tp_by_mode = d.get("tp_by_mode")
+    if isinstance(tp_by_mode, dict):
+        tp_by_mode.pop(mode, None)
+        d["tp_by_mode"] = tp_by_mode
+
+    rr_by_mode = d.get("rr_by_mode")
+    if isinstance(rr_by_mode, dict):
+        rr_by_mode.pop(mode, None)
+        d["rr_by_mode"] = rr_by_mode
+
+    exit_plan_by_mode = d.get("exit_plan_by_mode")
+    if isinstance(exit_plan_by_mode, dict):
+        exit_plan_by_mode.pop(mode, None)
+        d["exit_plan_by_mode"] = exit_plan_by_mode
+
+    entries = d.get("entries")
+    if isinstance(entries, dict):
+        entries.pop(mode, None)
+        d["entries"] = entries
+
+    # Remove generic top-level levels that represent the currently selected mode.
+    # During a strict block, we don't want to emit actionable levels.
+    for k in ("entry_range", "entry_price", "sl", "tp1", "tp2", "tp3"):
+        d.pop(k, None)
+
+
+def apply_us_two_phase_policy(d: dict) -> None:
+    """
+    Two-phase US window in MSK:
+    - Phase 1 (17:00–19:30 MSK): strict block for non-aggressive; aggressive forces wait_confirm.
+    - Phase 2 (19:30–24:00 MSK): keep existing behavior unchanged (phase_flip + time_window etc).
+    """
+    if not isinstance(d, dict):
+        return
+
+    # Source of truth flags (should already be present after apply_phase_flip_modifier),
+    # but compute defensively in case of partial flows.
+    is_open_block = bool(d.get("is_us_open_block")) or _is_us_open_block(d)
+    is_session_late = bool(d.get("is_us_session_late")) or _is_us_session_late(d)
+    d["is_us_open_block"] = bool(is_open_block)
+    d["is_us_session_late"] = bool(is_session_late)
+    dbg = d.get("debug")
+    if isinstance(dbg, dict):
+        dbg["is_us_open_block"] = bool(is_open_block)
+        dbg["is_us_session_late"] = bool(is_session_late)
+
+    if not is_open_block:
+        return
+
+    mode = normalize_mode(d.get("mode"))
+
+    if mode in {"neutral", "conservative"}:
+        d["no_trade"] = True
+        d.setdefault("no_trade_reasons", [])
+        reasons = d.get("no_trade_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons = [r for r in reasons if isinstance(r, str) and r.strip()]
+        # Make the policy reason primary.
+        reasons = ["us_open_block_non_aggressive"] + [r for r in reasons if r != "us_open_block_non_aggressive"]
+        d["no_trade_reasons"] = reasons
+        d["no_trade_hint"] = "us_open_block_non_aggressive"
+
+        # Do not emit non-aggressive entry/SL/TP payload.
+        _drop_trade_levels_for_mode(d, mode)
+        return
+
+    if mode == "aggressive" and not bool(d.get("no_trade")):
+        d["entry_mode"] = "wait_confirm"
+        return
 
 _FALLBACK_SYMBOL_PRICE_PRECISION: dict[str, int] = {
     # Common alts whose chart tick size is usually finer than 2 decimals.
@@ -4022,6 +4146,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     except Exception:
         pass
     apply_time_window_policy_variant_b(d)
+    try:
+        apply_us_two_phase_policy(d)
+    except Exception:
+        pass
     return normalize_no_trade(d)
 
 

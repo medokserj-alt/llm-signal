@@ -37,7 +37,7 @@ class TestPhaseFlipModifier(unittest.TestCase):
             "warnings": ["impulse_no_exhale"],
         }
         get_signal_json.apply_phase_flip_modifier(d)
-        for k in ("is_us_session", "impulse_proxy", "phase_flip_m15"):
+        for k in ("is_us_session", "is_us_open_block", "is_us_session_late", "impulse_proxy", "phase_flip_m15"):
             self.assertIn(k, d)
             self.assertIsInstance(d.get(k), bool)
 
