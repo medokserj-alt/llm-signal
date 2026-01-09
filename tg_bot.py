@@ -888,18 +888,19 @@ async def handle_full(update,context):
                     payload = _build_no_trade_decision_payload(uid, tg_text=part0, symbol_hint=None)
                     if payload and _should_send_to_aia_for_target(target):
                         asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
-                published_at = _utc_now_z()
-                signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
-                global _AIA_UID_CONTEXT
-                _AIA_UID_CONTEXT = uid
-                sig_v1 = _build_signal_json_v1(
-                    signal_id=signal_id,
-                    published_at=published_at,
-                    channel_id=target,
-                    symbol_hint=None,
-                )
-                if sig_v1 and _should_send_to_aia_for_target(target):
-                    asyncio.create_task(_send_signal_to_aia_background(sig_v1))
+                else:
+                    published_at = _utc_now_z()
+                    signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
+                    global _AIA_UID_CONTEXT
+                    _AIA_UID_CONTEXT = uid
+                    sig_v1 = _build_signal_json_v1(
+                        signal_id=signal_id,
+                        published_at=published_at,
+                        channel_id=target,
+                        symbol_hint=None,
+                    )
+                    if sig_v1 and _should_send_to_aia_for_target(target):
+                        asyncio.create_task(_send_signal_to_aia_background(sig_v1))
 
         mode_label = MODE_LABELS.get(get_user_mode(uid), MODE_LABELS["neutral"])
         await msg.edit_text(
@@ -1025,16 +1026,17 @@ async def handle_symbol(update,context):
                     payload = _build_no_trade_decision_payload(uid, tg_text=part0, symbol_hint=symbol)
                     if payload and _should_send_to_aia_for_target(target):
                         asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
-                published_at = _utc_now_z()
-                signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
-                global _AIA_UID_CONTEXT
-                _AIA_UID_CONTEXT = uid
-                sig_v1 = _build_signal_json_v1(
-                    signal_id=signal_id,
-                    published_at=published_at,
-                    channel_id=target,
-                    symbol_hint=symbol,
-                )
+                else:
+                    published_at = _utc_now_z()
+                    signal_id = _infer_signal_id(Path(sig_html) if sig_html else None, Path(run_log) if run_log else None, published_at)
+                    global _AIA_UID_CONTEXT
+                    _AIA_UID_CONTEXT = uid
+                    sig_v1 = _build_signal_json_v1(
+                        signal_id=signal_id,
+                        published_at=published_at,
+                        channel_id=target,
+                        symbol_hint=symbol,
+                    )
 
         await msg.edit_text(
             format_done(
