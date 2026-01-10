@@ -264,6 +264,114 @@ def _read_last_signal_json() -> dict | None:
     except Exception:
         return None
 
+def _try_int(v) -> int | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        if float(v).is_integer():
+            return int(v)
+        return None
+    if isinstance(v, str) and v.strip().lstrip("-").isdigit():
+        try:
+            return int(v.strip())
+        except Exception:
+            return None
+    return None
+
+def _shorten_text(s: str, max_len: int = 220) -> str:
+    t = (s or "").strip()
+    if not t:
+        return ""
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3].rstrip() + "..."
+
+def _extract_confirm_text(d: dict) -> str:
+    raw = d.get("confirmation_rules")
+    if isinstance(raw, str):
+        return _shorten_text(raw)
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for x in raw:
+            if isinstance(x, str) and x.strip():
+                parts.append(x.strip())
+            elif isinstance(x, dict):
+                txt = x.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+        return _shorten_text("; ".join(parts))
+    return ""
+
+def _extract_confirmation_rules_text(d: dict, *, max_len: int | None = None) -> str:
+    raw = d.get("confirmation_rules")
+    text = ""
+    if isinstance(raw, str):
+        text = raw.strip()
+    elif isinstance(raw, list):
+        parts: list[str] = []
+        for x in raw:
+            if isinstance(x, str) and x.strip():
+                parts.append(x.strip())
+            elif isinstance(x, dict):
+                txt = x.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+        text = "; ".join(parts).strip()
+    elif isinstance(raw, dict):
+        txt = raw.get("text")
+        if isinstance(txt, str):
+            text = txt.strip()
+
+    if not text:
+        return ""
+    if max_len is not None and max_len > 0 and len(text) > max_len:
+        return text[: max_len - 3].rstrip() + "..."
+    return text
+
+def _extract_max_wait_minutes(d: dict, default: int = 90) -> int:
+    for k in ("max_wait_minutes", "max_valid_minutes", "validity_minutes", "max_valid_minutes"):
+        v = _try_int(d.get(k))
+        if isinstance(v, int) and v > 0:
+            return v
+    return int(default)
+
+def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
+    rules: list[dict] = []
+    raw = d.get("confirmation_rules")
+    text = raw if isinstance(raw, str) else ""
+    if isinstance(raw, list):
+        text_parts: list[str] = []
+        for x in raw:
+            if isinstance(x, str):
+                text_parts.append(x)
+            elif isinstance(x, dict):
+                t = x.get("text")
+                if isinstance(t, str):
+                    text_parts.append(t)
+        text = " ".join(text_parts)
+    norm = str(text).lower()
+
+    if "m15" in norm and "ema20" in norm:
+        has_above = any(token in norm for token in ("не ниже", ">=", "выше"))
+        has_below = any(token in norm for token in ("не выше", "<=", "ниже"))
+        if has_above and not has_below:
+            rules.append({"type": "m15_close_vs_ema20", "op": "above"})
+        elif has_below and not has_above:
+            rules.append({"type": "m15_close_vs_ema20", "op": "below"})
+
+    if "объ" in norm and "средн" in norm and "20" in norm and "m15" in norm:
+        rules.append({"type": "volume_m15_vs_avg20", "op": ">="})
+
+    if "тенью" in norm and ("диапазон" in norm or "зон" in norm) and ("внутр" in norm or "зайти" in norm):
+        rules.append({"type": "wick_into_entry_zone", "required": True})
+
+    rules.append({"type": "deadline_minutes", "value": int(max_wait_minutes)})
+    return {"version": 1, "rules": rules}
+
 def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symbol_hint: str | None = None) -> dict | None:
     d = _read_last_signal_json()
     if not isinstance(d, dict):
@@ -460,6 +568,15 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         out["entry_price"] = float(entry_price)
     if meta is not None:
         out["meta"] = meta
+        if meta.get("entry_type") == "wait_confirm":
+            max_wait_minutes = _extract_max_wait_minutes(d, default=90)
+            confirm_text = _extract_confirm_text(d)
+            out["meta"]["max_wait_minutes"] = int(max_wait_minutes)
+            out["meta"]["confirm_timeout_minutes"] = int(max_wait_minutes)
+            out["meta"]["confirmation_rules_text"] = _extract_confirmation_rules_text(d, max_len=1500) or ""
+            if confirm_text:
+                out["meta"]["confirm_text"] = confirm_text
+            out["meta"]["confirm_rule_v1"] = _build_confirm_rule_v1(d, max_wait_minutes=max_wait_minutes)
     return out
 
 def send_signal_to_aia(signal_json_v1: dict) -> bool:
