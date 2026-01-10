@@ -44,7 +44,29 @@ class TestRenderWaitConfirmBlock(unittest.TestCase):
         self.assertIn("⚠️ Направление против EMA-структуры — подтверждение обязательно.", out)
         self.assertIn("Отмена:", out)
 
+    def test_neutral_wait_confirm_includes_short_reason_line(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "BTC/USDT",
+            "price": 100.0,
+            "mode": "neutral",
+            "side": "long",
+            "entry_mode": "wait_confirm",
+            "why_asset": "test",
+            "multi_tf_view": {"m5": "—", "m15": "—", "h1": "—", "h4": "—", "d1": "—"},
+            "news_context": [],
+            "entries": {"neutral": {"enabled": True}},
+            "entry_price_neutral": 99.5,
+            "sl_by_mode": {"neutral": 98.0},
+            "tp_by_mode": {"neutral": {"tvh1": 102.0, "tvh2": 104.0}},
+            "rr_by_mode": {"neutral": 1.2},
+            "exit_plan_by_mode": {"neutral": "plan"},
+            "warnings": ["neutral_wait_confirm_due_to_rr"],
+        }
+
+        out = _render_text(d)
+        self.assertIn("⏳ Neutral ждёт подтверждение: нужен глубже вход/лучше RR.", out)
+
 
 if __name__ == "__main__":
     unittest.main()
-

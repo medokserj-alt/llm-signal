@@ -450,6 +450,10 @@ def main():
                 lines.append(
                     "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️"
                 )
+            for w in _iter_warnings(data):
+                if "Низкая ликвидность (ночное окно)" in w:
+                    lines.append(w)
+                    break
 
             # wait_confirm explanation (any mode): trader-oriented actionable checklist.
             em_raw = (data.get("entry_mode") or "").strip().lower()
@@ -460,6 +464,10 @@ def main():
                     else ""
                 )
                 lines.append("⏳ Вход только после подтверждения:")
+                if mode == "neutral" and (
+                    "neutral_wait_confirm_due_to_rr" in wl or "neutral_wait_confirm_due_to_volatility" in wl
+                ):
+                    lines.append("⏳ Neutral ждёт подтверждение: нужен глубже вход/лучше RR.")
                 if "aggressive_direction_conflict_with_ema_wait_confirm" in wl:
                     lines.append("⚠️ Направление против EMA-структуры — подтверждение обязательно.")
 

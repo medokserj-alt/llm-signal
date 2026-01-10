@@ -12,7 +12,7 @@ class TestNeutralTooCloseNoTrade(unittest.TestCase):
             "price": 15.00,
             "side": "long",
             "entries": {"neutral": {"enabled": True}, "aggressive": {"enabled": True}},
-            # Even after volatility-aware offset (1% for alts), this will stay within 20 ticks (tick=0.01).
+            # Even after volatility-aware offset (0.8% for alts), this will stay within 20 ticks (tick=0.01).
             "entry_price_neutral": 14.99,
             "entry_price_aggressive": 14.95,
             # Ensure the shifted target remains valid and above SL.
@@ -25,7 +25,7 @@ class TestNeutralTooCloseNoTrade(unittest.TestCase):
         out = get_signal_json.validate_active_mode_setup(d)
         self.assertFalse(bool(out.get("no_trade")))
         self.assertIn("neutral_entry_shifted_by_volatility", out.get("warnings") or [])
-        self.assertAlmostEqual(float(out.get("entry_price_neutral")), 14.85, places=6)
+        self.assertAlmostEqual(float(out.get("entry_price_neutral")), 14.88, places=6)
 
 
 if __name__ == "__main__":

@@ -26,11 +26,11 @@ class TestNeutralNearMarketAutoSplit(unittest.TestCase):
         self.assertEqual(out.get("mode"), "neutral")
 
         self.assertFalse(bool(out.get("no_trade")))
-        self.assertAlmostEqual(float(out.get("neutral_offset_pct")), 1.0, places=6)
+        self.assertAlmostEqual(float(out.get("neutral_offset_pct")), 0.8, places=6)
 
         px = float(out["price"])
         n_entry = float(out["entry_price_neutral"])
-        self.assertLessEqual(n_entry, px - px * 0.010)
+        self.assertLessEqual(n_entry, px - px * 0.008)
 
 
 if __name__ == "__main__":

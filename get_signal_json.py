@@ -38,10 +38,10 @@ NEUTRAL_MIN_DIST_PCT_ALT = 0.35  # others
 
 # ---- Neutral volatility-aware spacing (adaptive calmer entry) ----
 # Applies only to entry_price_neutral placement; does not change EMA/provenance, direction, SL/TP/RR math, or gates.
-NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR = 0.008  # 0.80%
-NEUTRAL_VOL_MIN_OFFSET_PCT_ALT = 0.010  # 1.00%
-NEUTRAL_VOL_K_ATR_MAJOR = 1.2
-NEUTRAL_VOL_K_ATR_ALT = 1.3
+NEUTRAL_VOL_MIN_OFFSET_PCT_MAJOR = 0.006  # 0.60%
+NEUTRAL_VOL_MIN_OFFSET_PCT_ALT = 0.008  # 0.80%
+NEUTRAL_VOL_K_ATR_MAJOR = 1.0
+NEUTRAL_VOL_K_ATR_ALT = 1.1
 
 # When neutral mode exposes an early aggressive entry option, keep neutral meaningfully farther.
 # Soft shaping only: does not hard-limit the model or change EMA/no_trade/direction logic.
@@ -870,6 +870,10 @@ def _in_danger_time_window_msk(mins: int) -> bool:
     )
     return any(start <= mins < end for start, end in windows)
 
+def _in_night_low_liquidity_window_msk(mins: int) -> bool:
+    # Night / low-liquidity window in MSK: 00:00–07:00 (end exclusive).
+    return 0 <= int(mins) < 7 * 60
+
 
 def _tw_clear_artifacts(d: dict) -> None:
     reasons = d.get("no_trade_reasons")
@@ -1039,28 +1043,9 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
     d.setdefault("no_trade_hint", "")
 
     if mode == "aggressive":
-        _tw_append_unique(d, "warnings", "time_window_low_liquidity")
-        _tw_append_unique(d, "warnings", "time_window_caution_aggressive")
-
-        # Never “enter now” inside time_window in aggressive mode.
+        # Aggressive must NOT be hard-blocked solely due to time windows / low-liquidity timing.
+        # Tactic: force confirmation (wait_confirm) but keep trading allowed unless other core blockers apply.
         d["entry_mode"] = "wait_confirm"
-
-        warnings = d.get("warnings")
-        stress_news = _tw_news_stress(d.get("news_context"))
-        stress_vol = _tw_volatility_stress(warnings)
-        stress_struct = _tw_structure_stress(d)
-        stress_risk_off = _tw_risk_off_stress(d)
-        stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
-
-        flush_extreme = _tw_has_any_reason(d, "flush_knife_aggressive_extreme") or bool(d.get("flush_knife_aggressive_extreme"))
-        invalid_setup = _tw_has_any_reason(d, "invalid_mode_setup")
-
-        extreme_block = bool(stress or flush_extreme or invalid_setup)
-        if extreme_block:
-            d["no_trade"] = True
-            _tw_append_unique(d, "no_trade_reasons", "time_window_extreme_block")
-            if not (d.get("no_trade_hint") or "").strip():
-                d["no_trade_hint"] = "time_window_extreme_block"
         return
 
     warnings = d.get("warnings")
@@ -1085,6 +1070,48 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
     _tw_append_unique(d, "no_trade_reasons", "time_window")
     if not (d.get("no_trade_hint") or "").strip():
         d["no_trade_hint"] = "time_window"
+
+
+_AGGRESSIVE_NIGHT_RISK_TEXT = (
+    "⚠️ Низкая ликвидность (ночное окно): повышенный риск шпилек и ложных движений"
+)
+
+
+def apply_aggressive_night_low_liquidity_policy(d: dict) -> None:
+    """
+    Aggressive mode special-case for 00:00–07:00 MSK:
+    - trading is allowed (no hard no_trade by time-of-day);
+    - explicit risk warning is required;
+    - entries must be confirmation-based (wait_confirm), especially for impulse/countertrend.
+    """
+    mode = normalize_mode(d.get("mode"))
+    if mode != "aggressive":
+        return
+    if bool(d.get("no_trade")):
+        return
+
+    mins = _msk_minutes_from_time_str(d.get("time_msk"))
+    if mins is None:
+        mins = _msk_minutes_from_time_str(current_msk())
+    if mins is None or not _in_night_low_liquidity_window_msk(mins):
+        return
+
+    d.setdefault("warnings", [])
+    if isinstance(d.get("warnings"), list):
+        _append_unique_str(d, "warnings", _AGGRESSIVE_NIGHT_RISK_TEXT)
+
+    # At night we avoid instant/market entries; confirmation is mandatory.
+    d["entry_mode"] = "wait_confirm"
+
+    warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+    wl = " ".join(str(w or "").strip().lower() for w in warnings)
+    if "impulse_no_exhale" in wl or "countertrend_aggressive" in wl:
+        # Ensure the signal remains actionable: prefer explicit confirmation checklist.
+        if not (d.get("confirmation_rules") or ""):
+            d["confirmation_rules"] = (
+                "Ночное окно: вход только после подтверждения (1–2 свечи удержания), "
+                "без нового экстремума и с нормализацией объёма."
+            )
 
 
 def _normalize_side(d: dict) -> None:
@@ -3009,6 +3036,14 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                 d["entry_mode"] = "wait_confirm"
             if d.get("confidence") not in ("Low", "Medium", "High"):
                 d["confidence"] = "Low"
+        elif active_mode == "neutral":
+            # Neutral: low RR is a quality issue, not a hard blocker.
+            # Tactic: wait for deeper entry / better RR; do not no_trade on RR alone.
+            d.setdefault("warnings", [])
+            if isinstance(d.get("warnings"), list) and "neutral_wait_confirm_due_to_rr" not in d["warnings"]:
+                d["warnings"].append("neutral_wait_confirm_due_to_rr")
+            if (d.get("entry_mode") or "").strip().lower() != "wait_confirm":
+                d["entry_mode"] = "wait_confirm"
         else:
             d["no_trade"] = True
             reasons = d.get("no_trade_reasons")
@@ -3249,6 +3284,13 @@ def validate_active_mode_setup(d: dict) -> dict:
                     "Контртренд без подтверждения: дождаться разворота EMA-fan на M15 / "
                     "смешанного состояния на H1 / закрепления цены относительно EMA20(H1)."
                 )
+
+        # Night / low-liquidity window (00:00–07:00 MSK): never hard-block by time,
+        # but require explicit risk warning + confirmation-based entry.
+        try:
+            apply_aggressive_night_low_liquidity_policy(d)
+        except Exception:
+            pass
 
     # ---- DAY/MID soft-bias override note (intraday facts can dominate) ----
     try:
@@ -3670,48 +3712,30 @@ def validate_active_mode_setup(d: dict) -> dict:
                             invalid = True
 
                     if invalid:
-                        d["no_trade"] = True
-                        reasons = d.setdefault("no_trade_reasons", [])
-                        if isinstance(reasons, list) and "neutral_no_good_entry_volatility" not in reasons:
-                            reasons.append("neutral_no_good_entry_volatility")
-                        if not (d.get("no_trade_hint") or "").strip():
-                            d["no_trade_hint"] = "neutral_no_good_entry_volatility"
+                        # Neutral: volatility-based deep offset could not be placed safely.
+                        # This is a quality issue → pause (wait_confirm), but do not no_trade unless hard gates block later.
+                        if final_mode == "neutral":
+                            d.setdefault("warnings", [])
+                            if (
+                                isinstance(d.get("warnings"), list)
+                                and "neutral_wait_confirm_due_to_volatility" not in d["warnings"]
+                            ):
+                                d["warnings"].append("neutral_wait_confirm_due_to_volatility")
+                            if (d.get("entry_mode") or "").strip().lower() != "wait_confirm":
+                                d["entry_mode"] = "wait_confirm"
 
-                        # Strip neutral trade levels from output: neutral cannot be safely deep.
-                        d.pop("entry_price_neutral", None)
-                        try:
-                            sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else None
-                            if isinstance(sl_by_mode, dict):
-                                sl_by_mode.pop("neutral", None)
-                            tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else None
-                            if isinstance(tp_by_mode, dict):
-                                tp_by_mode.pop("neutral", None)
-                            rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else None
-                            if isinstance(rr_by_mode, dict):
-                                rr_by_mode.pop("neutral", None)
-                            ep_by_mode = (
-                                d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else None
-                            )
-                            if isinstance(ep_by_mode, dict):
-                                ep_by_mode.pop("neutral", None)
-                        except Exception:
-                            pass
-                        for k in ("sl", "tp1", "tp2", "tp3"):
-                            d.pop(k, None)
-
-                        # Suggest aggressive (only if it already exists as an entry idea).
-                        existing = d.get("aggressive_option")
-                        a_entry = None
-                        if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
-                            a_entry = _to_float(existing.get("entry_price"))
-                        else:
-                            a_entry = _to_float(d.get("entry_price_aggressive"))
-                        if a_entry is not None:
-                            d["aggressive_option"] = {
-                                "entry_price": float(a_entry),
-                                "note": "Neutral не удалось поставить безопасный глубокий вход; если хотите торговать — рассмотрите aggressive.",
-                            }
-                        return d
+                            # Keep aggressive as an optional early alternative (if already present).
+                            existing = d.get("aggressive_option")
+                            a_entry = None
+                            if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
+                                a_entry = _to_float(existing.get("entry_price"))
+                            else:
+                                a_entry = _to_float(d.get("entry_price_aggressive"))
+                            if a_entry is not None:
+                                d["aggressive_option"] = {
+                                    "entry_price": float(a_entry),
+                                    "note": "Neutral ждёт подтверждение: по волатильности не удалось выставить безопасный глубокий вход; aggressive возможен раньше (повышенный риск).",
+                                }
                     else:
                         d["entry_price_neutral"] = float(cand)
 
@@ -3848,46 +3872,29 @@ def validate_active_mode_setup(d: dict) -> dict:
                             unsafe = True
 
                     if unsafe:
-                        d["no_trade"] = True
-                        reasons = d.setdefault("no_trade_reasons", [])
-                        if isinstance(reasons, list) and "neutral_no_good_entry_volatility" not in reasons:
-                            reasons.append("neutral_no_good_entry_volatility")
-                        if not (d.get("no_trade_hint") or "").strip():
-                            d["no_trade_hint"] = "neutral_no_good_entry_volatility"
+                        # Neutral: could not safely push away from near-market using volatility offset.
+                        # Treat as wait_confirm, keep the idea alive, let hard gates decide no_trade later.
+                        if final_mode == "neutral":
+                            d.setdefault("warnings", [])
+                            if (
+                                isinstance(d.get("warnings"), list)
+                                and "neutral_wait_confirm_due_to_volatility" not in d["warnings"]
+                            ):
+                                d["warnings"].append("neutral_wait_confirm_due_to_volatility")
+                            if (d.get("entry_mode") or "").strip().lower() != "wait_confirm":
+                                d["entry_mode"] = "wait_confirm"
 
-                        # Strip neutral trade levels from output: neutral cannot be safely deep.
-                        d.pop("entry_price_neutral", None)
-                        try:
-                            if isinstance(sl_by_mode, dict):
-                                sl_by_mode.pop("neutral", None)
-                            tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else None
-                            if isinstance(tp_by_mode, dict):
-                                tp_by_mode.pop("neutral", None)
-                            rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else None
-                            if isinstance(rr_by_mode, dict):
-                                rr_by_mode.pop("neutral", None)
-                            ep_by_mode = (
-                                d.get("exit_plan_by_mode") if isinstance(d.get("exit_plan_by_mode"), dict) else None
-                            )
-                            if isinstance(ep_by_mode, dict):
-                                ep_by_mode.pop("neutral", None)
-                        except Exception:
-                            pass
-                        for k in ("sl", "tp1", "tp2", "tp3"):
-                            d.pop(k, None)
-
-                        existing = d.get("aggressive_option")
-                        a_entry = None
-                        if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
-                            a_entry = _to_float(existing.get("entry_price"))
-                        else:
-                            a_entry = _to_float(d.get("entry_price_aggressive"))
-                        if a_entry is not None:
-                            d["aggressive_option"] = {
-                                "entry_price": float(a_entry),
-                                "note": "Neutral не удалось поставить безопасный глубокий вход; если хотите торговать — рассмотрите aggressive.",
-                            }
-                        return d
+                            existing = d.get("aggressive_option")
+                            a_entry = None
+                            if isinstance(existing, dict) and _to_float(existing.get("entry_price")) is not None:
+                                a_entry = _to_float(existing.get("entry_price"))
+                            else:
+                                a_entry = _to_float(d.get("entry_price_aggressive"))
+                            if a_entry is not None:
+                                d["aggressive_option"] = {
+                                    "entry_price": float(a_entry),
+                                    "note": "Neutral ждёт подтверждение: по волатильности не удалось безопасно отодвинуть вход от текущей; aggressive возможен раньше (повышенный риск).",
+                                }
 
                     d["entry_price_neutral"] = float(target)
                     warnings = d.setdefault("warnings", [])

@@ -49,24 +49,68 @@ class TestAggressiveTradeOriented(unittest.TestCase):
         get_signal_json.apply_time_window_policy_variant_b(d)
         self.assertFalse(bool(d.get("no_trade")))
         self.assertEqual(d.get("entry_mode"), "wait_confirm")
-        self.assertIn("time_window_caution_aggressive", d.get("warnings") or [])
 
-    def test_aggressive_time_window_extreme_blocks_on_risk_off(self) -> None:
+    def test_aggressive_risk_off_blocks_even_at_night(self) -> None:
         d = {
+            "no_trade": False,
             "mode": "aggressive",
             "time_msk": "01.01.2025, 00:30",
-            "no_trade": False,
-            "no_trade_reasons": [],
-            "no_trade_hint": "",
             "warnings": [],
-            "entry_mode": "now",
+            "entry_mode": "limit",
             "risk_off": True,
+            "symbol": "BTC/USDT",
+            "price": 100.0,
+            "side": "long",
+            "entries": {
+                "aggressive": {"enabled": True, "range": {"min": 99.9, "max": 100.1}},
+                "neutral": {"enabled": True, "range": {"min": 99.0, "max": 99.5}},
+                "conservative": {"enabled": True, "range": {"min": 98.0, "max": 98.5}},
+            },
+            "entry_range": {"min": 99.9, "max": 100.1},
+            "entry_price_aggressive": 100.0,
+            "sl_by_mode": {"aggressive": 99.0},
+            "tp_by_mode": {"aggressive": {"tvh1": 101.0, "tvh2": 102.0}},
+            "rr_by_mode": {"aggressive": 2.0},
+            "exit_plan_by_mode": {"aggressive": "plan"},
+            "ema_fan_m15_state": "bull",
+            "ema_fan_h1_state": "bull",
         }
-        get_signal_json.apply_time_window_policy_variant_b(d)
-        self.assertTrue(bool(d.get("no_trade")))
-        self.assertIn("time_window_extreme_block", d.get("no_trade_reasons") or [])
-        self.assertEqual(d.get("entry_mode"), "wait_confirm")
-        self.assertIn("time_window_caution_aggressive", d.get("warnings") or [])
+
+        out = get_signal_json.validate_active_mode_setup(d)
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("risk_off", out.get("no_trade_reasons") or [])
+
+    def test_aggressive_night_window_adds_risk_warning_and_wait_confirm(self) -> None:
+        d = {
+            "no_trade": False,
+            "mode": "aggressive",
+            "time_msk": "01.01.2025, 03:30",
+            "warnings": [],
+            "entry_mode": "limit",
+            "symbol": "BTC/USDT",
+            "price": 100.0,
+            "side": "long",
+            "entries": {
+                "aggressive": {"enabled": True, "range": {"min": 99.9, "max": 100.1}},
+                "neutral": {"enabled": True, "range": {"min": 99.0, "max": 99.5}},
+                "conservative": {"enabled": True, "range": {"min": 98.0, "max": 98.5}},
+            },
+            "entry_range": {"min": 99.9, "max": 100.1},
+            "entry_price_aggressive": 100.0,
+            "sl_by_mode": {"aggressive": 99.0},
+            "tp_by_mode": {"aggressive": {"tvh1": 101.0, "tvh2": 102.0}},
+            "rr_by_mode": {"aggressive": 2.0},
+            "exit_plan_by_mode": {"aggressive": "plan"},
+            "ema_fan_m15_state": "bull",
+            "ema_fan_h1_state": "bull",
+        }
+
+        out = get_signal_json.validate_active_mode_setup(d)
+        self.assertFalse(bool(out.get("no_trade")))
+        self.assertEqual(out.get("entry_mode"), "wait_confirm")
+        self.assertTrue(
+            any("Низкая ликвидность (ночное окно)" in str(w) for w in (out.get("warnings") or []))
+        )
 
     def test_aggressive_countertrend_without_evidence_waits_confirmation(self) -> None:
         d = {

@@ -398,6 +398,24 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
             except Exception:
                 return None
 
+        entry_price = None
+        try:
+            entry_price = _try_float(d.get(f"entry_price_{mode}"))
+        except Exception:
+            entry_price = None
+        if entry_price is None:
+            low = _try_float(entry_range.get("min"))
+            high = _try_float(entry_range.get("max"))
+            if low is not None and high is not None:
+                entry_price = (low + high) / 2.0
+        if entry_price is None:
+            ez = d.get("entry_zone")
+            if isinstance(ez, (list, tuple)) and len(ez) == 2:
+                low = _try_float(ez[0])
+                high = _try_float(ez[1])
+                if low is not None and high is not None:
+                    entry_price = (low + high) / 2.0
+
         sl_val = None
         sl_by_mode = d.get("sl_by_mode")
         if isinstance(sl_by_mode, dict):
@@ -438,6 +456,8 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         "published_at": str(published_at),
         "channel_id": channel_id,
     }
+    if entry_price is not None:
+        out["entry_price"] = float(entry_price)
     if meta is not None:
         out["meta"] = meta
     return out

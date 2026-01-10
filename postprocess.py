@@ -374,25 +374,8 @@ def apply_time_window_policy_variant_b(d: dict) -> None:
     d.setdefault("no_trade_hint", "")
 
     if mode == "aggressive":
-        _tw_append_unique(d, "warnings", "time_window_low_liquidity")
-        _tw_append_unique(d, "warnings", "time_window_caution_aggressive")
+        # Aggressive must not be hard-blocked by time windows; use confirmation tactics only.
         d["entry_mode"] = "wait_confirm"
-
-        warnings = d.get("warnings")
-        stress_news = _tw_news_stress(d.get("news_context"))
-        stress_vol = _tw_volatility_stress(warnings)
-        stress_struct = _tw_structure_stress(d)
-        stress_risk_off = _tw_risk_off_stress(d)
-        stress = bool(stress_news or stress_vol or stress_struct or stress_risk_off)
-
-        flush_extreme = _tw_has_any_reason(d, "flush_knife_aggressive_extreme") or bool(d.get("flush_knife_aggressive_extreme"))
-        invalid_setup = _tw_has_any_reason(d, "invalid_mode_setup")
-
-        if bool(stress or flush_extreme or invalid_setup):
-            d["no_trade"] = True
-            _tw_append_unique(d, "no_trade_reasons", "time_window_extreme_block")
-            if not (d.get("no_trade_hint") or "").strip():
-                d["no_trade_hint"] = "time_window_extreme_block"
         return
 
     _tw_append_unique(d, "warnings", "time_window_low_liquidity")

@@ -60,11 +60,12 @@ class TestNeutralSemanticShaping(unittest.TestCase):
         dist_pct = abs(entry_mid - price) / price * 100.0
         self.assertGreaterEqual(dist_pct, get_signal_json.NEUTRAL_MIN_DIST_PCT_MAJOR)
 
-        # With stricter neutral volatility spacing, if the envelope cannot accommodate a safe deep entry,
-        # neutral must no_trade and suggest aggressive instead of issuing a near-aggressive neutral.
-        self.assertTrue(bool(out.get("no_trade")))
-        self.assertIn("neutral_no_good_entry_volatility", out.get("no_trade_reasons") or [])
-        self.assertIsNone(out.get("entry_price_neutral"))
+        # If a safe deep volatility offset cannot be placed inside the envelope,
+        # neutral should pause (wait_confirm) instead of disappearing.
+        self.assertFalse(bool(out.get("no_trade")))
+        self.assertEqual(str(out.get("entry_mode") or "").strip().lower(), "wait_confirm")
+        self.assertIn("neutral_wait_confirm_due_to_volatility", out.get("warnings") or [])
+        self.assertIsNotNone(out.get("entry_price_neutral"))
         aggressive_option = out.get("aggressive_option")
         self.assertIsInstance(aggressive_option, dict)
         self.assertIsNotNone(aggressive_option.get("entry_price"))
@@ -96,9 +97,10 @@ class TestNeutralSemanticShaping(unittest.TestCase):
 
         out = get_signal_json.validate_active_mode_setup(d)
         self.assertEqual(out.get("mode"), "neutral")
-        self.assertTrue(bool(out.get("no_trade")))
-        self.assertIn("neutral_no_good_entry_volatility", out.get("no_trade_reasons") or [])
-        self.assertIsNone(out.get("entry_price_neutral"))
+        self.assertFalse(bool(out.get("no_trade")))
+        self.assertEqual(str(out.get("entry_mode") or "").strip().lower(), "wait_confirm")
+        self.assertIn("neutral_wait_confirm_due_to_volatility", out.get("warnings") or [])
+        self.assertIsNotNone(out.get("entry_price_neutral"))
         aggressive_option = out.get("aggressive_option")
         self.assertIsInstance(aggressive_option, dict)
         self.assertIsNotNone(aggressive_option.get("entry_price"))
