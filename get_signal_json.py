@@ -3487,6 +3487,29 @@ def validate_active_mode_setup(d: dict) -> dict:
         er_mm = _range_to_minmax(er)
         env_mm = _range_to_minmax(neu_range_env)
 
+        # If the neutral profile provides an entry range, neutral must anchor at the conservative edge:
+        #   LONG -> range.min, SHORT -> range.max
+        # This keeps neutral meaningfully deeper than near-market / aggressive "enter now" ideas.
+        try:
+            if side in ("long", "short") and env_mm is not None:
+                lo, hi = env_mm
+                base_entry = float(lo) if side == "long" else float(hi)
+                base_q = _round_price_dir(
+                    base_entry,
+                    "down" if side == "long" else "up",
+                    symbol=d.get("symbol"),
+                )
+                if base_q is None:
+                    base_q = base_entry
+                base_q = float(base_q)
+                if base_q < float(lo):
+                    base_q = float(lo)
+                if base_q > float(hi):
+                    base_q = float(hi)
+                d["entry_price_neutral"] = float(base_q)
+        except Exception:
+            pass
+
         neutral_too_close = False
         if price_val is not None and price_val > 0 and er_mm is not None:
             er_mid = (er_mm[0] + er_mm[1]) / 2.0
@@ -3595,9 +3618,20 @@ def validate_active_mode_setup(d: dict) -> dict:
                     entries["neutral"] = neu_bucket
                     d["entries"] = entries
 
-                neu_mid = _mid_from_range(new_range, symbol=symbol)
-                if neu_mid is not None:
-                    d["entry_price_neutral"] = neu_mid
+                # Neutral entry must be at the conservative edge (not the mid).
+                try:
+                    edge = float(new_range["min"]) if side == "long" else float(new_range["max"])
+                except Exception:
+                    edge = None
+                if edge is not None:
+                    edge_q = _round_price_dir(
+                        float(edge),
+                        "down" if side == "long" else "up",
+                        symbol=symbol,
+                    )
+                    if edge_q is None:
+                        edge_q = float(edge)
+                    d["entry_price_neutral"] = float(edge_q)
 
                 d["neutral_adjusted"] = True
                 d["neutral_adjust_reason"] = "neutral_too_close"
@@ -3680,6 +3714,9 @@ def validate_active_mode_setup(d: dict) -> dict:
 
                     sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
                     sl_neutral = _to_float(sl_by_mode.get("neutral"))
+                    tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+                    tp_neutral = tp_by_mode.get("neutral") if isinstance(tp_by_mode.get("neutral"), dict) else {}
+                    tp1_neutral = _to_float(tp_neutral.get("tvh1"))
 
                     def _range_to_minmax(r: dict | None) -> tuple[float, float] | None:
                         if not isinstance(r, dict):
@@ -3710,6 +3747,12 @@ def validate_active_mode_setup(d: dict) -> dict:
                             invalid = True
                         if side == "short" and float(cand) >= float(sl_neutral):
                             invalid = True
+                        # Do not invert the setup: entry must remain on the correct side of TP1 when present.
+                        if tp1_neutral is not None and math.isfinite(float(tp1_neutral)):
+                            if side == "long" and float(cand) >= float(tp1_neutral):
+                                invalid = True
+                            if side == "short" and float(cand) <= float(tp1_neutral):
+                                invalid = True
 
                     if invalid:
                         # Neutral: volatility-based deep offset could not be placed safely.
@@ -3780,6 +3823,9 @@ def validate_active_mode_setup(d: dict) -> dict:
 
                     sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
                     sl_neutral = _to_float(sl_by_mode.get("neutral"))
+                    tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+                    tp_neutral = tp_by_mode.get("neutral") if isinstance(tp_by_mode.get("neutral"), dict) else {}
+                    tp1_neutral = _to_float(tp_neutral.get("tvh1"))
 
                     def _candidate_ok(px: float) -> bool:
                         if not (math.isfinite(px) and px > 0):
@@ -3870,6 +3916,12 @@ def validate_active_mode_setup(d: dict) -> dict:
                             unsafe = True
                         if side == "short" and not (float(target) < float(sl_neutral)):
                             unsafe = True
+                        # Do not invert the setup: entry must remain on the correct side of TP1 when present.
+                        if tp1_neutral is not None and math.isfinite(float(tp1_neutral)):
+                            if side == "long" and float(target) >= float(tp1_neutral):
+                                unsafe = True
+                            if side == "short" and float(target) <= float(tp1_neutral):
+                                unsafe = True
 
                     if unsafe:
                         # Neutral: could not safely push away from near-market using volatility offset.
@@ -3896,10 +3948,11 @@ def validate_active_mode_setup(d: dict) -> dict:
                                     "note": "Neutral ждёт подтверждение: по волатильности не удалось безопасно отодвинуть вход от текущей; aggressive возможен раньше (повышенный риск).",
                                 }
 
-                    d["entry_price_neutral"] = float(target)
-                    warnings = d.setdefault("warnings", [])
-                    if isinstance(warnings, list) and "neutral_entry_shifted_by_volatility" not in warnings:
-                        warnings.append("neutral_entry_shifted_by_volatility")
+                    if not unsafe:
+                        d["entry_price_neutral"] = float(target)
+                        warnings = d.setdefault("warnings", [])
+                        if isinstance(warnings, list) and "neutral_entry_shifted_by_volatility" not in warnings:
+                            warnings.append("neutral_entry_shifted_by_volatility")
         except Exception:
             pass
 
