@@ -570,12 +570,8 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         out["meta"] = meta
         if meta.get("entry_type") == "wait_confirm":
             max_wait_minutes = _extract_max_wait_minutes(d, default=90)
-            confirm_text = _extract_confirm_text(d)
             out["meta"]["max_wait_minutes"] = int(max_wait_minutes)
             out["meta"]["confirm_timeout_minutes"] = int(max_wait_minutes)
-            out["meta"]["confirmation_rules_text"] = _extract_confirmation_rules_text(d, max_len=1500) or ""
-            if confirm_text:
-                out["meta"]["confirm_text"] = confirm_text
             out["meta"]["confirm_rule_v1"] = _build_confirm_rule_v1(d, max_wait_minutes=max_wait_minutes)
     return out
 
