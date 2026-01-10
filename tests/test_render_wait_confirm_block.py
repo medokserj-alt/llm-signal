@@ -19,7 +19,7 @@ def _render_text(data: dict) -> str:
 
 
 class TestRenderWaitConfirmBlock(unittest.TestCase):
-    def test_wait_confirm_renders_actionable_confirmation_block(self) -> None:
+    def test_wait_confirm_renders_simple_block_and_mentions_aia(self) -> None:
         d = {
             "time_msk": "01.01.2025, 00:00",
             "symbol": "BTC/USDT",
@@ -40,11 +40,14 @@ class TestRenderWaitConfirmBlock(unittest.TestCase):
         }
 
         out = _render_text(d)
-        self.assertIn("⏳ Вход только после подтверждения:", out)
-        self.assertIn("⚠️ Направление против EMA-структуры — подтверждение обязательно.", out)
-        self.assertIn("Отмена:", out)
+        self.assertIn("⏳ Вход: wait_confirm", out)
+        self.assertIn("ℹ️ Подтверждение/снятие сценария — через AIA (если подключён).", out)
+        self.assertNotIn("⏳ Вход только после подтверждения:", out)
+        self.assertNotIn("Отмена:", out)
+        self.assertNotIn("- цена удерживается", out)
+        self.assertNotIn("- пробой", out)
 
-    def test_neutral_wait_confirm_includes_short_reason_line(self) -> None:
+    def test_neutral_wait_confirm_renders_simple_block(self) -> None:
         d = {
             "time_msk": "01.01.2025, 00:00",
             "symbol": "BTC/USDT",
@@ -65,7 +68,8 @@ class TestRenderWaitConfirmBlock(unittest.TestCase):
         }
 
         out = _render_text(d)
-        self.assertIn("⏳ Neutral ждёт подтверждение: нужен глубже вход/лучше RR.", out)
+        self.assertIn("⏳ Вход: wait_confirm", out)
+        self.assertIn("ℹ️ Подтверждение/снятие сценария — через AIA (если подключён).", out)
 
 
 if __name__ == "__main__":
