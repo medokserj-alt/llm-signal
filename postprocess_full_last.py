@@ -6,6 +6,7 @@ from pathlib import Path
 from postprocess import process as pp_process
 from get_signal_json import (
     overwrite_ema20_from_provenance,
+    apply_ema_blocks_and_derivatives,
     apply_ema_relation_flags,
     enforce_ema_narrative_consistency,
     apply_ema_exhale_filter,
@@ -13,6 +14,7 @@ from get_signal_json import (
     validate_or_fallback_tvh_by_mode,
     validate_active_mode_setup,
     _round_price,
+    sync_impulse_proxy,
 )
 from no_trade_explain import ensure_decision_path
 
@@ -183,6 +185,12 @@ def main():
     except Exception:
         pass
 
+    # 1a) EMA blocks + EMA fan states must be computed (never null / never "unknown").
+    try:
+        apply_ema_blocks_and_derivatives(data, (data.get("symbol") or "").strip() or None)
+    except Exception:
+        pass
+
     # 1b) ema_guard текст должен соответствовать рассчитанным EMA/price (без изменения остального текста)
     try:
         _apply_ema_guard_text_consistent(data)
@@ -224,6 +232,10 @@ def main():
     validate_active_mode_setup(data)
     normalize_no_trade(data)
     ensure_decision_path(data)
+    try:
+        sync_impulse_proxy(data)
+    except Exception:
+        pass
 
     # 4) сохраняем обратно
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

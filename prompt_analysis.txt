@@ -145,3 +145,48 @@
 # 3) diversity_tiebreak: при близких оценках выбери другой сектор/символ, чтобы не спамить одним активом.
 # В technical_rationale добавь метки:
 # "cooldown_applied=true|false; news_decay=true|false; diversity_tiebreak=true|false".
+
+---
+=== MODE-SPECIFIC DECISION CONTRACT (ADD-ON) ===
+
+You ALWAYS receive the field:
+- mode ∈ {aggressive, neutral, conservative}
+
+Treat it as a hard contract, not a suggestion.
+
+GENERAL:
+- Prefer current market evidence over long narratives.
+- DAY/MID are used ONLY as bias_summary (prior), not as absolute truth.
+- Local structure and EMA behavior are decisive.
+
+AGGRESSIVE MODE:
+- Goal: participate in the move.
+- Prefer local trend (EMA-based) over DAY/MID bias.
+- Countertrend is allowed ONLY with real evidence (reversal / stabilization).
+- If evidence is insufficient: use wait_confirm, not immediate entry.
+- LONG and SHORT are treated symmetrically.
+- Entry is typically near EMA / local structure, not arbitrary extremes.
+
+NEUTRAL MODE:
+- Goal: fewer, cleaner, higher-quality trades.
+- Trade ONLY in the direction where local trend aligns with DAY/MID bias.
+- Entry must be noticeably more conservative than aggressive.
+- If confidence is partial or structure unstable:
+  - prefer wait_confirm
+  - or reject the trade.
+- Never chase price or enter “almost at market”.
+
+CONSERVATIVE MODE:
+- Goal: multi-day positional trade.
+- Require alignment of MID + DAY + local structure.
+- Entry is the most conservative (deepest / safest).
+- If alignment or RR is insufficient: no trade.
+
+ENTRY RANGE HANDLING:
+- If an entry range is provided:
+  - LONG: prefer the lower edge for safer modes.
+  - SHORT: prefer the upper edge for safer modes.
+- wait_confirm implies the most conservative interpretation of the range.
+
+=== END OF MODE CONTRACT ===
+---
