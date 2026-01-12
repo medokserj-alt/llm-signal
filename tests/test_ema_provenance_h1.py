@@ -10,11 +10,20 @@ import postprocess_full_last
 class TestEMAProvenanceH1(unittest.TestCase):
     def test_last_json_has_h1_provenance_fields(self) -> None:
         calls: list[tuple[str, str]] = []
-        closes_15m = [float(i) for i in range(1, 31)]
-        closes_1h = [float(i) for i in range(101, 131)]
+        closes_15m = [float(i) for i in range(1, 221)]  # >=200 candles required for EMA fan computation
+        closes_1h = [float(i) for i in range(1001, 1221)]
 
         old_fetch = get_signal_json._fetch_closes_from_market
         old_base = postprocess_full_last.BASE
+
+        def _ohlcv_tail_from_closes(closes: list[float]) -> list[list[float]]:
+            base_ts = 1700000000000
+            out: list[list[float]] = []
+            tail = closes[-200:]
+            for i, c in enumerate(tail):
+                ts = base_ts + i * 60_000
+                out.append([ts, c - 1.0, c + 1.0, c - 2.0, c, 123.0])
+            return out
 
         def fake_fetch(market: str, timeframe: str, *, symbol: str, limit: int, min_len: int):  # type: ignore[no-untyped-def]
             calls.append((market, timeframe))
@@ -31,12 +40,14 @@ class TestEMAProvenanceH1(unittest.TestCase):
                     "open": 29.0,
                     "high": 30.0,
                     "low": 28.0,
-                    "close": 30.0,
+                    "close": float(closes[-1]),
                     "volume": 123.0,
                 },
-                "ohlcv_count": 30,
+                "ohlcv_count": len(closes),
                 "fetched_at": 0.0,
+                "ohlcv_tail": _ohlcv_tail_from_closes(closes),
                 "closes": closes,
+                "closes_tail": closes[-200:],
             }
 
         get_signal_json._fetch_closes_from_market = fake_fetch  # type: ignore[assignment]
@@ -73,9 +84,13 @@ class TestEMAProvenanceH1(unittest.TestCase):
                     ema = float(v) * k + ema * (1.0 - k)
                 self.assertAlmostEqual(float(out.get("ema20_h1")), round(ema, 6), places=6)
                 self.assertEqual(out.get("timeframe_h1"), "1h")
-                self.assertEqual(out.get("candles_h1_count"), 30)
+                self.assertEqual(out.get("candles_h1_count"), len(closes_1h))
                 self.assertIsInstance(out.get("last_candle_h1"), dict)
                 self.assertIsNotNone(out.get("last_candle_h1", {}).get("close"))
+                self.assertIsInstance(out.get("closes_h1_tail"), list)
+                self.assertEqual(len(out.get("closes_h1_tail") or []), 200)
+                self.assertIsInstance(out.get("ohlcv_h1_tail"), list)
+                self.assertEqual(len(out.get("ohlcv_h1_tail") or []), 200)
 
                 # Ensure we did fetch both timeframes and preferred bybit first.
                 self.assertTrue(any(tf == "1h" for (_m, tf) in calls))

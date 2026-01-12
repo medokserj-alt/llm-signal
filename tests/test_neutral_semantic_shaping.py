@@ -105,13 +105,14 @@ class TestNeutralSemanticShaping(unittest.TestCase):
         self.assertIsInstance(aggressive_option, dict)
         self.assertIsNotNone(aggressive_option.get("entry_price"))
 
-    def test_renderer_renders_aggressive_option_line(self) -> None:
+    def test_renderer_hides_aggressive_option_in_neutral_trade(self) -> None:
         d = {
             "time_msk": "01.01.2025, 00:00",
             "symbol": "BTC/USDT",
             "price": 100.0,
             "mode": "neutral",
             "side": "long",
+            "entry_mode": "wait_confirm",
             "why_asset": "test",
             "multi_tf_view": {"m5": "—", "m15": "—", "h1": "—", "h4": "—", "d1": "—"},
             "news_context": [],
@@ -126,9 +127,9 @@ class TestNeutralSemanticShaping(unittest.TestCase):
         }
 
         out = _render_text(d)
-        self.assertIn("⚡ Возможен агрессивный вход:", out)
-        self.assertIn("(повышенный риск).", out)
-        self.assertIn("ℹ️ Neutral-вход выставлен с запасом относительно aggressive.", out)
+        # Neutral (STRICT): aggressive_option is never shown unless no_trade == true.
+        self.assertNotIn("⚡ Возможен агрессивный вход:", out)
+        self.assertNotIn("aggressive option", out.lower())
         self.assertNotRegex(out, r"\\d\\s*–\\s*\\d")
 
 

@@ -5,11 +5,29 @@ import get_signal_json
 
 def _patch_fetch_closes(closes_15m: list[float], closes_1h: list[float]):
     old = get_signal_json._fetch_closes_from_market
+    required = 200
+
+    def _pad(closes: list[float]) -> list[float]:
+        if not closes:
+            return closes
+        if len(closes) >= required:
+            return closes
+        return [float(closes[0])] * (required - len(closes)) + [float(x) for x in closes]
+
+    def _ohlcv_tail(closes: list[float]) -> list[list[float]]:
+        base_ts = 1700000000000
+        tail = closes[-required:]
+        out: list[list[float]] = []
+        for i, c in enumerate(tail):
+            ts = base_ts + i * 60_000
+            out.append([ts, c - 1.0, c + 1.0, c - 2.0, c, 1.0])
+        return out
 
     def fake_fetch(market: str, timeframe: str, *, symbol: str, limit: int, min_len: int):  # type: ignore[no-untyped-def]
         closes = closes_15m if timeframe == "15m" else (closes_1h if timeframe == "1h" else None)
         if closes is None:
             raise AssertionError(f"Unexpected timeframe: {timeframe}")
+        closes = _pad(closes)
         return {
             "market": market,
             "symbol": symbol,
@@ -17,9 +35,10 @@ def _patch_fetch_closes(closes_15m: list[float], closes_1h: list[float]):
             "last_candle_ts": None,
             "last_candle": None,  # allow US-session detection to rely on time_msk
             "ohlcv_count": len(closes),
-            "ohlcv_tail": None,
+            "ohlcv_tail": _ohlcv_tail(closes),
             "fetched_at": 0.0,
             "closes": closes,
+            "closes_tail": closes[-required:],
         }
 
     get_signal_json._fetch_closes_from_market = fake_fetch  # type: ignore[assignment]

@@ -143,7 +143,7 @@ class TestAggressiveTradeOriented(unittest.TestCase):
 
         self.assertFalse(bool(out.get("no_trade")))
         self.assertNotEqual(out.get("entry_mode"), "now")
-        self.assertIn("countertrend_aggressive_needs_evidence", out.get("warnings") or [])
+        self.assertIn("aggressive_countertrend_no_evidence_wait_confirm", out.get("warnings") or [])
 
     def test_aggressive_dir_guard_forced_short_by_ema_blocks_enter_now(self) -> None:
         d = {

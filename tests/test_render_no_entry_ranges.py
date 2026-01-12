@@ -42,17 +42,10 @@ class TestRenderNoEntryRanges(unittest.TestCase):
 
         out = _render_text(d)
         self.assertIn("Вход: 99.70", out)
-        self.assertIn("⚡ Возможен агрессивный вход: 99.90", out)
+        self.assertNotIn("⚡ Возможен агрессивный вход:", out)
 
         # No user-facing entry ranges like "a–b".
         self.assertIsNone(re.search(r"\\d[\\d.]*\\s*–\\s*\\d", out))
-
-        # Aggressive option must not be identical to the neutral entry.
-        m_neu = re.search(r"Вход:\s*([0-9.]+)", out)
-        m_agg = re.search(r"⚡ Возможен агрессивный вход:\s*([0-9.]+)", out)
-        self.assertIsNotNone(m_neu)
-        self.assertIsNotNone(m_agg)
-        self.assertNotEqual(m_neu.group(1), m_agg.group(1))
 
 
 if __name__ == "__main__":

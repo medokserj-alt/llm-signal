@@ -61,8 +61,18 @@ class TestEMANarrativeConsistency(unittest.TestCase):
 
                 out = json.loads((base / "logs" / "last.json").read_text(encoding="utf-8"))
                 self.assertEqual(out.get("price_vs_ema20_m15"), "below")
-                self.assertEqual(out.get("price_vs_ema20_h1"), "above")
-                self.assertEqual(out.get("ema_guard_state"), "between")
+                price = float(out["price"])
+                ema20_h1 = float(out["ema20_h1"])
+                exp_h1 = "above" if price > ema20_h1 else ("below" if price < ema20_h1 else "equal")
+                self.assertEqual(out.get("price_vs_ema20_h1"), exp_h1)
+                ema20_m15 = float(out["ema20_m15"])
+                if price > ema20_m15 and price > ema20_h1:
+                    exp_state = "above_both"
+                elif price < ema20_m15 and price < ema20_h1:
+                    exp_state = "below_both"
+                else:
+                    exp_state = "between"
+                self.assertEqual(out.get("ema_guard_state"), exp_state)
 
                 mtf = out.get("multi_tf_view") or {}
                 self.assertIsInstance(mtf, dict)

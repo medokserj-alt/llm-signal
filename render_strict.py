@@ -446,6 +446,8 @@ def main():
             wl = " ".join(w.lower() for w in _iter_warnings(data))
             if mode == "aggressive" and "phase_flip_wait_confirm" in wl:
                 lines.append("⚠️ Phase flip по M15: вход только после подтверждения (wait_confirm).")
+            if mode == "aggressive" and "aggressive_countertrend_no_evidence_wait_confirm" in wl:
+                lines.append("⚠️ Контртренд против сильного H1 — вход только после подтверждения (wait_confirm).")
             if mode == "aggressive" and bool(data.get("is_us_open_block")):
                 lines.append(
                     "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️"
@@ -488,33 +490,6 @@ def main():
                             )
 
             lines.append(entry_line)
-            aggressive_option = data.get("aggressive_option")
-            if mode == "neutral" and isinstance(aggressive_option, dict):
-                a_entry = _valid_price(aggressive_option.get("entry_price"))
-                if a_entry is None:
-                    a_entry = _valid_price(data.get("entry_price_aggressive"))
-                if a_entry is not None:
-                    lines.append(
-                        f"⚡ Возможен агрессивный вход: {format_price(symbol if isinstance(symbol, str) else None, a_entry)} (повышенный риск)."
-                    )
-                    if data.get("neutral_autosplit") is True:
-                        lines.append(
-                            "ℹ️ Neutral-вход отодвинут от текущей цены; ранний вход вынесен в aggressive option."
-                        )
-                    side_ok = False
-                    try:
-                        buffer_ticks = int(get_signal_json.NEUTRAL_BUFFER_TICKS)  # type: ignore[attr-defined]
-                    except Exception:
-                        buffer_ticks = 10
-                    tick = 10 ** (-int(price_prec))
-                    buf = float(buffer_ticks) * float(tick)
-                    if entry_val is not None:
-                        if side_key == "long":
-                            side_ok = float(entry_val) <= float(a_entry) - buf
-                        elif side_key == "short":
-                            side_ok = float(entry_val) >= float(a_entry) + buf
-                    if side_ok and data.get("neutral_autosplit") is not True:
-                        lines.append("ℹ️ Neutral-вход выставлен с запасом относительно aggressive.")
             lines.append(f"SL: {format_price(symbol if isinstance(symbol, str) else None, sl_val)}")
             if mode == "aggressive":
                 lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")

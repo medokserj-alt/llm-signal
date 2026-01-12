@@ -115,6 +115,7 @@ def _debug_trace_write() -> None:
 # ---- EMA helpers (Bybit Futures-aligned) ----
 _CLOSES_CACHE: dict[tuple[str, str, str], dict] = {}
 _EXCHANGES: dict[str, object] = {}
+_OHLCV_TAIL_LEN: int = 200
 
 
 def _normalize_timeframe(timeframe: str) -> str:
@@ -348,11 +349,12 @@ def _fetch_closes_from_market(
         "last_candle_ts": last_candle_ts,
         "last_candle": last_candle,
         "ohlcv_count": len(ohlcv),
-        # Keep only a short tail of OHLCV for derived calculations (ATR/flush), not for full history.
+        # Keep a reproducible tail of OHLCV for derived calculations + EMA blocks.
         # Format is ccxt OHLCV: [ts, open, high, low, close, volume?]
-        "ohlcv_tail": ohlcv[-60:] if isinstance(ohlcv, list) else None,
+        "ohlcv_tail": ohlcv[-_OHLCV_TAIL_LEN:] if isinstance(ohlcv, list) else None,
         "fetched_at": time.time(),
         "closes": closes,
+        "closes_tail": closes[-_OHLCV_TAIL_LEN:],
     }
     _CLOSES_CACHE[cache_key] = snap
     return snap
@@ -477,7 +479,7 @@ def get_ema_provenance(period: int, timeframe: str, *, symbol: str) -> dict:
         out["last_candle"] = snap.get("last_candle")
         out["ohlcv_tail"] = snap.get("ohlcv_tail")
         try:
-            out["closes_tail"] = [float(x) for x in closes[-5:]]
+            out["closes_tail"] = [float(x) for x in closes[-_OHLCV_TAIL_LEN:]]
         except Exception:
             out["closes_tail"] = None
 
@@ -522,6 +524,21 @@ def overwrite_ema20_from_provenance(d: dict) -> None:
     d["last_candle_h1"] = prov_h1.get("last_candle")
     d["ohlcv_h1_tail"] = prov_h1.get("ohlcv_tail")
     d["closes_h1_tail"] = prov_h1.get("closes_tail")
+
+    # Hard requirement: ensure we have enough OHLCV to compute EMA fan blocks deterministically.
+    try:
+        m15_ok = int(d.get("candles_m15_count") or 0) >= _OHLCV_TAIL_LEN
+        h1_ok = int(d.get("candles_h1_count") or 0) >= _OHLCV_TAIL_LEN
+    except Exception:
+        m15_ok, h1_ok = False, False
+
+    if not (m15_ok and h1_ok and _is_num(d.get("ema20_m15")) and _is_num(d.get("ema20_h1"))):
+        d["no_trade"] = True
+        reasons = d.setdefault("no_trade_reasons", [])
+        if isinstance(reasons, list) and "insufficient_ohlcv_for_ema_fan" not in reasons:
+            reasons.append("insufficient_ohlcv_for_ema_fan")
+        if not isinstance(d.get("no_trade_hint"), str) or not str(d.get("no_trade_hint") or "").strip():
+            d["no_trade_hint"] = "insufficient_ohlcv_for_ema_fan"
 
 
 def debug_get_ema_snapshot(symbol: str) -> dict:
@@ -771,6 +788,22 @@ def normalize_mode(mode_val) -> str:
     except Exception:
         m = ""
     return m if m in VALID_MODES else "neutral"
+
+def ensure_warnings_list(d: dict) -> None:
+    """
+    Runtime safety: ensure `warnings` is always a list (some upstream payloads can emit str/null).
+    This is plumbing-only (no trading logic changes), but prevents `.setdefault("warnings", []).append(...)`
+    from crashing when `warnings` exists with a non-list type.
+    """
+    if not isinstance(d, dict):
+        return
+    w = d.get("warnings")
+    if isinstance(w, list):
+        return
+    if isinstance(w, str) and w.strip():
+        d["warnings"] = [w.strip()]
+    else:
+        d["warnings"] = []
 
 def normalize_no_trade(d: dict) -> dict:
     """
@@ -1882,24 +1915,35 @@ def _compute_phase_flip_m15(d: dict) -> bool:
 
 def _compute_impulse_proxy(d: dict) -> bool:
     """
-    Impulse proxy: reuse existing computed signals (warnings + flush proxies).
+    Impulse proxy: deterministic sync with impulse markers.
+    Rules:
+    - True if warnings contain "impulse_no_exhale" or "phase_between"
+    - True if flush/knife detector triggers (existing ATR-based logic)
+    - False otherwise
     """
     warnings = d.get("warnings")
-    wl = ""
+    wset: set[str] = set()
     if isinstance(warnings, list):
-        wl = " ".join(str(w or "").strip().lower() for w in warnings)
-    if any(k in wl for k in ("impulse_no_exhale", "phase_between", "ema_between_m15_h1")):
+        for w in warnings:
+            s = str(w or "").strip().lower()
+            if s:
+                wset.add(s)
+    if ("impulse_no_exhale" in wset) or ("phase_between" in wset):
         return True
-    if _m15_flush_detected(d):
-        return True
-    if bool(d.get("flush_knife_aggressive_extreme")):
-        return True
-    reasons = d.get("no_trade_reasons")
-    if isinstance(reasons, list):
-        rl = " ".join(str(r or "").strip().lower() for r in reasons)
-        if "flush" in rl or "knife" in rl or "impulse" in rl:
-            return True
-    return False
+    return bool(_m15_flush_detected(d))
+
+
+def sync_impulse_proxy(d: dict) -> None:
+    """
+    Ensure `impulse_proxy` is always present and consistent with final warnings + computed markers.
+    """
+    if not isinstance(d, dict):
+        return
+    impulse_proxy = bool(_compute_impulse_proxy(d))
+    d["impulse_proxy"] = impulse_proxy
+    dbg = d.get("debug")
+    if isinstance(dbg, dict):
+        dbg["impulse_proxy"] = impulse_proxy
 
 
 def _append_unique_str(d: dict, key: str, value: str) -> None:
@@ -2459,32 +2503,102 @@ def _is_num(x) -> bool:
 
 def apply_ema_blocks_and_derivatives(d: dict, symbol: str | None) -> None:
     periods = (9, 12, 20, 50, 200)
+
+    def _set_data_error() -> None:
+        d["no_trade"] = True
+        reasons = d.setdefault("no_trade_reasons", [])
+        if isinstance(reasons, list) and "insufficient_ohlcv_for_ema_fan" not in reasons:
+            reasons.append("insufficient_ohlcv_for_ema_fan")
+        if not isinstance(d.get("no_trade_hint"), str) or not str(d.get("no_trade_hint") or "").strip():
+            d["no_trade_hint"] = "insufficient_ohlcv_for_ema_fan"
+
     if not symbol:
         d.setdefault("ema_m15", {f"ema{p}": None for p in periods})
         d.setdefault("ema_h1", {f"ema{p}": None for p in periods})
-        d.setdefault("ema_fan_m15_state", "mixed")
-        d.setdefault("ema_fan_h1_state", "mixed")
+        d["ema_fan_m15_state"] = "mixed"
+        d["ema_fan_h1_state"] = "mixed"
         d.setdefault("pivot_ema_hint_by_mode", "ema20")
+        _set_data_error()
         return
 
-    ema_m15 = d.get("ema_m15") if isinstance(d.get("ema_m15"), dict) else {}
-    ema_h1 = d.get("ema_h1") if isinstance(d.get("ema_h1"), dict) else {}
+    warmup_len = max(500, _OHLCV_TAIL_LEN)
+    required_candles = _OHLCV_TAIL_LEN
 
+    snap_m15 = _fetch_closes_from_market(
+        "bybit_swap",
+        "15m",
+        symbol=symbol,
+        limit=warmup_len,
+        min_len=required_candles,
+    )
+    snap_h1 = _fetch_closes_from_market(
+        "bybit_swap",
+        "1h",
+        symbol=symbol,
+        limit=warmup_len,
+        min_len=required_candles,
+    )
+
+    closes_m15 = snap_m15.get("closes") if isinstance(snap_m15, dict) else None
+    closes_h1 = snap_h1.get("closes") if isinstance(snap_h1, dict) else None
+    if not (isinstance(closes_m15, list) and len(closes_m15) >= required_candles):
+        d.setdefault("ema_m15", {f"ema{p}": None for p in periods})
+        d.setdefault("ema_h1", {f"ema{p}": None for p in periods})
+        d["ema_fan_m15_state"] = "mixed"
+        d["ema_fan_h1_state"] = "mixed"
+        _set_data_error()
+        return
+    if not (isinstance(closes_h1, list) and len(closes_h1) >= required_candles):
+        d.setdefault("ema_m15", {f"ema{p}": None for p in periods})
+        d.setdefault("ema_h1", {f"ema{p}": None for p in periods})
+        d["ema_fan_m15_state"] = "mixed"
+        d["ema_fan_h1_state"] = "mixed"
+        _set_data_error()
+        return
+
+    # Persist OHLCV snapshots for downstream consumers (logs/last.json).
+    d["exchange"] = "bybit"
+    d["market_type"] = "linear_perp"
+    d["price_source"] = "last"
+
+    d["timeframe_m15"] = "15m"
+    d["candles_m15_count"] = len(closes_m15)
+    d["last_candle_m15"] = snap_m15.get("last_candle")
+    d["ohlcv_m15_tail"] = snap_m15.get("ohlcv_tail")
+    d["closes_m15_tail"] = snap_m15.get("closes_tail")
+
+    d["timeframe_h1"] = "1h"
+    d["candles_h1_count"] = len(closes_h1)
+    d["last_candle_h1"] = snap_h1.get("last_candle")
+    d["ohlcv_h1_tail"] = snap_h1.get("ohlcv_tail")
+    d["closes_h1_tail"] = snap_h1.get("closes_tail")
+
+    ema_m15: dict[str, float | None] = {}
+    ema_h1: dict[str, float | None] = {}
     for p in periods:
-        k = f"ema{p}"
-        if k not in ema_m15 or ema_m15.get(k) is None:
-            if p == 20 and _is_num(d.get("ema20_m15")):
-                ema_m15[k] = float(d["ema20_m15"])
-            else:
-                ema_m15[k] = get_ema(p, "m15", symbol=symbol)
-        if k not in ema_h1 or ema_h1.get(k) is None:
-            if p == 20 and _is_num(d.get("ema20_h1")):
-                ema_h1[k] = float(d["ema20_h1"])
-            else:
-                ema_h1[k] = get_ema(p, "h1", symbol=symbol)
+        ema_m15[f"ema{p}"] = _ema_sma_seed(closes_m15, p)
+        ema_h1[f"ema{p}"] = _ema_sma_seed(closes_h1, p)
 
-    d["ema_m15"] = {f"ema{p}": ema_m15.get(f"ema{p}") for p in periods}
-    d["ema_h1"] = {f"ema{p}": ema_h1.get(f"ema{p}") for p in periods}
+    required_keys = ("ema9", "ema12", "ema20", "ema50")
+    if not all(_is_num(ema_m15.get(k)) for k in required_keys):
+        d["ema_m15"] = {f"ema{p}": None for p in periods}
+        d["ema_h1"] = {f"ema{p}": None for p in periods}
+        d["ema_fan_m15_state"] = "mixed"
+        d["ema_fan_h1_state"] = "mixed"
+        _set_data_error()
+        return
+    if not all(_is_num(ema_h1.get(k)) for k in required_keys):
+        d["ema_m15"] = {f"ema{p}": None for p in periods}
+        d["ema_h1"] = {f"ema{p}": None for p in periods}
+        d["ema_fan_m15_state"] = "mixed"
+        d["ema_fan_h1_state"] = "mixed"
+        _set_data_error()
+        return
+
+    d["ema_m15"] = {k: round(float(v), 6) for (k, v) in ema_m15.items() if k in {f"ema{p}" for p in periods}}
+    d["ema_h1"] = {k: round(float(v), 6) for (k, v) in ema_h1.items() if k in {f"ema{p}" for p in periods}}
+    d["ema20_m15"] = d["ema_m15"].get("ema20")
+    d["ema20_h1"] = d["ema_h1"].get("ema20")
 
     def fan_state(ema_block: dict) -> str:
         e9 = ema_block.get("ema9")
@@ -2499,8 +2613,8 @@ def apply_ema_blocks_and_derivatives(d: dict, symbol: str | None) -> None:
             return "bear"
         return "mixed"
 
-    d["ema_fan_m15_state"] = fan_state(d["ema_m15"])
-    d["ema_fan_h1_state"] = fan_state(d["ema_h1"])
+    d["ema_fan_m15_state"] = fan_state(d.get("ema_m15") if isinstance(d.get("ema_m15"), dict) else {})
+    d["ema_fan_h1_state"] = fan_state(d.get("ema_h1") if isinstance(d.get("ema_h1"), dict) else {})
 
     mode = normalize_mode(d.get("mode"))
     d["pivot_ema_hint_by_mode"] = (
@@ -3065,6 +3179,15 @@ def validate_active_mode_setup(d: dict) -> dict:
     - НЕ меняет торговую логику и НЕ пересчитывает уровни;
     - при невалидности помечает no_trade с понятным комментарием.
     """
+    # Runtime safety: LLM (or other callers) can emit `warnings` with an invalid type (e.g. str/null).
+    # Many downstream gates rely on `warnings` being a list for append semantics.
+    w0 = d.get("warnings")
+    if not isinstance(w0, list):
+        if isinstance(w0, str) and w0.strip():
+            d["warnings"] = [w0.strip()]
+        else:
+            d["warnings"] = []
+
     def _strip_neutral_trade_payload() -> None:
         d.pop("entry_price_neutral", None)
         try:
@@ -3270,20 +3393,52 @@ def validate_active_mode_setup(d: dict) -> dict:
         strong_h1_up = (vs_h1 == "above") and (fan_h1 == "bull")
         strong_h1_down = (vs_h1 == "below") and (fan_h1 == "bear")
         countertrend = (side == "short" and strong_h1_up) or (side == "long" and strong_h1_down)
-        if countertrend and not _has_reversal_evidence():
-            d.setdefault("warnings", [])
-            if isinstance(d.get("warnings"), list) and "countertrend_aggressive_needs_evidence" not in d["warnings"]:
-                d["warnings"].append("countertrend_aggressive_needs_evidence")
-            em = (d.get("entry_mode") or "").strip().lower()
-            if em in ("now", "market"):
-                d["entry_mode"] = "wait_confirm"
-            if d.get("confidence") == "High":
-                d["confidence"] = "Medium"
-            if not (d.get("confirmation_rules") or ""):
-                d["confirmation_rules"] = (
-                    "Контртренд без подтверждения: дождаться разворота EMA-fan на M15 / "
-                    "смешанного состояния на H1 / закрепления цены относительно EMA20(H1)."
+        if countertrend:
+            vs_m15 = str(d.get("price_vs_ema20_m15") or "").strip().lower()
+            ema20_m15 = _to_float(d.get("ema20_m15"))
+            closes = d.get("closes_m15_tail")
+
+            last2_above = False
+            last2_below = False
+            if ema20_m15 is not None and isinstance(closes, list) and len(closes) >= 2:
+                last2: list[float] = []
+                for x in closes[-2:]:
+                    v = _to_float(x)
+                    if v is None:
+                        last2 = []
+                        break
+                    last2.append(v)
+                if len(last2) == 2:
+                    last2_above = bool(last2[0] > ema20_m15 and last2[1] > ema20_m15)
+                    last2_below = bool(last2[0] < ema20_m15 and last2[1] < ema20_m15)
+
+            impulse_proxy = bool(d.get("impulse_proxy"))
+            phase_flip_m15 = bool(d.get("phase_flip_m15"))
+            has_phase_flip_after_impulse = bool(
+                phase_flip_m15
+                and impulse_proxy
+                and (
+                    (side == "long" and vs_m15 == "above")
+                    or (side == "short" and vs_m15 == "below")
                 )
+            )
+            reversal_evidence = bool(
+                (side == "long" and last2_above)
+                or (side == "short" and last2_below)
+                or (side == "long" and fan_m15 == "bull")
+                or (side == "short" and fan_m15 == "bear")
+                or has_phase_flip_after_impulse
+            )
+
+            warnings = d.setdefault("warnings", [])
+            if isinstance(warnings, list):
+                if reversal_evidence:
+                    if "aggressive_countertrend_with_evidence" not in warnings:
+                        warnings.append("aggressive_countertrend_with_evidence")
+                else:
+                    d["entry_mode"] = "wait_confirm"
+                    if "aggressive_countertrend_no_evidence_wait_confirm" not in warnings:
+                        warnings.append("aggressive_countertrend_no_evidence_wait_confirm")
 
         # Night / low-liquidity window (00:00–07:00 MSK): never hard-block by time,
         # but require explicit risk warning + confirmation-based entry.
@@ -4211,6 +4366,7 @@ def validate_active_mode_setup(d: dict) -> dict:
 def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool = True) -> dict:
     hints = hints or {}
     d = data or {}
+    ensure_warnings_list(d)
 
     # Защита от cross-symbol contamination в hints.*:
     # hints.price / hints.ema* можно использовать только если hints.symbol == текущему d["symbol"].
@@ -4437,6 +4593,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         apply_us_two_phase_policy(d)
     except Exception:
         pass
+    try:
+        sync_impulse_proxy(d)
+    except Exception:
+        pass
     return normalize_no_trade(d)
 
 
@@ -4495,8 +4655,10 @@ if args.multi:
                 multi_hints = params_payload.get("hints", {}) or {}
         except Exception:
             multi_hints = {}
-    mode_raw = multi_hints.get("mode")
+    force_mode = os.getenv("FORCE_MODE")
+    mode_raw = force_mode if (isinstance(force_mode, str) and force_mode.strip()) else multi_hints.get("mode")
     mode = normalize_mode(mode_raw)
+    requested_mode = normalize_mode(mode_raw) if (mode_raw is not None and str(mode_raw).strip()) else None
 
     pool_snapshot = get_pool_snapshot()
     snapshot = snapshot_from_status().strip()
@@ -4584,7 +4746,10 @@ if args.multi:
             "btc_change_pct": btc_info.get("change"),
             "eth_change_pct": eth_info.get("change"),
         },
+        "mode": mode,
     }
+    if requested_mode is not None:
+        pool_payload["requested_mode"] = requested_mode
 
     schema_hint = (
         risk_mode_hint
@@ -4640,10 +4805,20 @@ if args.multi:
         + btc_eth_line
         + schema_hint
         + "\n=== SNAPSHOT CONTEXT ===\n"
+        + f"MODE: {mode}. Follow the MODE-SPECIFIC DECISION CONTRACT below.\n"
         + json.dumps(pool_payload, ensure_ascii=False, indent=2)
         + "\n"
         + news_block
     )
+    if os.getenv("TRACE_LLM_INPUT") == "1":
+        print(
+            f"\n=== [LLM MODE LINE] ===\nMODE: {mode}. Follow the MODE-SPECIFIC DECISION CONTRACT below.\n"
+        )
+        print(
+            "\n=== [LLM PAYLOAD JSON] ===\n"
+            + json.dumps(pool_payload, ensure_ascii=False, indent=2)
+            + "\n"
+        )
 
     if focus:
         user_prompt += "\nNEWS_FOCUS (top-3):\n" + focus + "\n"
@@ -4765,9 +4940,13 @@ risk_hint = (
     if risk_off
     else ""
 )
-mode_raw = payload["hints"].get("mode")
+force_mode = os.getenv("FORCE_MODE")
+mode_raw = force_mode if (isinstance(force_mode, str) and force_mode.strip()) else payload["hints"].get("mode")
 mode = normalize_mode(mode_raw)
 payload["hints"]["mode"] = mode
+payload["mode"] = mode
+if "requested_mode" not in payload and mode_raw is not None and str(mode_raw).strip():
+    payload["requested_mode"] = normalize_mode(mode_raw)
 mode_block = (
     "=== TRADING MODE ===\n"
     f"Текущий режим: {mode}.\n"
@@ -4785,8 +4964,15 @@ base_user_prompt = (
     f"Поле time_msk установи РОВНО в это значение: {payload['hints']['time_msk']}. "
     "Поле price, если задано, используй РОВНО как задано. "
     "Если явных новостей нет (hints.news нет) — верни \"news_context\": [].\n"
-    "Входные данные:\n" + json.dumps(payload, ensure_ascii=False)
+    "Входные данные:\n"
+    + f"MODE: {mode}. Follow the MODE-SPECIFIC DECISION CONTRACT below.\n"
+    + json.dumps(payload, ensure_ascii=False)
 )
+if os.getenv("TRACE_LLM_INPUT") == "1":
+    print(
+        f"\n=== [LLM MODE LINE] ===\nMODE: {mode}. Follow the MODE-SPECIFIC DECISION CONTRACT below.\n"
+    )
+    print("\n=== [LLM PAYLOAD JSON] ===\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 # NEWS → в prompt
 news_block = get_news_block(12)

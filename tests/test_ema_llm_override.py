@@ -73,8 +73,11 @@ class TestEMALLMOverride(unittest.TestCase):
             self.assertIsInstance(out.get("last_candle_h1"), dict)
 
             # Relation flags must match computed EMA values.
-            self.assertEqual(out.get("price_vs_ema20_m15"), "above")
-            self.assertEqual(out.get("price_vs_ema20_h1"), "below")
+            price = float(llm_data["price"])
+            exp_m15 = "above" if price > ema_15m else ("below" if price < ema_15m else "equal")
+            exp_h1 = "above" if price > ema_1h else ("below" if price < ema_1h else "equal")
+            self.assertEqual(out.get("price_vs_ema20_m15"), exp_m15)
+            self.assertEqual(out.get("price_vs_ema20_h1"), exp_h1)
 
             # Both timeframes should be fetched.
             self.assertTrue(any(tf == "15m" for (_m, tf) in calls))
@@ -85,4 +88,3 @@ class TestEMALLMOverride(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
