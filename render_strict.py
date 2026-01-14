@@ -157,6 +157,47 @@ def _ema_status_line(data: dict) -> str | None:
         return None
     return f"EMA статус: M15: {label(m15)} | H1: {label(h1)}"
 
+def _sanitize_trend_narrative(
+    text: str,
+    *,
+    price_vs_ema20: str | None,
+    ema_fan_state: str | None,
+) -> str:
+    """
+    UX-only guard: if computed evidence is bearish/under-EMA, don't let narrative claim a stable uptrend / above-EMA.
+    Keep short and do not introduce new indicators beyond the provided flags.
+    """
+
+    raw = _one_line(text or "")
+    if not raw or raw == "—":
+        return raw or "—"
+
+    pv = (price_vs_ema20 or "").strip().lower() if isinstance(price_vs_ema20, str) else ""
+    fan = (ema_fan_state or "").strip().lower() if isinstance(ema_fan_state, str) else ""
+    bearish = pv == "below" or fan == "bear"
+    if not bearish:
+        return raw
+
+    bullish_claim = re.search(
+        r"(?i)\b("
+        r"ап[\s-]*тренд|up[\s-]*trend|"
+        r"быч\w*|bull\w*|"
+        r"(выше|над)\s+ema\s*20|above\s+ema\s*20"
+        r")\b",
+        raw,
+    )
+    if not bullish_claim:
+        return raw
+
+    parts: list[str] = []
+    if fan == "bear":
+        parts.append("нисходящая фаза/коррекция")
+    if pv == "below":
+        parts.append("ниже EMA20")
+    if not parts:
+        parts.append("коррекционная фаза")
+    return ", ".join(parts)
+
 
 def main():
     raw = sys.stdin.read().strip()
@@ -405,6 +446,8 @@ def main():
         rr_by_mode = data.get("rr_by_mode") if isinstance(data.get("rr_by_mode"), dict) else {}
         rr_val = _valid_price(rr_by_mode.get(mode))
         if rr_val is None:
+            rr_val = _valid_price(data.get("rr"))
+        if rr_val is None:
             missing.append("RR")
 
         exit_plan_by_mode = (
@@ -459,7 +502,8 @@ def main():
 
             # wait_confirm UX: keep it user-simple (no checklists / ranges in text).
             em_raw = (data.get("entry_mode") or "").strip().lower()
-            if em_raw in ("wait_confirm", "confirm", "wait-confirm", "wc"):
+            is_wait_confirm = em_raw in ("wait_confirm", "confirm", "wait-confirm", "wc")
+            if is_wait_confirm:
                 lines.append("⏳ Вход: wait_confirm")
                 lines.append("ℹ️ Подтверждение/снятие сценария — через AIA (если подключён).")
 
@@ -477,7 +521,7 @@ def main():
                     strange_side = (side_key == "long" and entry_val > px) or (side_key == "short" and entry_val < px)
                     near_and_correct_side = delta_pct <= THRESHOLD_NEAR_PCT and correct_side
 
-                    if mode == "aggressive" and near_and_correct_side:
+                    if mode == "aggressive" and near_and_correct_side and not is_wait_confirm:
                         lines.append("**✅ Логичен вход от текущей / вблизи текущей (агрессивно).**")
                     elif strange_side:
                         if side_key == "long":
@@ -518,10 +562,20 @@ def main():
             ema_line = _ema_status_line(data)
             if ema_line:
                 lines.append(ema_line)
+            m15_view = _sanitize_trend_narrative(
+                str(mtf.get("m15", "—")),
+                price_vs_ema20=data.get("price_vs_ema20_m15"),
+                ema_fan_state=data.get("ema_fan_m15_state"),
+            )
+            h1_view = _sanitize_trend_narrative(
+                str(mtf.get("h1", "—")),
+                price_vs_ema20=data.get("price_vs_ema20_h1"),
+                ema_fan_state=data.get("ema_fan_h1_state"),
+            )
             lines.append(
                 "5m: "
-                f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(str(mtf.get('m15','—')))}; "
-                f"1h: {_one_line(str(mtf.get('h1','—')))}; 4h: {_one_line(str(mtf.get('h4','—')))}; "
+                f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(m15_view)}; "
+                f"1h: {_one_line(h1_view)}; 4h: {_one_line(str(mtf.get('h4','—')))}; "
                 f"1D: {_one_line(str(mtf.get('d1','—')))}"
             )
             lines.append("")

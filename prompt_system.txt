@@ -34,8 +34,9 @@ technical_rationale, multi_tf_view, risk_management.
 
 direction выбирается по правилам:
 
-- Если price < ema20_m15 → предпочтение long (если нет risk-off).
-- Если price > ema20_m15 → предпочтение short (если нет risk-on).
+- Если price > ema20_m15 → предпочтение long (если нет risk_off).
+- Если price < ema20_m15 → предпочтение short (если нет risk_on).
+DAY/MID bias не может переворачивать направление против локального EMA-тренда; при конфликте — только wait_confirm или no_trade (в зависимости от режима).
 - Если price между ema20_m15 и ema20_h1 → структура «between» → можно оба направления, но выбирай тот, где R:R ≥ 2 достигается легче.
 - В контексте перегрева (“ema_guard=above_both”):  
   → long только от глубокого отката;  
@@ -202,6 +203,16 @@ news_context — только факты из блока [NEWS]
 - XRP/USDT и ADA/USDT → 4 знака (пример: 1.8500, а не 1.85)
 - DOGE/USDT → 5 знаков
 - BTC/USDT и ETH/USDT → 2 знака
+
+=== MODE RANGE SEPARATION (HARD) ===
+When outputting entries ranges:
+- aggressive.range must be the closest/earliest zone.
+- neutral.range must be noticeably safer/deeper than aggressive and must NOT overlap aggressive.range.
+- conservative.range must be the deepest/safest and must NOT overlap neutral.range.
+If you cannot produce non-overlapping ranges that are progressively safer by mode:
+- set no_trade=true for the affected safer mode(s) (neutral and/or conservative),
+- keep aggressive as the only tradable option.
+=== END MODE RANGE SEPARATION ===
 
 ---
 === MODE-SPECIFIC DECISION CONTRACT (ADD-ON) ===

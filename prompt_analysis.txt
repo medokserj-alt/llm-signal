@@ -94,7 +94,7 @@
 - `entry_mid = (min+max)/2`. Запрещено использовать `price` как `entry_mid`.
 - LONG: `sl = entry_mid * 0.99; tp1 = entry_mid * 1.01; tp2 = entry_mid * 1.02`.
 - SHORT: `sl = entry_mid * 1.01; tp1 = entry_mid * 0.99; tp2 = entry_mid * 0.98`.
-- R:R ≥ 2.0. Если не выходит — смести `entry_range` (±0.3%) или верни **stand-by**.
+- R:R ≥ 2.0 — базовая цель. В aggressive (особенно при wait_confirm) допускается RR ниже 2.0, если риск объяснён и вход условный; в neutral/conservative стремись к RR≥2.0. Если не выходит — смести `entry_range` (±0.3%) или верни **stand-by**.
 - ВСЕ ценовые уровни обязаны быть округлены по **price precision символа** (как на бирже) и отформатированы ровно с этим количеством знаков после точки (включая trailing zeros).
   Примеры: XRP/USDT и ADA/USDT → 4 знака (1.8500), DOGE/USDT → 5 знаков, BTC/USDT и ETH/USDT → 2 знака.
 

@@ -15,7 +15,7 @@ class TestPricePrecisionRounding(unittest.TestCase):
         get_signal_json.apply_entry_prices_from_ranges(d)
 
         self.assertEqual(f"{float(d['entry_price_neutral']):.4f}", "1.8688")
-        self.assertEqual(f"{float(d['entry_price_aggressive']):.4f}", "1.8699")
+        self.assertEqual(f"{float(d['entry_price_aggressive']):.4f}", "1.8693")
 
     def test_btc_rounding_stays_2_decimals(self) -> None:
         self.assertEqual(get_signal_json._round_price(100.1299, symbol="BTC/USDT"), 100.13)
