@@ -42,5 +42,9 @@ codex_tasks/
 user_channels.json
 params.json
 pinned_state.json
+personal_signal_state.json
+user_subscriptions*.json
+user_subscriptions*.jsonl
+worktrees/
 ai-agent/
 ai-agent.old/

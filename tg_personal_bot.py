@@ -11,6 +11,7 @@ from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+from cleanup_old_signals import cleanup_old_signals
 from pinned_state import get_pinned_message_id, load_pinned_state, save_pinned_state, set_pinned_message_id
 from rbac import analysis_menu_layout, is_admin
 
@@ -21,7 +22,7 @@ PROJECT_ROOT = BASE
 
 load_dotenv(BASE / ".env.tg.clean")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_PERSONAL_BOT_TOKEN")
 FALLBACK_CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL")
 
 # ============== AIA (AI Agent) ==============
@@ -42,7 +43,10 @@ def _parse_env_int(raw: str | None) -> int | None:
         return None
 
 _AIA_TEST_CHANNEL_ID_INT = _parse_env_int(AIA_TEST_CHANNEL_ID)
-_SUBSCRIPTION_LIMIT = _parse_env_int(os.getenv("TELEGRAM_SUBSCRIPTION_LIMIT"))
+PERSONAL_POLL_SEC = _parse_env_int(os.getenv("TELEGRAM_PERSONAL_POLL_SEC")) or 10
+SIGNAL_ROOT = Path(os.getenv("TELEGRAM_SIGNAL_ROOT", PROJECT_ROOT))
+SIGNAL_CLEANUP_DAYS = _parse_env_int(os.getenv("TELEGRAM_SIGNAL_CLEANUP_DAYS")) or 30
+SIGNAL_CLEANUP_SEC = _parse_env_int(os.getenv("TELEGRAM_SIGNAL_CLEANUP_SEC")) or 21600
 
 def _should_send_to_aia_for_target(target) -> bool:
     test_id = _AIA_TEST_CHANNEL_ID_INT
@@ -79,6 +83,18 @@ USER_CHANNELS_PATH = PROJECT_ROOT / "user_channels.json"
 SUBSCRIPTIONS_PATH = Path(
     os.getenv("TELEGRAM_SUBSCRIPTIONS_PATH", PROJECT_ROOT / "user_subscriptions.json")
 )
+SUBSCRIPTIONS_LOG_PATH = Path(
+    os.getenv(
+        "TELEGRAM_SUBSCRIPTIONS_LOG_PATH",
+        PROJECT_ROOT / "user_subscriptions.log.jsonl",
+    )
+)
+PERSONAL_SIGNAL_STATE_PATH = Path(
+    os.getenv(
+        "TELEGRAM_PERSONAL_SIGNAL_STATE_PATH",
+        PROJECT_ROOT / "personal_signal_state.json",
+    )
+)
 PARAMS_PATH = PROJECT_ROOT / "params.json"
 PINNED_STATE_PATH = PROJECT_ROOT / "pinned_state.json"
 USER_CONFIG = {}
@@ -86,6 +102,7 @@ GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 _AIA_UID_CONTEXT = None
 SUBSCRIBERS: set[int] = set()
+USER_SIGNAL_PREFS: dict[str, dict] = {}
 
 def load_user_channels():
     global USER_CONFIG, GLOBAL_SETTINGS
@@ -123,13 +140,142 @@ def load_subscriptions() -> None:
             except Exception:
                 continue
     SUBSCRIBERS = out
+    prefs = data.get("prefs")
+    if isinstance(prefs, dict):
+        global USER_SIGNAL_PREFS
+        USER_SIGNAL_PREFS = prefs
 
 def _save_subscriptions() -> None:
-    data = {"subscribers": sorted(SUBSCRIBERS)}
+    data = {"subscribers": sorted(SUBSCRIBERS), "prefs": USER_SIGNAL_PREFS}
     SUBSCRIPTIONS_PATH.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+def _log_subscription_event(action: str, user) -> None:
+    if user is None:
+        return
+    record = {
+        "ts": time.time(),
+        "ts_iso": _utc_now_z(),
+        "action": action,
+        "uid": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+    }
+    with SUBSCRIPTIONS_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+def _load_personal_signal_state() -> dict:
+    if not PERSONAL_SIGNAL_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(PERSONAL_SIGNAL_STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_personal_signal_state(state: dict) -> None:
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(PERSONAL_SIGNAL_STATE_PATH.parent),
+            prefix=f"{PERSONAL_SIGNAL_STATE_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PERSONAL_SIGNAL_STATE_PATH)
+        tmp_path = None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+async def _broadcast_signal_to_subscribers(app: Application, sig_html: Path) -> None:
+    parts = html_file_to_tg_text(sig_html)
+    if not parts:
+        return
+    signal_info = _read_last_signal_json_from_root(SIGNAL_ROOT) or {}
+    direction = _normalize_direction_v1(signal_info.get("direction") or signal_info.get("side"))
+    signal_mode = signal_info.get("mode")
+    subscribers = list(SUBSCRIBERS)
+    for chat_id in subscribers:
+        prefs = _get_user_prefs(chat_id)
+        pref_dir = prefs.get("direction") or "all"
+        pref_mode = prefs.get("mode") or "all"
+        if pref_dir != "all" and direction and pref_dir != direction:
+            continue
+        if pref_mode != "all" and signal_mode and pref_mode != signal_mode:
+            continue
+        for idx, part in enumerate(parts):
+            prefix = "📣 Сигнал\n\n" if idx == 0 else ""
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=prefix + part)
+            except Exception:
+                continue
+
+async def _watch_new_signals(app: Application) -> None:
+    state = _load_personal_signal_state()
+    last_path = state.get("path")
+    last_mtime = state.get("mtime")
+    initialized = bool(last_path)
+
+    while True:
+        try:
+            sig_html = latest_in_root(SIGNAL_ROOT, "signal_*.html")
+            if not initialized:
+                if sig_html:
+                    last_path = sig_html.as_posix()
+                    last_mtime = sig_html.stat().st_mtime
+                    _save_personal_signal_state(
+                        {"path": last_path, "mtime": last_mtime}
+                    )
+                    initialized = True
+                await asyncio.sleep(PERSONAL_POLL_SEC)
+                continue
+
+            if sig_html:
+                current_path = sig_html.as_posix()
+                current_mtime = sig_html.stat().st_mtime
+                if current_path != last_path or (
+                    last_mtime is not None and current_mtime > last_mtime
+                ):
+                    await _broadcast_signal_to_subscribers(app, sig_html)
+                    last_path = current_path
+                    last_mtime = current_mtime
+                    _save_personal_signal_state(
+                        {"path": last_path, "mtime": last_mtime}
+                    )
+        except Exception:
+            pass
+
+        await asyncio.sleep(PERSONAL_POLL_SEC)
+
+async def _cleanup_old_signals_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(
+                cleanup_old_signals,
+                SIGNAL_ROOT,
+                days=SIGNAL_CLEANUP_DAYS,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(SIGNAL_CLEANUP_SEC)
+
+async def _post_init(app: Application) -> None:
+    asyncio.create_task(_watch_new_signals(app))
+    asyncio.create_task(_cleanup_old_signals_loop())
 
 def is_subscribed(uid: int) -> bool:
     return uid in SUBSCRIBERS
@@ -149,32 +295,7 @@ def unsubscribe_user(uid: int) -> bool:
     return True
 
 def get_signal_targets(uid: int):
-    target = get_main_chat_id(uid)
-    targets: list = []
-    seen: set[str] = set()
-
-    def _add(val):
-        if val is None:
-            return
-        key: str
-        if isinstance(val, int) and not isinstance(val, bool):
-            key = f"int:{val}"
-        elif isinstance(val, str) and val.strip().lstrip("-").isdigit():
-            try:
-                key = f"int:{int(val.strip())}"
-            except Exception:
-                key = f"str:{val}"
-        else:
-            key = f"str:{val}"
-        if key in seen:
-            return
-        seen.add(key)
-        targets.append(val)
-
-    _add(target)
-    for uid in sorted(SUBSCRIBERS):
-        _add(uid)
-    return targets
+    return sorted(SUBSCRIBERS)
 
 load_subscriptions()
 
@@ -182,12 +303,7 @@ def get_user_cfg(uid:int):
     return USER_CONFIG.get(str(uid))
 
 def get_main_chat_id(uid:int):
-    cfg = get_user_cfg(uid)
-    if cfg:
-        ch = cfg.get("channels",{}).get("main_chat_id")
-        if ch:
-            return ch
-    return FALLBACK_CHANNEL
+    return uid
 
 def get_all_main_channels() -> list[int]:
     out: set[int] = set()
@@ -254,9 +370,45 @@ def set_user_mode(uid:int, mode:str):
     )
 
 def is_allowed(uid:int) -> bool:
-    if ALLOWED_UIDS and uid in ALLOWED_UIDS:
-        return True
-    return get_user_cfg(uid) is not None
+    return True
+
+def _load_user_signal_prefs() -> None:
+    global USER_SIGNAL_PREFS
+    USER_SIGNAL_PREFS = {}
+    path = SUBSCRIPTIONS_PATH
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    prefs = data.get("prefs")
+    if isinstance(prefs, dict):
+        USER_SIGNAL_PREFS = prefs
+
+def _save_user_signal_prefs() -> None:
+    data = {}
+    if SUBSCRIPTIONS_PATH.exists():
+        try:
+            data = json.loads(SUBSCRIPTIONS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["subscribers"] = sorted(SUBSCRIBERS)
+    data["prefs"] = USER_SIGNAL_PREFS
+    SUBSCRIPTIONS_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def _get_user_prefs(uid: int) -> dict:
+    raw = USER_SIGNAL_PREFS.get(str(uid))
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+def _set_user_prefs(uid: int, prefs: dict) -> None:
+    USER_SIGNAL_PREFS[str(uid)] = prefs
+    _save_user_signal_prefs()
 
 # ============== HELPERS =====================
 
@@ -267,6 +419,13 @@ def make_header(title:str)->str:
 def latest(pattern:str):
     files = list(PROJECT_ROOT.glob(pattern))
     return max(files, key=lambda p:p.stat().st_mtime) if files else None
+
+def latest_in_root(root: Path, pattern: str) -> Path | None:
+    try:
+        files = list(root.glob(pattern))
+    except Exception:
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 def latest_report_dir(root_dir: str) -> Path | None:
     root = PROJECT_ROOT / "reports" / root_dir
@@ -340,7 +499,10 @@ def _aia_request_json(method: str, path: str, *, query: dict | None = None, body
             return status, None
 
 def _read_last_signal_json() -> dict | None:
-    p = PROJECT_ROOT / "logs" / "last.json"
+    return _read_last_signal_json_from_root(PROJECT_ROOT)
+
+def _read_last_signal_json_from_root(root: Path) -> dict | None:
+    p = root / "logs" / "last.json"
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
@@ -835,6 +997,20 @@ async def _send_to_current_chat(update: Update, context: ContextTypes.DEFAULT_TY
     if update.message:
         await update.message.reply_text(text)
 
+async def _send_to_current_chat_with_kb(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup,
+) -> None:
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(text, reply_markup=reply_markup)
+        return
+    chat = update.effective_chat
+    if chat:
+        await context.bot.send_message(chat_id=chat.id, text=text, reply_markup=reply_markup)
+
 def set_params_mode(mode: str):
     if mode not in VALID_MODES:
         mode = "neutral"
@@ -899,6 +1075,54 @@ def main_menu_kb():
             [KeyboardButton("⚙️ Режим")],
         ],
         resize_keyboard=True
+    )
+
+def personal_menu_kb():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📣 Последний сигнал")],
+            [KeyboardButton("⚙️ Настройки")],
+            [KeyboardButton("ℹ️ Помощь")],
+        ],
+        resize_keyboard=True
+    )
+
+def personal_settings_kb(uid: int):
+    if is_subscribed(uid):
+        rows = [[KeyboardButton("❌ Отписаться")]]
+    else:
+        rows = [[KeyboardButton("✅ Подписаться")]]
+    rows.append([KeyboardButton("🎯 Фильтры")])
+    rows.append([KeyboardButton("⬅️ Назад")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def filters_menu_kb(uid: int):
+    prefs = _get_user_prefs(uid)
+    mode = prefs.get("mode") or "all"
+    direction = prefs.get("direction") or "all"
+    mode_label = {"all": "Все", "aggressive": "Aggressive", "neutral": "Neutral", "conservative": "Conservative"}.get(mode, "Все")
+    dir_label = {"all": "Все", "long": "Long", "short": "Short"}.get(direction, "Все")
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(f"🎯 Режим: {mode_label}")],
+            [KeyboardButton(f"🧭 Направление: {dir_label}")],
+            [KeyboardButton("⬅️ Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+def personal_help_text() -> str:
+    return (
+        "Команды:\n"
+        "/subscribe — получать сигналы\n"
+        "/unsubscribe — остановить\n"
+        "/last_signal — показать последний сигнал\n"
+        "/whoami — ваш id\n"
+        "/help — помощь\n\n"
+        "Сигналы приходят автоматически после подписки, "
+        "когда публикуются в основном канале.\n\n"
+        "Кнопка «⚙️ Настройки» — подписка/отписка.\n"
+        "Кнопка «🎯 Фильтры» — режим/направление."
     )
 
 def signal_menu_kb():
@@ -1006,25 +1230,101 @@ async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Подписка активна. Для отключения: /unsubscribe")
     else:
         await update.message.reply_text("Чтобы получать сигналы: /subscribe")
-    if is_allowed(uid):
-        await update.message.reply_text("📋 Главное меню", reply_markup=main_menu_kb())
+    await _send_to_current_chat_with_kb(update, context, personal_help_text(), personal_menu_kb())
 
 async def subscribe(update:Update, context:ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if subscribe_user(uid):
-        await update.message.reply_text("✅ Подписка включена. Чтобы отключить: /unsubscribe")
+        _log_subscription_event("subscribed", update.effective_user)
+        if not _get_user_prefs(uid):
+            _set_user_prefs(uid, {"mode": "all", "direction": "all"})
+        await _send_to_current_chat(update, context, "✅ Подписка включена. Чтобы отключить: /unsubscribe")
+        await last_signal(update, context)
     else:
-        await update.message.reply_text("ℹ️ Вы уже подписаны. Для отключения: /unsubscribe")
+        await _send_to_current_chat(update, context, "ℹ️ Вы уже подписаны. Для отключения: /unsubscribe")
+    await _send_to_current_chat_with_kb(update, context, "⚙️ Настройки обновлены.", personal_settings_kb(uid))
 
 async def unsubscribe(update:Update, context:ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if unsubscribe_user(uid):
-        await update.message.reply_text("❌ Подписка отключена. Вернуться: /subscribe")
+        _log_subscription_event("unsubscribed", update.effective_user)
+        await _send_to_current_chat(update, context, "❌ Подписка отключена. Вернуться: /subscribe")
     else:
-        await update.message.reply_text("ℹ️ Вы не были подписаны. Подписаться: /subscribe")
+        await _send_to_current_chat(update, context, "ℹ️ Вы не были подписаны. Подписаться: /subscribe")
+    await _send_to_current_chat_with_kb(update, context, "⚙️ Настройки обновлены.", personal_settings_kb(uid))
+
+async def last_signal(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    sig_html = latest_in_root(SIGNAL_ROOT, "signal_*.html")
+    if not sig_html:
+        await _send_to_current_chat(update, context, "Нет сохранённых сигналов.")
+        return
+    parts = html_file_to_tg_text(Path(sig_html))
+    if not parts:
+        await _send_to_current_chat(update, context, "Нет сохранённых сигналов.")
+        return
+    for idx, part in enumerate(parts):
+        prefix = "📣 Последний сигнал\n\n" if idx == 0 else ""
+        await _send_to_current_chat(update, context, prefix + part)
+
+async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await _send_to_current_chat_with_kb(update, context, personal_help_text(), personal_menu_kb())
+
+async def handle_settings_menu(update, context):
+    uid = update.effective_user.id
+    await _send_to_current_chat_with_kb(
+        update,
+        context,
+        "⚙️ Настройки подписки",
+        personal_settings_kb(uid),
+    )
+
+async def handle_filters_menu(update, context):
+    uid = update.effective_user.id
+    await _send_to_current_chat_with_kb(
+        update,
+        context,
+        "🎯 Фильтры сигналов",
+        filters_menu_kb(uid),
+    )
+
+async def handle_filter_mode_toggle(update, context):
+    uid = update.effective_user.id
+    prefs = _get_user_prefs(uid)
+    order = ["all", "aggressive", "neutral", "conservative"]
+    current = prefs.get("mode") or "all"
+    try:
+        idx = order.index(current)
+    except ValueError:
+        idx = 0
+    prefs["mode"] = order[(idx + 1) % len(order)]
+    _set_user_prefs(uid, prefs)
+    await _send_to_current_chat_with_kb(
+        update,
+        context,
+        "🎯 Фильтры обновлены.",
+        filters_menu_kb(uid),
+    )
+
+async def handle_filter_direction_toggle(update, context):
+    uid = update.effective_user.id
+    prefs = _get_user_prefs(uid)
+    order = ["all", "long", "short"]
+    current = prefs.get("direction") or "all"
+    try:
+        idx = order.index(current)
+    except ValueError:
+        idx = 0
+    prefs["direction"] = order[(idx + 1) % len(order)]
+    _set_user_prefs(uid, prefs)
+    await _send_to_current_chat_with_kb(
+        update,
+        context,
+        "🎯 Фильтры обновлены.",
+        filters_menu_kb(uid),
+    )
 
 async def handle_back(update,context):
-    await update.message.reply_text("📋 Главное меню", reply_markup=main_menu_kb())
+    await _send_to_current_chat_with_kb(update, context, "📋 Меню", personal_menu_kb())
 
 async def handle_signal_menu(update,context):
     await update.message.reply_text("Выбери актив или режим:", reply_markup=signal_menu_kb())
@@ -1443,6 +1743,14 @@ async def handle_aia_daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============== REGISTER / MAIN ==============
 
 def register_text_handlers(app:Application):
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^✅ Подписаться$"), subscribe))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^❌ Отписаться$"), unsubscribe))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📣 Последний сигнал$"), last_signal))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⚙️ Настройки$"), handle_settings_menu))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🎯 Фильтры$"), handle_filters_menu))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🎯 Режим:"), handle_filter_mode_toggle))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🧭 Направление:"), handle_filter_direction_toggle))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^ℹ️ Помощь$"), help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📊 Сигнал$"), handle_signal_menu))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Анализ$"), handle_analysis_menu))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Current$"), handle_current_analysis))
@@ -1460,12 +1768,14 @@ def register_text_handlers(app:Application):
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env.tg.clean")
-    app = Application.builder().token(BOT_TOKEN).build()
+        raise SystemExit("Set TELEGRAM_PERSONAL_BOT_TOKEN in .env.tg.clean")
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    app.add_handler(CommandHandler("last_signal", last_signal))
     app.add_handler(CommandHandler("aia_report", handle_aia_report))
     app.add_handler(CommandHandler("aia_daily", handle_aia_daily))
     register_text_handlers(app)
