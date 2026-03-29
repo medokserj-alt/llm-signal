@@ -2,17 +2,30 @@
 from zoneinfo import ZoneInfo
 import asyncio
 import os, json, time, subprocess, re, html as htmllib, tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest, parse as urlparse
 
 from dotenv import load_dotenv
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 from pinned_state import get_pinned_message_id, load_pinned_state, save_pinned_state, set_pinned_message_id
 from rbac import analysis_menu_layout, is_admin
+from paid_allowlist import add_paid_allowed_uid, get_paid_allowed_ids
+from user_registry import (
+    consume_trial,
+    get_all_users,
+    get_user,
+    is_active,
+    register_user,
+    set_signal_bot_started,
+    set_paid,
+    set_status,
+    start_trial,
+    status_text,
+)
 
 # ============== BASE / ENV ==================
 
@@ -23,6 +36,10 @@ load_dotenv(BASE / ".env.tg.clean")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 FALLBACK_CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL")
+SIGNAL_BOT_TOKEN = os.getenv("TELEGRAM_SIGNAL_BOT_TOKEN")
+SIGNAL_BOT_USERNAME = os.getenv("TELEGRAM_SIGNAL_BOT_USERNAME", "LLM_signals_pa_dev_bot")
+ENV_PATH = BASE / ".env.tg.clean"
+PANEL_SYMBOLS_MAX = int(os.getenv("TELEGRAM_PANEL_SYMBOLS_MAX", "18") or "18")
 
 # ============== AIA (AI Agent) ==============
 
@@ -73,7 +90,9 @@ def parse_allowed_ids():
                 ids.append(int(x))
     return list(dict.fromkeys(ids))
 
+
 ALLOWED_UIDS = parse_allowed_ids()
+PAID_ALLOWED_UIDS = get_paid_allowed_ids()
 
 USER_CHANNELS_PATH = PROJECT_ROOT / "user_channels.json"
 SUBSCRIPTIONS_PATH = Path(
@@ -81,6 +100,12 @@ SUBSCRIPTIONS_PATH = Path(
 )
 PARAMS_PATH = PROJECT_ROOT / "params.json"
 PINNED_STATE_PATH = PROJECT_ROOT / "pinned_state.json"
+CORE_SIGNAL_STATE_PATH = Path(
+    os.getenv("TELEGRAM_CORE_SIGNAL_STATE_PATH", PROJECT_ROOT / "core_signal_state.json")
+)
+CORE_SIGNAL_POLL_SEC = _parse_env_int(os.getenv("TELEGRAM_CORE_SIGNAL_POLL_SEC")) or 10
+CORE_SIGNAL_WATCHER_MODE = str(os.getenv("TELEGRAM_CORE_SIGNAL_WATCHER_MODE", "") or "").strip().lower()
+SHARED_MAIN_ROUTE_KEY = "shared_v3_mixed"
 USER_CONFIG = {}
 GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
 VALID_MODES = {"aggressive", "neutral", "conservative"}
@@ -149,34 +174,176 @@ def unsubscribe_user(uid: int) -> bool:
     return True
 
 def get_signal_targets(uid: int):
-    target = get_main_chat_id(uid)
-    targets: list = []
-    seen: set[str] = set()
-
-    def _add(val):
-        if val is None:
-            return
-        key: str
-        if isinstance(val, int) and not isinstance(val, bool):
-            key = f"int:{val}"
-        elif isinstance(val, str) and val.strip().lstrip("-").isdigit():
-            try:
-                key = f"int:{int(val.strip())}"
-            except Exception:
-                key = f"str:{val}"
-        else:
-            key = f"str:{val}"
-        if key in seen:
-            return
-        seen.add(key)
-        targets.append(val)
-
-    _add(target)
-    for uid in sorted(SUBSCRIBERS):
-        _add(uid)
-    return targets
+    return [uid]
 
 load_subscriptions()
+
+def _load_core_signal_state() -> dict:
+    if not CORE_SIGNAL_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(CORE_SIGNAL_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _save_core_signal_state(state: dict) -> None:
+    CORE_SIGNAL_STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def _get_core_user_targets() -> list[int]:
+    out: set[int] = set()
+    users = get_all_users()
+    for uid_str, record in users.items():
+        if not isinstance(uid_str, str) or not uid_str.lstrip("-").isdigit():
+            continue
+        if not is_active(record):
+            continue
+        uid = int(uid_str)
+        if ALLOWED_UIDS and uid not in ALLOWED_UIDS and uid not in PAID_ALLOWED_UIDS:
+            continue
+        out.add(uid)
+    return sorted(out)
+
+def _normalize_chat_id(raw) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s and s.lstrip("-").isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return None
+    return None
+
+def _get_user_channels(cfg: dict | None) -> dict:
+    if not isinstance(cfg, dict):
+        return {}
+    channels = cfg.get("channels")
+    return channels if isinstance(channels, dict) else {}
+
+def get_shared_main_chat_id() -> int | None:
+    return _normalize_chat_id(_get_user_channels(USER_CONFIG.get(SHARED_MAIN_ROUTE_KEY)).get("main_chat_id"))
+
+def _get_user_route_key(cfg: dict | None) -> str | None:
+    if not isinstance(cfg, dict):
+        return None
+    for key in ("route", "shared_route", "routing_key", "main_route"):
+        raw = cfg.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    routing = cfg.get("routing")
+    if isinstance(routing, dict):
+        for key in ("main", "route", "key"):
+            raw = routing.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+    return None
+
+def is_shared_main_route_uid(uid: int) -> bool:
+    cfg = get_user_cfg(uid)
+    if not isinstance(cfg, dict):
+        return False
+    route_key = _get_user_route_key(cfg)
+    if route_key == SHARED_MAIN_ROUTE_KEY:
+        return True
+    shared_chat_id = get_shared_main_chat_id()
+    direct_chat_id = _normalize_chat_id(_get_user_channels(cfg).get("main_chat_id"))
+    return shared_chat_id is not None and direct_chat_id == shared_chat_id
+
+def get_main_publication_chat_id(uid: int) -> int | None:
+    cfg = get_user_cfg(uid)
+    if not isinstance(cfg, dict):
+        return None
+    if is_shared_main_route_uid(uid):
+        shared_chat_id = get_shared_main_chat_id()
+        if shared_chat_id is not None:
+            return shared_chat_id
+    return _normalize_chat_id(_get_user_channels(cfg).get("main_chat_id"))
+
+def get_main_publication_targets(uid: int) -> list[int]:
+    target = get_main_publication_chat_id(uid)
+    return [target] if target is not None else []
+
+def get_core_broadcast_targets() -> list[int]:
+    targets: set[int] = set()
+    for uid in _get_core_user_targets():
+        targets.update(get_main_publication_targets(uid))
+    return sorted(targets)
+
+def _is_core_signal_watcher_enabled() -> bool:
+    return CORE_SIGNAL_WATCHER_MODE in {"1", "true", "yes", "on", "watch", "watcher", "broadcast"}
+
+async def _broadcast_core_signal(app: Application, sig_html: Path) -> None:
+    parts = html_file_to_tg_text(sig_html)
+    if not parts:
+        return
+    targets = get_core_broadcast_targets()
+    if not targets:
+        return
+    published_at = _utc_now_z()
+    signal_id = _infer_signal_id(sig_html, None, published_at)
+    symbol = _resolve_signal_symbol(None)
+    for chat_id in targets:
+        for idx, part in enumerate(parts):
+            prefix = "📣 Сигнал\n\n" if idx == 0 else ""
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=prefix + part)
+                if idx == 0:
+                    _log_signal_publication(
+                        event="telegram_publish",
+                        uid=None,
+                        symbol=symbol,
+                        mode="watcher",
+                        target_chat_id=chat_id,
+                        source="tg_bot.py:_broadcast_core_signal",
+                        signal_id=signal_id,
+                        delivery_kind="watcher",
+                    )
+            except Exception:
+                continue
+
+async def _watch_core_signals(app: Application) -> None:
+    state = _load_core_signal_state()
+    last_path = state.get("path")
+    last_mtime = state.get("mtime")
+    initialized = bool(last_path)
+
+    while True:
+        try:
+            sig_html = latest("signal_*.html")
+            if not initialized:
+                if sig_html:
+                    last_path = sig_html.as_posix()
+                    last_mtime = sig_html.stat().st_mtime
+                    _save_core_signal_state({"path": last_path, "mtime": last_mtime})
+                    initialized = True
+                await asyncio.sleep(CORE_SIGNAL_POLL_SEC)
+                continue
+
+            if sig_html:
+                current_path = sig_html.as_posix()
+                current_mtime = sig_html.stat().st_mtime
+                if current_path != last_path or (
+                    last_mtime is not None and current_mtime > last_mtime
+                ):
+                    await _broadcast_core_signal(app, sig_html)
+                    last_path = current_path
+                    last_mtime = current_mtime
+                    _save_core_signal_state({"path": last_path, "mtime": last_mtime})
+        except Exception:
+            pass
+
+        await asyncio.sleep(CORE_SIGNAL_POLL_SEC)
+
+async def _post_init(app: Application) -> None:
+    if _is_core_signal_watcher_enabled():
+        asyncio.create_task(_watch_core_signals(app))
 
 def get_user_cfg(uid:int):
     return USER_CONFIG.get(str(uid))
@@ -188,6 +355,53 @@ def get_main_chat_id(uid:int):
         if ch:
             return ch
     return FALLBACK_CHANNEL
+
+async def _send_main_publication(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    protect_content: bool = True,
+) -> list[int]:
+    chat_id = get_main_publication_chat_id(uid)
+    if chat_id is None:
+        return []
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            protect_content=protect_content,
+        )
+        return [chat_id]
+    except Exception:
+        return []
+
+def _get_publication_target(uid: int, delivery_kind: str) -> int | None:
+    if delivery_kind == "personal":
+        return uid
+    return get_main_publication_chat_id(uid)
+
+async def _deliver_publication(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    text: str,
+    *,
+    delivery_kind: str,
+    parse_mode: str | None = None,
+    protect_content: bool = True,
+) -> bool:
+    if delivery_kind == "personal":
+        return _send_personal(uid, text, parse_mode=parse_mode, protect_content=protect_content)
+    sent = await _send_main_publication(
+        context,
+        uid,
+        text,
+        parse_mode=parse_mode,
+        protect_content=protect_content,
+    )
+    return bool(sent)
 
 def get_all_main_channels() -> list[int]:
     out: set[int] = set()
@@ -254,9 +468,9 @@ def set_user_mode(uid:int, mode:str):
     )
 
 def is_allowed(uid:int) -> bool:
-    if ALLOWED_UIDS and uid in ALLOWED_UIDS:
-        return True
-    return get_user_cfg(uid) is not None
+    if ALLOWED_UIDS or PAID_ALLOWED_UIDS:
+        return uid in ALLOWED_UIDS or uid in PAID_ALLOWED_UIDS
+    return True
 
 # ============== HELPERS =====================
 
@@ -296,6 +510,42 @@ def _relpath(p: Path) -> str:
     except Exception:
         return p.as_posix()
 
+def _resolve_signal_symbol(symbol_hint: str | None) -> str | None:
+    if isinstance(symbol_hint, str) and symbol_hint.strip():
+        return symbol_hint.strip()
+    last = _read_last_signal_json()
+    if not isinstance(last, dict):
+        return None
+    for key in ("symbol", "asset"):
+        raw = last.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+def _log_signal_publication(
+    *,
+    event: str,
+    uid: int | None,
+    symbol: str | None,
+    mode: str | None,
+    target_chat_id: int | None,
+    source: str,
+    signal_id: str | None,
+    delivery_kind: str,
+) -> None:
+    record = {
+        "event": event,
+        "uid": uid,
+        "symbol": symbol,
+        "mode": mode,
+        "target_chat_id": target_chat_id,
+        "source": source,
+        "signal_id": signal_id,
+        "delivery_kind": delivery_kind,
+        "ts": _utc_now_z(),
+    }
+    print("[signal_publish] " + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+
 def format_done(done_line: str, logs_path: str | None = None) -> str:
     msg = "Готово.\n<pre>" + htmllib.escape(done_line) + "</pre>"
     if logs_path:
@@ -303,7 +553,7 @@ def format_done(done_line: str, logs_path: str | None = None) -> str:
     return msg
 
 def _utc_now_z() -> str:
-    return datetime.utcnow().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _infer_signal_id(sig_html: Path | None, run_log: Path | None, published_at: str) -> str:
     for p in (sig_html, run_log):
@@ -317,7 +567,7 @@ def _infer_signal_id(sig_html: Path | None, run_log: Path | None, published_at: 
         dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
         return dt.strftime("%Y%m%d_%H%M%S")
     except Exception:
-        return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 def _aia_request_json(method: str, path: str, *, query: dict | None = None, body: dict | None = None) -> tuple[int, dict | None]:
     url = AIA_BASE_URL.rstrip("/") + path
@@ -338,6 +588,52 @@ def _aia_request_json(method: str, path: str, *, query: dict | None = None, body
             return status, json.loads(raw.decode("utf-8", errors="replace"))
         except Exception:
             return status, None
+
+def _signal_bot_request_json(method: str, path: str, *, body: dict | None = None) -> bool:
+    if not SIGNAL_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{SIGNAL_BOT_TOKEN}{path}"
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    try:
+        req = urlrequest.Request(url, data=data, method=method.upper(), headers=headers)
+        with urlrequest.urlopen(req, timeout=10) as resp:
+            status = int(getattr(resp, "status", 200))
+            return 200 <= status < 300
+    except Exception:
+        return False
+
+def _signal_bot_hint_text() -> str:
+    name = (SIGNAL_BOT_USERNAME or "LLM_signals_pa_dev_bot").lstrip("@")
+    return f"Чтобы получать результаты, открой @{name} и нажми /start."
+
+def _signal_bot_link() -> str:
+    name = (SIGNAL_BOT_USERNAME or "LLM_signals_pa_dev_bot").lstrip("@")
+    return f"https://t.me/{name}?start=1"
+
+def _signal_bot_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Открыть Signal bot", url=_signal_bot_link())]])
+
+async def _send_signal_bot_hint(update: Update) -> None:
+    await update.message.reply_text(_signal_bot_hint_text(), reply_markup=_signal_bot_kb())
+
+def _send_via_signal_bot(chat_id: int, text: str, *, parse_mode: str | None = None, protect_content: bool = True) -> bool:
+    payload = {"chat_id": chat_id, "text": text, "protect_content": bool(protect_content)}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return _signal_bot_request_json("POST", "/sendMessage", body=payload)
+
+def _send_personal(uid: int, text: str, *, parse_mode: str | None = None, protect_content: bool = True) -> bool:
+    ok = _send_via_signal_bot(uid, text, parse_mode=parse_mode, protect_content=protect_content)
+    if ok:
+        try:
+            set_signal_bot_started(uid, True)
+        except Exception:
+            pass
+    return ok
 
 def _read_last_signal_json() -> dict | None:
     p = PROJECT_ROOT / "logs" / "last.json"
@@ -711,6 +1007,140 @@ async def _send_no_trade_decision_to_aia_background(payload: dict) -> None:
     except Exception:
         pass
 
+def _queue_aia_signal_forward(
+    signal_json_v1: dict,
+    *,
+    uid: int,
+    symbol: str | None,
+    mode: str,
+    target_chat_id: int,
+    source: str,
+    signal_id: str,
+    delivery_kind: str,
+) -> None:
+    _log_signal_publication(
+        event="aia_forward_signal",
+        uid=uid,
+        symbol=symbol,
+        mode=mode,
+        target_chat_id=target_chat_id,
+        source=source,
+        signal_id=signal_id,
+        delivery_kind=delivery_kind,
+    )
+    asyncio.create_task(_send_signal_to_aia_background(signal_json_v1))
+
+def _queue_aia_no_trade_forward(
+    payload: dict,
+    *,
+    uid: int,
+    symbol: str | None,
+    mode: str,
+    target_chat_id: int,
+    source: str,
+    signal_id: str,
+    delivery_kind: str,
+) -> None:
+    _log_signal_publication(
+        event="aia_forward_no_trade",
+        uid=uid,
+        symbol=symbol,
+        mode=mode,
+        target_chat_id=target_chat_id,
+        source=source,
+        signal_id=signal_id,
+        delivery_kind=delivery_kind,
+    )
+    asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
+
+async def _publish_signal_result(
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    *,
+    text: str,
+    target_chat_id: int,
+    delivery_kind: str,
+    source: str,
+    symbol_hint: str | None,
+    sig_html: Path | None,
+    run_log: Path | None,
+) -> bool:
+    published_at = _utc_now_z()
+    signal_id = _infer_signal_id(sig_html, run_log, published_at)
+    symbol = _resolve_signal_symbol(symbol_hint)
+    mode = get_user_mode(uid)
+    delivered = await _deliver_publication(
+        context,
+        uid,
+        text,
+        delivery_kind=delivery_kind,
+        protect_content=True,
+    )
+    if not delivered:
+        _log_signal_publication(
+            event="telegram_publish_failed",
+            uid=uid,
+            symbol=symbol,
+            mode=mode,
+            target_chat_id=target_chat_id,
+            source=source,
+            signal_id=signal_id,
+            delivery_kind=delivery_kind,
+        )
+        return False
+
+    _log_signal_publication(
+        event="telegram_publish",
+        uid=uid,
+        symbol=symbol,
+        mode=mode,
+        target_chat_id=target_chat_id,
+        source=source,
+        signal_id=signal_id,
+        delivery_kind=delivery_kind,
+    )
+
+    if "📌 Сигнал не выдан" in text:
+        payload = _build_no_trade_decision_payload(
+            uid,
+            tg_text=text,
+            symbol_hint=symbol_hint,
+            channel_id=target_chat_id,
+        )
+        if payload and _should_send_to_aia_for_target(target_chat_id):
+            _queue_aia_no_trade_forward(
+                payload,
+                uid=uid,
+                symbol=symbol,
+                mode=mode,
+                target_chat_id=target_chat_id,
+                source=source,
+                signal_id=signal_id,
+                delivery_kind=delivery_kind,
+            )
+        return True
+
+    global _AIA_UID_CONTEXT
+    _AIA_UID_CONTEXT = uid
+    sig_v1 = _build_signal_json_v1(
+        signal_id=signal_id,
+        published_at=published_at,
+        channel_id=target_chat_id,
+        symbol_hint=symbol_hint,
+    )
+    if sig_v1 and _should_send_to_aia_for_target(target_chat_id):
+        _queue_aia_signal_forward(
+            sig_v1,
+            uid=uid,
+            symbol=symbol,
+            mode=mode,
+            target_chat_id=target_chat_id,
+            source=source,
+            signal_id=signal_id,
+            delivery_kind=delivery_kind,
+        )
+    return True
+
 def _normalize_direction_v1(raw) -> str | None:
     if raw is None:
         return None
@@ -883,7 +1313,8 @@ def set_params_mode(mode: str):
 
 def load_symbols():
     try:
-        pool = json.load(open(PROJECT_ROOT/"pool.json","r",encoding="utf-8"))["pool"]
+        with open(PROJECT_ROOT / "pool.json", "r", encoding="utf-8") as f:
+            pool = json.load(f)["pool"]
         return [s.split("/")[0] for s in pool]
     except Exception:
         return ["BTC","ETH","SOL","AVAX","SUI","APT","AAVE","LINK","TON","ARB"]
@@ -891,12 +1322,36 @@ def load_symbols():
 SYMBOLS     = load_symbols()
 SYMBOLS_SET = set(SYMBOLS)
 
+def _panel_symbols() -> list[str]:
+    if PANEL_SYMBOLS_MAX <= 0:
+        return []
+    return SYMBOLS[:PANEL_SYMBOLS_MAX]
+
+def panel_kb() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("✅ Подписаться", callback_data="panel:subscribe")],
+        [InlineKeyboardButton("💬 Открыть Signal bot", url=_signal_bot_link())],
+        [
+            InlineKeyboardButton("📈 Анализ", callback_data="panel:analysis"),
+            InlineKeyboardButton("🤖 FULL", callback_data="panel:full"),
+        ],
+    ]
+    symbols = _panel_symbols()
+    for i in range(0, len(symbols), 3):
+        rows.append([InlineKeyboardButton(x, callback_data=f"panel:sig:{x}") for x in symbols[i:i+3]])
+    if len(symbols) < len(SYMBOLS):
+        rows.append([InlineKeyboardButton("⋯ Другие", url=_signal_bot_link())])
+    return InlineKeyboardMarkup(rows)
+
 def main_menu_kb():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📊 Сигнал")],
             [KeyboardButton("📈 Анализ")],
             [KeyboardButton("⚙️ Режим")],
+            [KeyboardButton("📝 Регистрация")],
+            [KeyboardButton("🎁 5 сигналов"), KeyboardButton("💳 Оплата")],
+            [KeyboardButton("🧾 Статус"), KeyboardButton("🔗 Signal bot")],
         ],
         resize_keyboard=True
     )
@@ -991,37 +1446,229 @@ async def whoami(update:Update, context:ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     cfg = get_user_cfg(uid)
     ch  = get_main_chat_id(uid)
-    sub = is_subscribed(uid)
+    reg = get_user(uid)
     await update.message.reply_text(
         f"whoami\nuid: {uid}\nallowed(env): {ALLOWED_UIDS}\n"
         f"in JSON: {bool(cfg)}\nchannel: {ch}\nmode: {get_user_mode(uid)}\n"
-        f"subscribed: {sub}"
+        f"{status_text(reg)}"
     )
 
 async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and getattr(chat, "type", None) != "private":
+        await _send_to_current_chat(update, context, "Открой бота в личном чате для меню и управления.")
+        return
     uid = update.effective_user.id
     first = (update.effective_user.first_name or "").strip()
+    record, created = register_user(update.effective_user)
     await update.message.reply_text(f"Привет, {first or 'трейдер'}!")
-    if is_subscribed(uid):
-        await update.message.reply_text("✅ Подписка активна. Для отключения: /unsubscribe")
-    else:
-        await update.message.reply_text("Чтобы получать сигналы: /subscribe")
+    if created:
+        await update.message.reply_text("✅ Регистрация выполнена.")
+    await update.message.reply_text(status_text(record))
+    await update.message.reply_text(
+        "Для доступа активируй trial или оплату.\n"
+        "Trial: /trial\n"
+        "Оплата (мок): /pay"
+    )
     if is_allowed(uid):
         await update.message.reply_text("📋 Главное меню", reply_markup=main_menu_kb())
 
 async def subscribe(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if subscribe_user(uid):
-        await update.message.reply_text("✅ Подписка включена. Чтобы отключить: /unsubscribe")
-    else:
-        await update.message.reply_text("ℹ️ Вы уже подписаны. Для отключения: /unsubscribe")
+    await handle_pay(update, context)
 
 async def unsubscribe(update:Update, context:ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if unsubscribe_user(uid):
-        await update.message.reply_text("❌ Подписка отключена. Вернуться: /subscribe")
+    try:
+        set_status(uid, "registered")
+        await update.message.reply_text("❌ Подписка отключена. Вернуться: /pay или /trial")
+    except Exception:
+        await update.message.reply_text("ℹ️ Подписка не найдена. Вернуться: /pay или /trial")
+
+async def handle_register(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    record, created = register_user(update.effective_user)
+    if created:
+        await update.message.reply_text("✅ Регистрация выполнена.")
     else:
-        await update.message.reply_text("ℹ️ Вы не были подписаны. Подписаться: /subscribe")
+        await update.message.reply_text("✅ Регистрация обновлена.")
+    await update.message.reply_text(status_text(record))
+
+async def handle_trial(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    record = start_trial(update.effective_user)
+    await update.message.reply_text("🎁 Trial активирован: 5 сигналов бесплатно.")
+    await update.message.reply_text(status_text(record))
+
+async def handle_pay(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    try:
+        add_paid_allowed_uid(uid)
+    except Exception:
+        pass
+    PAID_ALLOWED_UIDS.add(uid)
+    record = set_paid(update.effective_user)
+    await update.message.reply_text("💳 Оплата принята (мок). Подписка активирована.")
+    await update.message.reply_text(status_text(record))
+
+async def handle_status(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    record = get_user(uid)
+    if not isinstance(record, dict):
+        await update.message.reply_text("Сначала зарегистрируйся: /register")
+        return
+    await update.message.reply_text(status_text(record))
+
+async def handle_signal_bot_info(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    await _send_signal_bot_hint(update)
+
+async def handle_panel_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _is_chat_admin_or_owner(update, context):
+        await _send_to_current_chat(update, context, "⛔ Недоступно")
+        return
+    text = (
+        "✅ Подписка и персональные сигналы\n"
+        "1) Нажми «Подписаться»\n"
+        "2) Открой Signal bot и нажми /start\n"
+        "3) Запрашивай сигналы кнопками ниже — ответы придут в личку"
+    )
+    channels: list[int] = []
+    if context.args:
+        raw = str(context.args[0]).strip()
+        if raw.lstrip("-").isdigit():
+            channels = [int(raw)]
+    if not channels and FALLBACK_CHANNEL:
+        raw = str(FALLBACK_CHANNEL).strip()
+        if raw.lstrip("-").isdigit():
+            channels = [int(raw)]
+    if not channels:
+        channels = get_all_main_channels()
+    if not channels:
+        await _send_to_current_chat(update, context, "Каналы не найдены в конфиге.")
+        return
+    sent = 0
+    for ch in channels:
+        try:
+            await context.bot.send_message(chat_id=ch, text=text, reply_markup=panel_kb())
+            sent += 1
+        except Exception:
+            continue
+    await _send_to_current_chat(update, context, f"Панель отправлена: {sent}")
+
+async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    data = (query.data or "").strip()
+    if not data.startswith("panel:"):
+        return
+    uid = query.from_user.id if query.from_user else None
+    if uid is None:
+        await query.answer()
+        return
+
+    if data == "panel:subscribe":
+        try:
+            add_paid_allowed_uid(uid)
+            PAID_ALLOWED_UIDS.add(uid)
+        except Exception:
+            pass
+        set_paid(query.from_user)
+        ok = _send_personal(uid, "✅ Подписка активирована. Запрашивай сигналы в основном канале.", protect_content=True)
+        if ok:
+            await query.answer("Подписка активирована. Проверь личный чат Signal bot.", show_alert=True)
+        else:
+            await query.answer("Подписка активирована. Открой Signal bot и нажми /start.", show_alert=True)
+        return
+
+    if not is_allowed(uid):
+        await query.answer("Нет доступа.", show_alert=True)
+        return
+
+    record = get_user(uid)
+    if not isinstance(record, dict):
+        record, _ = register_user(query.from_user)
+    if not is_active(record):
+        await query.answer("Нет активной подписки. Нажми «Подписаться».", show_alert=True)
+        return
+    if not SIGNAL_BOT_TOKEN:
+        await query.answer("Signal bot не настроен.", show_alert=True)
+        return
+
+    ok, wait = can_request(uid)
+    if not ok:
+        await query.answer(f"Подожди {wait} сек.", show_alert=True)
+        return
+    if is_gen_locked():
+        await query.answer("Уже считаю сигнал, попробуй позже.", show_alert=True)
+        return
+
+    if data == "panel:analysis":
+        if not _send_personal(uid, "Готовлю анализ… ⏳", protect_content=True):
+            await query.answer("Открой Signal bot и нажми /start.", show_alert=True)
+            return
+        await query.answer("Готовлю… отправлю в личку.", show_alert=False)
+        touch_request(uid)
+        if not acquire_gen_lock():
+            _send_personal(uid, "Занято, попробуй позже.", protect_content=True)
+            return
+        try:
+            await _run_analysis_core(uid, context, record, status_msg=None, delivery_kind="personal")
+        finally:
+            release_gen_lock()
+        return
+
+    if data == "panel:full":
+        if not _send_personal(uid, "Готовлю FULL… ⏳", protect_content=True):
+            await query.answer("Открой Signal bot и нажми /start.", show_alert=True)
+            return
+        await query.answer("Готовлю… отправлю в личку.", show_alert=False)
+        touch_request(uid)
+        if not acquire_gen_lock():
+            _send_personal(uid, "Занято, попробуй позже.", protect_content=True)
+            return
+        try:
+            await _run_full_core(uid, context, record, status_msg=None, delivery_kind="personal")
+        finally:
+            release_gen_lock()
+        return
+
+    if data.startswith("panel:sig:"):
+        sym = data.split("panel:sig:", 1)[1].strip().upper()
+        if not sym or sym not in SYMBOLS_SET:
+            await query.answer("Неизвестный тикер.", show_alert=True)
+            return
+        symbol = f"{sym}/USDT"
+        if not _send_personal(uid, f"Готовлю сигнал по {symbol}… ⏳", protect_content=True):
+            await query.answer("Открой Signal bot и нажми /start.", show_alert=True)
+            return
+        await query.answer("Готовлю… отправлю в личку.", show_alert=False)
+        touch_request(uid)
+        if not acquire_gen_lock():
+            _send_personal(uid, "Занято, попробуй позже.", protect_content=True)
+            return
+        try:
+            await _run_symbol_core(uid, symbol, context, record, status_msg=None, delivery_kind="personal")
+        finally:
+            release_gen_lock()
+        return
+
+    await query.answer()
+
+async def _ensure_active_access(update: Update) -> dict | None:
+    uid = update.effective_user.id
+    record = get_user(uid)
+    if not isinstance(record, dict):
+        await update.message.reply_text("Сначала зарегистрируйся: /register")
+        return None
+    if not is_active(record):
+        status = record.get("status")
+        if status == "trial":
+            await update.message.reply_text("Trial закончился. Продли: /pay")
+        else:
+            await update.message.reply_text("Нужна активация доступа: /trial или /pay")
+        return None
+    if get_main_publication_chat_id(uid) is None:
+        await update.message.reply_text("Канал для публикации не настроен. Обратись к администратору.")
+        return None
+    return record
 
 async def handle_back(update,context):
     await update.message.reply_text("📋 Главное меню", reply_markup=main_menu_kb())
@@ -1075,11 +1722,188 @@ async def handle_mode_neutral(update,context):
 async def handle_mode_conservative(update,context):
     await _handle_mode_choice(update, context, "conservative")
 
+# ---------- INTERNAL RUNNERS ----------
+async def _run_full_core(
+    uid: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    record: dict,
+    *,
+    status_msg=None,
+    delivery_kind: str = "main",
+) -> None:
+    target_chat_id = _get_publication_target(uid, delivery_kind)
+    if target_chat_id is None:
+        if status_msg is not None:
+            await status_msg.edit_text("Канал для публикации не настроен.")
+        return
+    set_params_mode(get_user_mode(uid))
+    proc = subprocess.run(
+        ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
+        capture_output=True, text=True, timeout=900
+    )
+
+    analysis = latest("analysis_*.md")
+    sig_html = latest("signal_*.html")
+    run_log = latest("logs/signal_*.log")
+
+    if analysis:
+        hdr = make_header("📝 LLM Full анализ")
+        txt_raw = Path(analysis).read_text(encoding="utf-8")
+        txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
+        await _deliver_publication(
+            context,
+            uid,
+            hdr+"\n\n"+txt,
+            delivery_kind=delivery_kind,
+            protect_content=True,
+        )
+
+    if sig_html:
+        parts = html_file_to_tg_text(Path(sig_html))
+        if parts:
+            part0 = parts[0]
+            await _publish_signal_result(
+                context,
+                uid,
+                text="📣 Сигнал\n\n" + part0,
+                target_chat_id=target_chat_id,
+                delivery_kind=delivery_kind,
+                source="tg_bot.py:_run_full_core",
+                symbol_hint=None,
+                sig_html=Path(sig_html) if sig_html else None,
+                run_log=Path(run_log) if run_log else None,
+            )
+
+    if record.get("status") == "trial":
+        consume_trial(uid)
+
+    if status_msg is not None:
+        mode_label = MODE_LABELS.get(get_user_mode(uid), MODE_LABELS["neutral"])
+        await status_msg.edit_text(
+            format_done(
+                f"✅ FULL: режим {mode_label}",
+                logs_path=_relpath(run_log) if run_log else None,
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+async def _run_analysis_core(
+    uid: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    record: dict,
+    *,
+    status_msg=None,
+    delivery_kind: str = "main",
+) -> None:
+    target_chat_id = _get_publication_target(uid, delivery_kind)
+    if target_chat_id is None:
+        if status_msg is not None:
+            await status_msg.edit_text("Канал для публикации не настроен.")
+        return
+    set_params_mode(get_user_mode(uid))
+    proc = subprocess.run(
+        ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
+        capture_output=True, text=True, timeout=900
+    )
+    analysis = latest("analysis_*.md")
+    run_log = latest("logs/signal_*.log")
+    if not analysis:
+        if status_msg is not None:
+            await status_msg.edit_text("Не удалось сформировать анализ.")
+        return
+
+    hdr = make_header("📝 LLM Анализ")
+    txt_raw = Path(analysis).read_text(encoding="utf-8")
+    txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
+    await _deliver_publication(
+        context,
+        uid,
+        hdr+"\n\n"+txt,
+        delivery_kind=delivery_kind,
+        protect_content=True,
+    )
+
+    if status_msg is not None:
+        await status_msg.edit_text(
+            format_done(
+                f"✅ CURRENT: {_relpath(Path(analysis))}",
+                logs_path=_relpath(run_log) if run_log else None,
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+async def _run_symbol_core(
+    uid: int,
+    symbol: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    record: dict,
+    *,
+    status_msg=None,
+    delivery_kind: str = "main",
+) -> None:
+    target_chat_id = _get_publication_target(uid, delivery_kind)
+    if target_chat_id is None:
+        if status_msg is not None:
+            await status_msg.edit_text("Канал для публикации не настроен.")
+        return
+    set_params_mode(get_user_mode(uid))
+    proc = subprocess.run(
+        ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal '{symbol}'"],
+        capture_output=True, text=True, timeout=900
+    )
+
+    analysis = latest("analysis_*.md")
+    sig_html = latest("signal_*.html")
+    run_log = latest("logs/signal_*.log")
+
+    if analysis:
+        hdr = make_header(f"📝 Анализ {symbol}")
+        txt_raw = Path(analysis).read_text(encoding="utf-8")
+        txt = strip_snapshot(txt_raw).strip()
+        await _deliver_publication(
+            context,
+            uid,
+            hdr+"\n\n"+txt,
+            delivery_kind=delivery_kind,
+            protect_content=True,
+        )
+
+    if sig_html:
+        parts = html_file_to_tg_text(Path(sig_html))
+        if parts:
+            part0 = parts[0]
+            await _publish_signal_result(
+                context,
+                uid,
+                text="📣 Сигнал\n\n" + part0,
+                target_chat_id=target_chat_id,
+                delivery_kind=delivery_kind,
+                source="tg_bot.py:_run_symbol_core",
+                symbol_hint=symbol,
+                sig_html=Path(sig_html) if sig_html else None,
+                run_log=Path(run_log) if run_log else None,
+            )
+
+    if record.get("status") == "trial":
+        consume_trial(uid)
+
+    if status_msg is not None:
+        await status_msg.edit_text(
+            format_done(
+                f"✅ SIGNAL: {symbol}",
+                logs_path=_relpath(run_log) if run_log else None,
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
 # ---------- FULL ----------
 async def handle_full(update,context):
     uid = update.effective_user.id
     if not is_allowed(uid):
         await update.message.reply_text("Нет доступа.")
+        return
+    record = await _ensure_active_access(update)
+    if record is None:
         return
 
     ok, wait = can_request(uid)
@@ -1093,71 +1917,13 @@ async def handle_full(update,context):
 
     touch_request(uid)
     msg = await update.message.reply_text("Готовлю FULL… ⏳")
-    target = get_main_chat_id(uid)
-    targets = get_signal_targets(uid)
 
     if not acquire_gen_lock():
         await msg.edit_text("Занято, попробуй позже.")
         return
 
     try:
-        set_params_mode(get_user_mode(uid))
-        proc = subprocess.run(
-            ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
-            capture_output=True, text=True, timeout=900
-        )
-
-        analysis = latest("analysis_*.md")
-        sig_html = latest("signal_*.html")
-        run_log = latest("logs/signal_*.log")
-
-        if analysis:
-            hdr = make_header("📝 LLM Full анализ")
-            txt_raw = Path(analysis).read_text(encoding="utf-8")
-            txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
-            await context.bot.send_message(chat_id=target, text=hdr+"\n\n"+txt)
-
-        if sig_html:
-            parts = html_file_to_tg_text(Path(sig_html))
-            if parts:
-                part0 = parts[0]
-                for ch in targets:
-                    await context.bot.send_message(chat_id=ch, text="📣 Сигнал\n\n"+part0)
-                if "📌 Сигнал не выдан" in part0:
-                    if target is not None:
-                        payload = _build_no_trade_decision_payload(
-                            uid, tg_text=part0, symbol_hint=None, channel_id=target
-                        )
-                        if payload and _should_send_to_aia_for_target(target):
-                            asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
-                else:
-                    published_at = _utc_now_z()
-                    signal_id = _infer_signal_id(
-                        Path(sig_html) if sig_html else None,
-                        Path(run_log) if run_log else None,
-                        published_at,
-                    )
-                    global _AIA_UID_CONTEXT
-                    _AIA_UID_CONTEXT = uid
-                    if target is not None:
-                        sig_v1 = _build_signal_json_v1(
-                            signal_id=signal_id,
-                            published_at=published_at,
-                            channel_id=target,
-                            symbol_hint=None,
-                        )
-                        if sig_v1 and _should_send_to_aia_for_target(target):
-                            asyncio.create_task(_send_signal_to_aia_background(sig_v1))
-
-        mode_label = MODE_LABELS.get(get_user_mode(uid), MODE_LABELS["neutral"])
-        await msg.edit_text(
-            format_done(
-                f"✅ FULL: режим {mode_label}",
-                logs_path=_relpath(run_log) if run_log else None,
-            ),
-            parse_mode=ParseMode.HTML
-        )
-
+        await _run_full_core(uid, context, record, status_msg=msg)
     finally:
         release_gen_lock()
 
@@ -1166,6 +1932,9 @@ async def handle_current_analysis(update,context):
     uid = update.effective_user.id
     if not is_allowed(uid):
         await update.message.reply_text("Нет доступа.")
+        return
+    record = await _ensure_active_access(update)
+    if record is None:
         return
 
     ok, wait = can_request(uid)
@@ -1179,36 +1948,13 @@ async def handle_current_analysis(update,context):
 
     touch_request(uid)
     msg = await update.message.reply_text("Готовлю анализ… ⏳")
-    target = get_main_chat_id(uid)
 
     if not acquire_gen_lock():
         await msg.edit_text("Занято, позже.")
         return
 
     try:
-        set_params_mode(get_user_mode(uid))
-        proc = subprocess.run(
-            ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
-            capture_output=True, text=True, timeout=900
-        )
-        analysis = latest("analysis_*.md")
-        run_log = latest("logs/signal_*.log")
-        if not analysis:
-            await msg.edit_text("Не удалось сформировать анализ.")
-            return
-
-        hdr = make_header("📝 LLM Анализ")
-        txt_raw = Path(analysis).read_text(encoding="utf-8")
-        txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
-        await context.bot.send_message(chat_id=target, text=hdr+"\n\n"+txt)
-
-        await msg.edit_text(
-            format_done(
-                f"✅ CURRENT: {_relpath(Path(analysis))}",
-                logs_path=_relpath(run_log) if run_log else None,
-            ),
-            parse_mode=ParseMode.HTML
-        )
+        await _run_analysis_core(uid, context, record, status_msg=msg)
     finally:
         release_gen_lock()
 
@@ -1220,6 +1966,9 @@ async def handle_symbol(update,context):
     uid = update.effective_user.id
     if not is_allowed(uid):
         await update.message.reply_text("Нет доступа.")
+        return
+    record = await _ensure_active_access(update)
+    if record is None:
         return
 
     ok, wait = can_request(uid)
@@ -1234,8 +1983,6 @@ async def handle_symbol(update,context):
 
     symbol = f"{sym}/USDT"
     msg = await update.message.reply_text(f"Готовлю сигнал по {symbol}… ⏳")
-    target = get_main_chat_id(uid)
-    targets = get_signal_targets(uid)
 
     if is_gen_locked():
         await msg.edit_text("Уже считается другой сигнал, попробуй позже.")
@@ -1248,63 +1995,7 @@ async def handle_symbol(update,context):
         return
 
     try:
-        set_params_mode(get_user_mode(uid))
-        # SINGLE-путь: один символ напрямую
-        proc = subprocess.run(
-            ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal '{symbol}'"],
-            capture_output=True, text=True, timeout=900
-        )
-
-        analysis = latest("analysis_*.md")
-        sig_html = latest("signal_*.html")
-        run_log = latest("logs/signal_*.log")
-
-        if analysis:
-            hdr = make_header(f"📝 Анализ {symbol}")
-            txt_raw = Path(analysis).read_text(encoding="utf-8")
-            txt = strip_snapshot(txt_raw).strip()   # ВЕСЬ анализ, не режем по 2️⃣ Сетап
-            await context.bot.send_message(chat_id=target, text=hdr+"\n\n"+txt)
-
-        if sig_html:
-            parts = html_file_to_tg_text(Path(sig_html))
-            if parts:
-                part0 = parts[0]
-                for ch in targets:
-                    await context.bot.send_message(chat_id=ch, text="📣 Сигнал\n\n"+part0)
-                if "📌 Сигнал не выдан" in part0:
-                    if target is not None:
-                        payload = _build_no_trade_decision_payload(
-                            uid, tg_text=part0, symbol_hint=symbol, channel_id=target
-                        )
-                        if payload and _should_send_to_aia_for_target(target):
-                            asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
-                else:
-                    published_at = _utc_now_z()
-                    signal_id = _infer_signal_id(
-                        Path(sig_html) if sig_html else None,
-                        Path(run_log) if run_log else None,
-                        published_at,
-                    )
-                    global _AIA_UID_CONTEXT
-                    _AIA_UID_CONTEXT = uid
-                    if target is not None:
-                        sig_v1 = _build_signal_json_v1(
-                            signal_id=signal_id,
-                            published_at=published_at,
-                            channel_id=target,
-                            symbol_hint=symbol,
-                        )
-                        if sig_v1 and _should_send_to_aia_for_target(target):
-                            asyncio.create_task(_send_signal_to_aia_background(sig_v1))
-
-        await msg.edit_text(
-            format_done(
-                f"✅ SIGNAL: {symbol}",
-                logs_path=_relpath(run_log) if run_log else None,
-            ),
-            parse_mode=ParseMode.HTML
-        )
-
+        await _run_symbol_core(uid, symbol, context, record, status_msg=msg)
     finally:
         release_gen_lock()
 
@@ -1447,6 +2138,11 @@ def register_text_handlers(app:Application):
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Анализ$"), handle_analysis_menu))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📈 Current$"), handle_current_analysis))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^⚙️ Режим$"), handle_mode_menu))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📝 Регистрация$"), handle_register))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🎁 5 сигналов$"), handle_trial))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^💳 Оплата$"), handle_pay))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🧾 Статус$"), handle_status))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🔗 Signal bot$"), handle_signal_bot_info))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟥 Агрессивный$"), handle_mode_aggressive))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟨 Нейтральный$"), handle_mode_neutral))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^🟩 Консервативный$"), handle_mode_conservative))
@@ -1461,13 +2157,20 @@ def register_text_handlers(app:Application):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env.tg.clean")
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("register", handle_register))
+    app.add_handler(CommandHandler("trial", handle_trial))
+    app.add_handler(CommandHandler("pay", handle_pay))
+    app.add_handler(CommandHandler("status", handle_status))
+    app.add_handler(CommandHandler("signalbot", handle_signal_bot_info))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
     app.add_handler(CommandHandler("aia_report", handle_aia_report))
     app.add_handler(CommandHandler("aia_daily", handle_aia_daily))
+    app.add_handler(CommandHandler("panel", handle_panel_publish))
+    app.add_handler(CallbackQueryHandler(handle_panel_callback, pattern="^panel:"))
     register_text_handlers(app)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
