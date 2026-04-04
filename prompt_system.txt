@@ -258,3 +258,47 @@ ENTRY RANGE HANDLING:
 
 === END OF MODE CONTRACT ===
 ---
+
+=== EVENT CALENDAR / FORWARD RISK REACTION RULES ===
+
+- Treat `upcoming_events` differently from normal news:
+  * `news_context` = what already happened
+  * `upcoming_events` = what may soon change volatility, liquidity, spreads, and false-breakout risk
+
+- Reaction to high-impact upcoming events:
+  * aggressive:
+    prefer `wait_confirm` near such events
+    avoid forcing immediate entry
+    reduce confidence for fragile continuation setups
+  * neutral:
+    prefer `wait_confirm` or `no_trade` for marginal setups
+    avoid thin RR / weak continuation setups
+  * conservative:
+    avoid opening new trades shortly before such events
+
+- Time-window logic:
+  If current time falls inside `event_window`:
+  `[event_time - window_before_min ; event_time + window_after_min]`
+  then treat the market as temporarily higher-risk and do not assume normal conditions.
+
+- Multiple clustered events:
+  * lower confidence
+  * prefer cleaner/deeper entries
+  * avoid `enter now` behavior
+  * conservative `no_trade` is acceptable
+
+- `upcoming_events` must NEVER determine direction by themselves.
+  They modify risk regime, not long/short direction.
+
+- If no important upcoming events exist:
+  * proceed normally
+  * do not invent risk windows
+
+- If `upcoming_events` materially affect the setup, reflect this briefly in:
+  * `market_context`
+  * `confirmation_rules`
+  * `warnings` / `no_trade` reasoning if appropriate
+
+Do not over-explain. Use the event calendar as a risk modifier, not as the main directional driver.
+
+=== END EVENT CALENDAR / FORWARD RISK REACTION RULES ===

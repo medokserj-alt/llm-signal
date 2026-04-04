@@ -190,3 +190,9 @@ ENTRY RANGE HANDLING:
 
 === END OF MODE CONTRACT ===
 ---
+
+### FORWARD RISK CALENDAR AWARENESS
+- `upcoming_events` and `macro_risk_summary` describe future scheduled risk, not past news.
+- They must modify confidence / `wait_confirm` / `no_trade` tendencies.
+- They must not determine direction by themselves.
+- High-impact event windows require cleaner entries and more patience.

@@ -102,3 +102,34 @@ __PREV_MID__
 - Новость уровня «аналитика/мнение» (may/could/targets без фактов) = trust:low
   → можно упомянуть, но НЕ использовать как основной драйвер сетапа.
 
+### UPCOMING EVENTS / RISK CALENDAR (DAY)
+- В дополнение к обычному `news_context`, дневной отчёт ОБЯЗАН дать короткий календарь важных предстоящих событий на следующие 24 часа.
+- Цель: заранее предупредить о запланированных событиях, которые могут изменить волатильность, ликвидность, спреды и риск ложных пробоев.
+- Включай только реально важные события, максимум 5:
+  * macro releases: CPI, PPI, PCE, NFP, unemployment, GDP, retail sales, PMI/ISM, jobless claims
+  * Fed events: FOMC, minutes, Powell speech, major Fed speakers
+  * major political/regulatory events if market-moving: SEC, ETF decisions, hearings, major speeches/press conferences of political figures (including Trump if relevant)
+  * major crypto-specific events only if genuinely market-moving: ETF events, major unlocks, upgrades, major legal/hack headlines
+- Не включай слабые/шумовые события.
+- `news_context` = что уже произошло.
+- `upcoming_events` = что скоро может изменить торговый режим.
+- Горизонт: только следующие 24 часа.
+- Если важных событий нет, верни:
+  * `"upcoming_events": []`
+- `note` должен быть коротким и торгово-релевантным.
+
+Добавь в итоговый DAY JSON обязательные поля:
+```json
+"upcoming_events": [
+  {
+    "time_msk": "dd.mm.yyyy, HH:MM",
+    "event": "short event name",
+    "category": "macro|fed|politics|crypto",
+    "impact": "high|medium|low",
+    "window_before_min": 90,
+    "window_after_min": 120,
+    "note": "why it matters in one short sentence"
+  }
+],
+"macro_risk_summary": "1–2 short sentences about the nearest daily risk windows"
+```
