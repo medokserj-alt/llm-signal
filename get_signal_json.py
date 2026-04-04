@@ -7,7 +7,7 @@ import time
 import re
 import argparse
 import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -805,6 +805,633 @@ def ensure_warnings_list(d: dict) -> None:
     else:
         d["warnings"] = []
 
+
+def _normalize_optional_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    try:
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
+def _normalize_optional_number(value):
+    num = _to_float(value)
+    if num is None or not math.isfinite(num):
+        return None
+    if float(num).is_integer():
+        return int(num)
+    return float(num)
+
+
+def _normalize_upcoming_event_item(item):
+    if isinstance(item, str):
+        s = item.strip()
+        return {"event": s} if s else None
+
+    if not isinstance(item, dict):
+        return None
+
+    out: dict = {}
+    text_keys = (
+        "event",
+        "category",
+        "impact",
+        "time_msk",
+        "date_msk",
+        "note",
+        "expected_regime_effect",
+        "type",
+    )
+    number_keys = ("window_before_min", "window_after_min")
+
+    for key in text_keys:
+        if key not in item:
+            continue
+        text = _normalize_optional_text(item.get(key))
+        if text:
+            out[key] = text
+
+    if out.get("note"):
+        out["note"] = _merge_unique_texts(out.get("note"), max_fragments=2)
+
+    for key in number_keys:
+        if key not in item:
+            continue
+        num = _normalize_optional_number(item.get(key))
+        if num is not None:
+            out[key] = num
+
+    # Preserve any extra scalar keys so partially useful events are not silently lost.
+    for key, value in item.items():
+        if key in out or key in text_keys or key in number_keys:
+            continue
+        if isinstance(value, (str, int, float, bool)) and not isinstance(value, bool):
+            text = _normalize_optional_text(value)
+            if text:
+                out[key] = text
+            continue
+        if isinstance(value, bool):
+            out[key] = value
+
+    return out if out else None
+
+
+def _normalize_macro_event_bundle(raw_events, raw_summary) -> tuple[list[dict], str]:
+    normalized_events: list[dict] = []
+
+    if isinstance(raw_events, list):
+        for item in raw_events:
+            normalized = _normalize_upcoming_event_item(item)
+            if normalized is not None:
+                normalized_events.append(normalized)
+    elif isinstance(raw_events, dict):
+        normalized = _normalize_upcoming_event_item(raw_events)
+        if normalized is not None:
+            normalized_events.append(normalized)
+    elif isinstance(raw_events, str):
+        normalized = _normalize_upcoming_event_item(raw_events)
+        if normalized is not None:
+            normalized_events.append(normalized)
+
+    return normalized_events, _merge_unique_texts(raw_summary, max_fragments=3)
+
+
+def ensure_macro_event_fields(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+
+    normalized_events, normalized_summary = _normalize_macro_event_bundle(
+        d.get("upcoming_events"),
+        d.get("macro_risk_summary"),
+    )
+    d["upcoming_events"] = _merge_upcoming_event_lists(normalized_events)
+    d["macro_risk_summary"] = _merge_unique_texts(normalized_summary, max_fragments=3)
+
+
+def _normalize_text_key(value) -> str:
+    text = _normalize_optional_text(value).lower()
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _text_word_tokens(value) -> list[str]:
+    text = _normalize_text_key(value)
+    if not text:
+        return []
+    return re.findall(r"[0-9a-zа-яё]+", text)
+
+
+def _normalize_event_identity_text(value) -> str:
+    tokens = _text_word_tokens(value)
+    if not tokens:
+        return ""
+
+    normalized_tokens: list[str] = []
+    acronym: list[str] = []
+    for token in tokens:
+        if len(token) == 1 and token.isalpha():
+            acronym.append(token)
+            continue
+        if acronym:
+            normalized_tokens.append("".join(acronym))
+            acronym = []
+        normalized_tokens.append(token)
+    if acronym:
+        normalized_tokens.append("".join(acronym))
+    return " ".join(normalized_tokens).strip()
+
+
+_SEMANTIC_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "but",
+    "by",
+    "can",
+    "could",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "may",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+    "без",
+    "ближе",
+    "ближайшие",
+    "ближайшим",
+    "будут",
+    "бы",
+    "в",
+    "во",
+    "вокруг",
+    "времени",
+    "временно",
+    "все",
+    "всего",
+    "для",
+    "до",
+    "же",
+    "за",
+    "и",
+    "или",
+    "из",
+    "их",
+    "к",
+    "ко",
+    "как",
+    "когда",
+    "может",
+    "могут",
+    "на",
+    "над",
+    "не",
+    "но",
+    "о",
+    "об",
+    "оба",
+    "обе",
+    "около",
+    "он",
+    "она",
+    "они",
+    "от",
+    "по",
+    "под",
+    "после",
+    "перед",
+    "при",
+    "про",
+    "с",
+    "со",
+    "также",
+    "то",
+    "только",
+    "у",
+    "это",
+    "этот",
+    "эта",
+    "эти",
+}
+
+
+def _normalize_semantic_token(token: str) -> str:
+    text = _normalize_optional_text(token).lower().replace("ё", "е")
+    if not text:
+        return ""
+
+    if len(text) > 4:
+        if text.endswith("ies"):
+            text = text[:-3] + "y"
+        elif text.endswith("ing"):
+            text = text[:-3]
+        elif text.endswith("ed"):
+            text = text[:-2]
+        elif text.endswith("es"):
+            text = text[:-2]
+        elif text.endswith("s") and not text.endswith("ss"):
+            text = text[:-1]
+
+    for suffix in (
+        "ировать",
+        "ениями",
+        "ового",
+        "евому",
+        "овому",
+        "ением",
+        "остью",
+        "ацией",
+        "яцией",
+        "ация",
+        "яция",
+        "иями",
+        "ости",
+        "ями",
+        "ами",
+        "ием",
+        "иях",
+        "ого",
+        "ему",
+        "ому",
+        "ыми",
+        "ими",
+        "цией",
+        "ция",
+        "ции",
+        "ией",
+        "ий",
+        "ый",
+        "ой",
+        "ая",
+        "ое",
+        "ые",
+        "их",
+        "ых",
+        "ую",
+        "юю",
+        "ам",
+        "ям",
+        "ом",
+        "ем",
+        "ов",
+        "ев",
+        "ия",
+        "ья",
+        "ие",
+        "ье",
+        "ка",
+        "ки",
+        "ть",
+        "ти",
+        "а",
+        "я",
+        "ы",
+        "и",
+        "е",
+        "у",
+        "ю",
+        "о",
+    ):
+        if len(text) - len(suffix) >= 3 and text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text
+
+
+def _semantic_text_tokens(value) -> list[str]:
+    out: list[str] = []
+    for token in _text_word_tokens(value):
+        normalized = _normalize_semantic_token(token)
+        if not normalized:
+            continue
+        if normalized in _SEMANTIC_STOPWORDS:
+            continue
+        if len(normalized) <= 1 and not normalized.isdigit():
+            continue
+        out.append(normalized)
+    return out
+
+
+def _semantic_texts_match(left, right) -> bool:
+    if _event_texts_match(left, right):
+        return True
+
+    left_ordered = _semantic_text_tokens(left)
+    right_ordered = _semantic_text_tokens(right)
+    left_tokens = set(left_ordered)
+    right_tokens = set(right_ordered)
+    if not left_tokens or not right_tokens:
+        return False
+
+    common = left_tokens & right_tokens
+    if not common:
+        return False
+
+    min_ratio = len(common) / min(len(left_tokens), len(right_tokens))
+    max_ratio = len(common) / max(len(left_tokens), len(right_tokens))
+    if min_ratio >= 0.6 or (len(common) >= 4 and max_ratio >= 0.5):
+        return True
+    if left_ordered[:2] == right_ordered[:2] and len(common) >= 4:
+        return True
+    return bool(left_ordered and right_ordered) and left_ordered[0] == right_ordered[0] and len(common) >= 6
+
+
+def _fragment_quality_score(value) -> tuple[int, int]:
+    text = _normalize_optional_text(value)
+    semantic_count = len(set(_semantic_text_tokens(text)))
+    return semantic_count, -len(text)
+
+
+def _find_matching_fragment_index(fragments: list[str], candidate: str) -> int | None:
+    for idx, existing in enumerate(fragments):
+        if _semantic_texts_match(existing, candidate):
+            return idx
+    return None
+
+
+def _collect_unique_text_fragments(*values, max_fragments: int | None = None) -> list[str]:
+    out: list[str] = []
+    for value in values:
+        fragments = _split_text_fragments(value)
+        if not fragments:
+            continue
+        for fragment in fragments:
+            match_idx = _find_matching_fragment_index(out, fragment)
+            if match_idx is not None:
+                if _fragment_quality_score(fragment) > _fragment_quality_score(out[match_idx]):
+                    out[match_idx] = fragment
+                continue
+            if max_fragments is not None and len(out) >= max_fragments:
+                continue
+            out.append(fragment)
+    return out
+
+
+def _split_text_fragments(value) -> list[str]:
+    text = _normalize_optional_text(value)
+    if not text:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    chunks = re.split(r"[\r\n]+", text)
+    for chunk in chunks:
+        piece = chunk.strip()
+        if not piece:
+            continue
+        fragments = re.split(r"(?<=[.!?])\s+|\s*[;•]+\s*", piece)
+        for fragment in fragments:
+            candidate = fragment.strip()
+            if not candidate:
+                continue
+            key = _normalize_event_identity_text(candidate) or _normalize_text_key(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+    return out
+
+
+def _event_fingerprint(item: dict) -> str:
+    fingerprint = _event_primary_identity_key(item)
+    if fingerprint:
+        return fingerprint
+
+    fallback = (
+        _normalize_event_identity_text(item.get("impact")),
+        _normalize_event_identity_text(item.get("expected_regime_effect")),
+        _normalize_event_identity_text(item.get("type")),
+    )
+    return "|".join(p for p in fallback if p)
+
+
+def _event_identity_label(item: dict) -> str:
+    return _normalize_event_identity_text(item.get("event")) or _normalize_event_identity_text(item.get("note"))
+
+
+def _event_primary_identity_key(item: dict) -> str:
+    label = _event_identity_label(item)
+    category = _normalize_event_identity_text(item.get("category"))
+    if label and category:
+        return f"{label}|{category}"
+    if label:
+        return label
+    return category
+
+
+def _extract_date_from_text(value) -> str:
+    text = _normalize_optional_text(value)
+    match = re.search(r"\b\d{2}\.\d{2}\.\d{4}\b", text)
+    return match.group(0) if match else ""
+
+
+def _extract_hhmm_from_text(value) -> str:
+    text = _normalize_optional_text(value)
+    match = re.search(r"\b\d{1,2}:\d{2}\b", text)
+    return match.group(0) if match else ""
+
+
+def _normalize_event_time_key(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    time_text = _normalize_optional_text(item.get("time_msk"))
+    date_text = _normalize_optional_text(item.get("date_msk")) or _extract_date_from_text(time_text)
+    hhmm = _extract_hhmm_from_text(time_text)
+    if hhmm:
+        return "|".join(part for part in (date_text, hhmm) if part)
+    if _event_time_is_tbd(item):
+        return f"tbd|{date_text}" if date_text else "tbd"
+    normalized = _normalize_event_identity_text(time_text)
+    return "|".join(part for part in (date_text, normalized) if part)
+
+
+def _event_times_match(left_event: dict, right_event: dict) -> bool:
+    left_key = _normalize_event_time_key(left_event)
+    right_key = _normalize_event_time_key(right_event)
+    return (not left_key) or (not right_key) or left_key == right_key
+
+
+def _event_time_detail_score(time_value, *, date_value=None) -> tuple[int, int]:
+    time_text = _normalize_optional_text(time_value)
+    date_text = _normalize_optional_text(date_value)
+    if not time_text:
+        return 0, 0
+    if _extract_hhmm_from_text(time_text):
+        return 3, len(time_text)
+    if re.search(r"\btbd\b", time_text, flags=re.IGNORECASE):
+        if _extract_date_from_text(time_text) or date_text:
+            return 2, len(time_text)
+        return 1, len(time_text)
+    if date_text or _extract_date_from_text(time_text):
+        return 2, len(time_text)
+    return 1, len(time_text)
+
+
+def _event_date_detail_score(date_value) -> tuple[int, int]:
+    date_text = _normalize_optional_text(date_value)
+    if not date_text:
+        return 0, 0
+    normalized = _normalize_event_identity_text(date_text)
+    if _extract_date_from_text(date_text):
+        return 2, len(normalized)
+    if normalized == "tbd":
+        return 1, len(normalized)
+    return 1, len(normalized)
+
+
+def _event_fields_compatible(left, right) -> bool:
+    left_key = _normalize_event_identity_text(left)
+    right_key = _normalize_event_identity_text(right)
+    return (not left_key) or (not right_key) or left_key == right_key
+
+
+def _event_texts_match(left, right) -> bool:
+    left_key = _normalize_event_identity_text(left)
+    right_key = _normalize_event_identity_text(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+
+    shorter, longer = sorted((left_key, right_key), key=len)
+    if len(shorter) >= 12 and shorter in longer:
+        return True
+
+    left_tokens = set(left_key.split())
+    right_tokens = set(right_key.split())
+    if not left_tokens or not right_tokens:
+        return False
+    common = left_tokens & right_tokens
+    if bool(common) and (len(common) / min(len(left_tokens), len(right_tokens))) >= 0.8:
+        return True
+
+    left_semantic = set(_semantic_text_tokens(left))
+    right_semantic = set(_semantic_text_tokens(right))
+    if not left_semantic or not right_semantic:
+        return False
+    semantic_common = left_semantic & right_semantic
+    return bool(semantic_common) and (
+        (len(semantic_common) / min(len(left_semantic), len(right_semantic))) >= 0.75
+    )
+
+
+def _find_matching_event_index(events: list[dict], candidate: dict, seen: dict[str, int]) -> int | None:
+    fingerprint = _event_fingerprint(candidate)
+    if fingerprint and fingerprint in seen:
+        return seen[fingerprint]
+
+    candidate_label = _event_identity_label(candidate)
+    candidate_category = candidate.get("category")
+
+    for idx, existing in enumerate(events):
+        if not _event_texts_match(candidate_label, _event_identity_label(existing)):
+            continue
+        if not _event_fields_compatible(candidate_category, existing.get("category")):
+            continue
+        return idx
+    return None
+
+
+def _merge_event_values(primary: dict, incoming: dict) -> dict:
+    merged = copy.deepcopy(primary)
+    canonical_text_keys = (
+        "event",
+        "category",
+        "impact",
+        "date_msk",
+        "time_msk",
+        "note",
+        "expected_regime_effect",
+        "type",
+    )
+    canonical_number_keys = ("window_before_min", "window_after_min")
+
+    for key in canonical_text_keys:
+        existing = _normalize_optional_text(merged.get(key))
+        incoming_val = _normalize_optional_text(incoming.get(key))
+        if key == "note" and existing and incoming_val:
+            merged[key] = _merge_unique_texts(existing, incoming_val, max_fragments=2)
+            continue
+        if key == "date_msk" and existing and incoming_val:
+            if _event_date_detail_score(incoming_val) > _event_date_detail_score(existing):
+                merged[key] = incoming_val
+            continue
+        if key == "time_msk" and existing and incoming_val:
+            existing_score = _event_time_detail_score(existing, date_value=merged.get("date_msk"))
+            incoming_score = _event_time_detail_score(incoming_val, date_value=incoming.get("date_msk") or merged.get("date_msk"))
+            if incoming_score > existing_score:
+                merged[key] = incoming_val
+            continue
+        if key == "expected_regime_effect" and existing and incoming_val:
+            if _fragment_quality_score(incoming_val) > _fragment_quality_score(existing):
+                merged[key] = incoming_val
+            continue
+        if key == "event" and existing and incoming_val and _semantic_texts_match(existing, incoming_val):
+            if _fragment_quality_score(incoming_val) > _fragment_quality_score(existing):
+                merged[key] = incoming_val
+            continue
+        if not existing and incoming_val:
+            merged[key] = incoming_val
+
+    for key in canonical_number_keys:
+        if merged.get(key) is None and incoming.get(key) is not None:
+            merged[key] = incoming.get(key)
+
+    for key, value in incoming.items():
+        if key in canonical_text_keys or key in canonical_number_keys:
+            continue
+        if key not in merged or merged.get(key) in (None, "", []):
+            merged[key] = copy.deepcopy(value)
+            continue
+        if (
+            isinstance(merged.get(key), str)
+            and isinstance(value, str)
+            and _normalize_text_key(merged.get(key)) != _normalize_text_key(value)
+        ):
+            merged[key] = _merge_unique_texts(merged.get(key), value)
+
+    return merged
+
+
+def _merge_upcoming_event_lists(*groups) -> list[dict]:
+    out: list[dict] = []
+    seen: dict[str, int] = {}
+    for group in groups:
+        normalized_events, _ = _normalize_macro_event_bundle(group, "")
+        for item in normalized_events:
+            match_idx = _find_matching_event_index(out, item, seen)
+            if match_idx is not None:
+                out[match_idx] = _merge_event_values(out[match_idx], item)
+                merged_fp = _event_fingerprint(out[match_idx])
+                if merged_fp:
+                    seen[merged_fp] = match_idx
+                continue
+            fp = _event_fingerprint(item)
+            if fp:
+                seen[fp] = len(out)
+            out.append(item)
+    return out
+
+
+def _merge_unique_texts(*values, max_fragments: int | None = None) -> str:
+    return " ".join(_collect_unique_text_fragments(*values, max_fragments=max_fragments))
+
 def normalize_no_trade(d: dict) -> dict:
     """
     Нормализует no_trade-ветку (без “чистки” семантических маркеров).
@@ -1196,7 +1823,7 @@ def _normalize_entry_mode(d: dict) -> None:
 def _normalize_day_mid_context(d: dict) -> None:
     raw = d.get("day_mid_context")
     if isinstance(raw, dict):
-        ctx = raw
+        ctx = dict(raw)
     elif isinstance(raw, str):
         s = raw.strip()
         ctx = {"day_bias": None, "mid_bias": None, "notes": (s or None)}
@@ -1216,7 +1843,94 @@ def _normalize_day_mid_context(d: dict) -> None:
     if "notes" not in ctx:
         ctx["notes"] = None
 
+    ctx_events, ctx_summary = _normalize_macro_event_bundle(
+        ctx.get("upcoming_events"),
+        ctx.get("macro_risk_summary"),
+    )
+    ctx["upcoming_events"] = _merge_upcoming_event_lists(ctx_events)
+    ctx["macro_risk_summary"] = _merge_unique_texts(ctx_summary, max_fragments=3)
+
     d["day_mid_context"] = ctx
+
+
+def _normalize_report_macro_context(report_payload) -> dict | None:
+    if not isinstance(report_payload, dict):
+        return None
+
+    out = dict(report_payload)
+    events, summary = _normalize_macro_event_bundle(
+        out.get("upcoming_events"),
+        out.get("macro_risk_summary"),
+    )
+    out["upcoming_events"] = _merge_upcoming_event_lists(events)
+    out["macro_risk_summary"] = _merge_unique_texts(summary, max_fragments=3)
+
+    tmp = {"day_mid_context": out.get("day_mid_context")}
+    _normalize_day_mid_context(tmp)
+    out["day_mid_context"] = tmp.get("day_mid_context") or {
+        "day_bias": None,
+        "mid_bias": None,
+        "notes": None,
+        "upcoming_events": [],
+        "macro_risk_summary": "",
+    }
+    return out
+
+
+def merge_day_mid_report_context(
+    d: dict,
+    *,
+    day_report: dict | None = None,
+    mid_report: dict | None = None,
+) -> None:
+    if not isinstance(d, dict):
+        return
+
+    ensure_macro_event_fields(d)
+    _normalize_day_mid_context(d)
+
+    day_ctx = _normalize_report_macro_context(day_report)
+    mid_ctx = _normalize_report_macro_context(mid_report)
+    ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+    ctx = dict(ctx)
+
+    for report_ctx in (day_ctx, mid_ctx):
+        if not isinstance(report_ctx, dict):
+            continue
+        report_dm = report_ctx.get("day_mid_context") if isinstance(report_ctx.get("day_mid_context"), dict) else {}
+        if ctx.get("day_bias") is None and report_dm.get("day_bias") is not None:
+            ctx["day_bias"] = report_dm.get("day_bias")
+        if ctx.get("mid_bias") is None and report_dm.get("mid_bias") is not None:
+            ctx["mid_bias"] = report_dm.get("mid_bias")
+
+    ctx["upcoming_events"] = _merge_upcoming_event_lists(
+        (day_ctx or {}).get("upcoming_events"),
+        (mid_ctx or {}).get("upcoming_events"),
+        ctx.get("upcoming_events"),
+    )
+    ctx["macro_risk_summary"] = _merge_unique_texts(
+        (day_ctx or {}).get("macro_risk_summary"),
+        (mid_ctx or {}).get("macro_risk_summary"),
+        ctx.get("macro_risk_summary"),
+    )
+
+    merged_notes = _merge_unique_texts(
+        ((day_ctx or {}).get("day_mid_context") or {}).get("notes"),
+        ((mid_ctx or {}).get("day_mid_context") or {}).get("notes"),
+        ctx.get("notes"),
+    )
+    ctx["notes"] = merged_notes or None
+
+    if isinstance(day_ctx, dict):
+        if day_ctx.get("time_msk"):
+            ctx["day_report_time_msk"] = day_ctx.get("time_msk")
+    if isinstance(mid_ctx, dict):
+        if mid_ctx.get("time_msk"):
+            ctx["mid_report_time_msk"] = mid_ctx.get("time_msk")
+
+    d["day_mid_context"] = ctx
+    d["upcoming_events"] = _merge_upcoming_event_lists(ctx.get("upcoming_events"), d.get("upcoming_events"))
+    d["macro_risk_summary"] = _merge_unique_texts(ctx.get("macro_risk_summary"), d.get("macro_risk_summary"))
 
 
 def _resolve_lessons_path():
@@ -1295,6 +2009,310 @@ def read_file(path: str) -> str:
 
 def current_msk() -> str:
     return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y, %H:%M")
+
+
+def _parse_msk_date(value) -> datetime | None:
+    text = _normalize_optional_text(value)
+    if not text:
+        return None
+    cleaned = re.sub(r"\b(MSK|МСК)\b", "", text, flags=re.IGNORECASE).strip()
+    tz = ZoneInfo("Europe/Moscow")
+    for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=tz)
+        except Exception:
+            pass
+    return None
+
+
+def _parse_msk_datetime(value, *, date_hint=None, fallback_dt: datetime | None = None) -> datetime | None:
+    text = _normalize_optional_text(value)
+    if not text:
+        return None
+    if re.search(r"\btbd\b", text, flags=re.IGNORECASE):
+        return None
+
+    cleaned = re.sub(r"\b(MSK|МСК)\b", "", text, flags=re.IGNORECASE).strip()
+    tz = ZoneInfo("Europe/Moscow")
+
+    for fmt in ("%d.%m.%Y, %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%y, %H:%M", "%d.%m.%y %H:%M"):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=tz)
+        except Exception:
+            pass
+
+    m = re.search(r"(\d{1,2}):(\d{2})", cleaned)
+    if not m:
+        return None
+
+    base_dt = _parse_msk_date(date_hint) if date_hint else None
+    if base_dt is None:
+        base_dt = fallback_dt
+    if base_dt is None:
+        base_dt = _parse_msk_datetime(current_msk())
+    if base_dt is None:
+        return None
+
+    try:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+    except Exception:
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return base_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def _normalize_event_impact(value) -> str:
+    text = _normalize_optional_text(value).lower().replace("-", "_").replace(" ", "_")
+    if text in {"critical", "very_high", "veryhigh", "severe"}:
+        return "high"
+    if text in {"med", "moderate"}:
+        return "medium"
+    if text in {"minor"}:
+        return "low"
+    return text
+
+
+def _event_time_is_tbd(event: dict) -> bool:
+    time_text = _normalize_optional_text(event.get("time_msk"))
+    return (not time_text) or bool(re.search(r"\btbd\b", time_text, flags=re.IGNORECASE))
+
+
+def _event_window_minutes(event: dict) -> tuple[int, int]:
+    impact = _normalize_event_impact(event.get("impact"))
+    before = _to_float(event.get("window_before_min"))
+    after = _to_float(event.get("window_after_min"))
+    if before is None:
+        before = 90.0 if impact == "high" else (45.0 if impact == "medium" else 30.0)
+    if after is None:
+        after = 60.0 if impact == "high" else (30.0 if impact == "medium" else 15.0)
+    return max(int(before), 0), max(int(after), 0)
+
+
+def _event_display_time(event: dict) -> str:
+    time_text = _normalize_optional_text(event.get("time_msk"))
+    date_text = _normalize_optional_text(event.get("date_msk"))
+    if _event_time_is_tbd(event):
+        if date_text:
+            return f"{date_text}, TBD"
+        return "TBD"
+    if time_text and re.search(r"\d{2}\.\d{2}\.\d{4}", time_text):
+        return time_text
+    if time_text and date_text:
+        return f"{date_text}, {time_text}"
+    return time_text or date_text or "TBD"
+
+
+def _event_label(event: dict) -> str:
+    name = _normalize_optional_text(event.get("event")) or "Upcoming event"
+    return f"{name} ({_event_display_time(event)} МСК)"
+
+
+def _downgrade_confidence(d: dict, steps: int = 1) -> None:
+    order = ("Low", "Medium", "High")
+    current = _normalize_optional_text(d.get("confidence"))
+    if current not in order:
+        current = "Medium"
+    idx = order.index(current)
+    idx = max(idx - max(int(steps), 0), 0)
+    d["confidence"] = order[idx]
+
+
+def _event_risk_setup_is_marginal(d: dict, *, mode: str) -> bool:
+    confidence = _normalize_optional_text(d.get("confidence"))
+    if confidence in {"Low", "Medium"}:
+        return True
+
+    entry_mode = str(d.get("entry_mode") or "").strip().lower()
+    if entry_mode in {"now", "market", "wait_confirm"}:
+        return True
+
+    warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+    wl = " ".join(str(w or "").strip().lower() for w in warnings)
+    risk_needles = (
+        "impulse_no_exhale",
+        "phase_between",
+        "ema_between_m15_h1",
+        "neutral_wait_confirm_due_to_volatility",
+        "neutral_wait_confirm_due_to_rr",
+        "dir_guard_forced",
+        "countertrend",
+    )
+    if any(needle in wl for needle in risk_needles):
+        return True
+
+    rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else {}
+    rr_val = _to_float(rr_by_mode.get(mode))
+    if rr_val is None:
+        rr_val = _to_float(d.get("rr"))
+    return rr_val is None or rr_val < 1.8
+
+
+def _ensure_event_wait_confirm_rules(d: dict, event_label: str) -> None:
+    text = (
+        f"Дождаться реакции после события {event_label}: без резкого спайка/расширения спреда, "
+        "затем подтверждение удержания уровня."
+    )
+    raw = d.get("confirmation_rules")
+    if isinstance(raw, str):
+        if event_label not in raw:
+            d["confirmation_rules"] = (raw.strip() + " " + text).strip()
+        return
+    if isinstance(raw, list):
+        joined = " ".join(str(x).strip() for x in raw if str(x).strip())
+        if event_label not in joined:
+            raw.append(text)
+        return
+    d["confirmation_rules"] = text
+
+
+def apply_upcoming_event_risk(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+
+    ensure_warnings_list(d)
+    ensure_macro_event_fields(d)
+    _normalize_day_mid_context(d)
+
+    ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+    merged_events = _merge_upcoming_event_lists(ctx.get("upcoming_events"), d.get("upcoming_events"))
+    merged_summary = _merge_unique_texts(ctx.get("macro_risk_summary"), d.get("macro_risk_summary"))
+    d["upcoming_events"] = merged_events
+    d["macro_risk_summary"] = merged_summary
+    if isinstance(ctx, dict):
+        ctx["upcoming_events"] = copy.deepcopy(merged_events)
+        ctx["macro_risk_summary"] = merged_summary
+        d["day_mid_context"] = ctx
+
+    if not merged_events and not merged_summary:
+        return
+
+    now_dt = _parse_msk_datetime(d.get("time_msk"))
+    if now_dt is None:
+        now_dt = _parse_msk_datetime(current_msk())
+    if now_dt is None:
+        return
+
+    active_high: list[dict] = []
+    active_other: list[dict] = []
+    tbd_events: list[dict] = []
+
+    for event in merged_events:
+        impact = _normalize_event_impact(event.get("impact"))
+        if _event_time_is_tbd(event):
+            tbd_events.append(
+                {
+                    "event": _normalize_optional_text(event.get("event")) or "Upcoming event",
+                    "time_msk": _event_display_time(event),
+                    "impact": impact or "",
+                }
+            )
+            continue
+
+        event_dt = _parse_msk_datetime(
+            event.get("time_msk"),
+            date_hint=event.get("date_msk"),
+            fallback_dt=now_dt,
+        )
+        if event_dt is None:
+            tbd_events.append(
+                {
+                    "event": _normalize_optional_text(event.get("event")) or "Upcoming event",
+                    "time_msk": _event_display_time(event),
+                    "impact": impact or "",
+                }
+            )
+            continue
+
+        before_min, after_min = _event_window_minutes(event)
+        if (event_dt - timedelta(minutes=before_min)) <= now_dt <= (event_dt + timedelta(minutes=after_min)):
+            bucket = {
+                "event": _normalize_optional_text(event.get("event")) or "Upcoming event",
+                "time_msk": _event_display_time(event),
+                "impact": impact or "",
+            }
+            if impact == "high":
+                active_high.append(bucket)
+            else:
+                active_other.append(bucket)
+
+    mode = normalize_mode(d.get("mode"))
+    event_risk = {
+        "active_events": active_high + active_other,
+        "tbd_events": tbd_events,
+        "macro_risk_summary": merged_summary,
+        "mode_action": "none",
+        "display_lines": [],
+    }
+
+    if active_other:
+        _append_unique_str(d, "warnings", "upcoming_event_caution_window")
+        _downgrade_confidence(d, 1)
+        if mode in {"aggressive", "neutral"} and not bool(d.get("no_trade")):
+            d["entry_mode"] = "wait_confirm"
+
+    if active_high:
+        primary = active_high[0]
+        label = f"{primary['event']} ({primary['time_msk']} МСК)"
+        if mode == "aggressive":
+            d["entry_mode"] = "wait_confirm"
+            _append_unique_str(d, "warnings", "upcoming_high_impact_event_wait_confirm")
+            _downgrade_confidence(d, 1)
+            _ensure_event_wait_confirm_rules(d, label)
+            event_risk["mode_action"] = "wait_confirm"
+            event_risk["display_lines"].append(
+                f"⚠️ Event risk: {label} — активное окно high-impact события; aggressive переведён в wait_confirm."
+            )
+        elif mode == "neutral":
+            if _event_risk_setup_is_marginal(d, mode=mode):
+                _set_no_trade_primary_reason(d, "upcoming_high_impact_event_neutral_block")
+                d["no_trade_hint"] = (
+                    f"{label}: активное окно high-impact события; neutral не открывает новый marginal setup."
+                )
+                event_risk["mode_action"] = "no_trade"
+                event_risk["display_lines"].append(
+                    f"⚠️ Event risk: {label} — активное окно high-impact события; marginal neutral setup заблокирован."
+                )
+            else:
+                d["entry_mode"] = "wait_confirm"
+                _append_unique_str(d, "warnings", "upcoming_high_impact_event_neutral_caution")
+                _ensure_event_wait_confirm_rules(d, label)
+                event_risk["mode_action"] = "wait_confirm"
+                event_risk["display_lines"].append(
+                    f"⚠️ Event risk: {label} — активное окно high-impact события; neutral требует wait_confirm."
+                )
+            _downgrade_confidence(d, 1)
+        elif mode == "conservative":
+            _set_no_trade_primary_reason(d, "upcoming_high_impact_event_conservative_block")
+            d["no_trade_hint"] = (
+                f"{label}: активное окно high-impact события; conservative не открывает новые сделки."
+            )
+            _downgrade_confidence(d, 1)
+            event_risk["mode_action"] = "no_trade"
+            event_risk["display_lines"].append(
+                f"⚠️ Event risk: {label} — активное окно high-impact события; conservative блокирует новый вход."
+            )
+
+    if (tbd_events or merged_summary) and not active_high:
+        _append_unique_str(d, "warnings", "upcoming_event_tbd_macro_caution")
+        _downgrade_confidence(d, 1)
+        if tbd_events:
+            primary_tbd = tbd_events[0]
+            event_risk["display_lines"].append(
+                f"⚠️ Macro risk: {primary_tbd['event']} ({primary_tbd['time_msk']} МСК) — точное время не задано, жёсткой блокировки нет; confidence снижена."
+            )
+        elif merged_summary:
+            event_risk["display_lines"].append(
+                "⚠️ Macro risk: ближайшее окно риска без точного времени; жёсткой блокировки нет, но confidence снижена."
+            )
+        if event_risk["mode_action"] == "none":
+            event_risk["mode_action"] = "confidence_down"
+
+    if merged_summary and len(event_risk["display_lines"]) < 2:
+        event_risk["display_lines"].append(f"🗓 Macro risk summary: {merged_summary}")
+
+    d["event_risk"] = event_risk
 
 
 # ---- тикеры с last и 24h % ----
@@ -4398,6 +5416,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     hints = hints or {}
     d = data or {}
     ensure_warnings_list(d)
+    ensure_macro_event_fields(d)
 
     # Защита от cross-symbol contamination в hints.*:
     # hints.price / hints.ema* можно использовать только если hints.symbol == текущему d["symbol"].
@@ -4628,6 +5647,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         sync_impulse_proxy(d)
     except Exception:
         pass
+    try:
+        apply_upcoming_event_risk(d)
+    except Exception:
+        pass
     return normalize_no_trade(d)
 
 
@@ -4651,6 +5674,58 @@ def read_latest_report_text(root_dir: str, limit_chars: int = 2000) -> str:
         return txt
     except Exception:
         return ""
+
+
+def read_latest_report_payload(
+    root_dir: str,
+    *,
+    max_age_hours: float | None = None,
+    base_dir: Path | None = None,
+) -> dict | None:
+    try:
+        base_root = base_dir if isinstance(base_dir, Path) else BASE
+        base = base_root / "reports" / root_dir
+        roots = sorted(base.glob("*"))
+        if not roots:
+            return None
+        report_dir = roots[-1]
+        payload_path = report_dir / "last.json"
+        if not payload_path.exists():
+            return None
+
+        report_time = None
+        try:
+            report_time = datetime.strptime(report_dir.name, "%Y%m%d_%H%M%S").replace(
+                tzinfo=ZoneInfo("Europe/Moscow")
+            )
+        except Exception:
+            report_time = datetime.fromtimestamp(
+                report_dir.stat().st_mtime,
+                tz=ZoneInfo("Europe/Moscow"),
+            )
+
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        age_hours = max((now - report_time).total_seconds() / 3600.0, 0.0)
+        if max_age_hours is not None and age_hours > float(max_age_hours):
+            return None
+
+        raw = json.loads(payload_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+
+        ensure_macro_event_fields(raw)
+        out = {
+            "time_msk": raw.get("time_msk"),
+            "upcoming_events": copy.deepcopy(raw.get("upcoming_events") or []),
+            "macro_risk_summary": raw.get("macro_risk_summary") or "",
+            "day_mid_context": copy.deepcopy(raw.get("day_mid_context")),
+            "_report_dir": report_dir.name,
+            "_age_hours": age_hours,
+            "_source": root_dir,
+        }
+        return _normalize_report_macro_context(out)
+    except Exception:
+        return None
 
 
 # ---------------- Bootstrap ----------------
@@ -4766,6 +5841,8 @@ if args.multi:
 
     day_txt = read_latest_report_text("day", limit_chars=2000)
     mid_txt = read_latest_report_text("mid", limit_chars=2000)
+    day_report_payload = read_latest_report_payload("day", max_age_hours=36)
+    mid_report_payload = read_latest_report_payload("mid", max_age_hours=120)
 
     pool_symbols = sorted(pool_snapshot.keys())
     pool_payload = {
@@ -4788,11 +5865,14 @@ if args.multi:
         "Верни ОДИН JSON c двумя ключами: overview (list of paragraphs) и signal (объект).\n"
         "overview: 4–6 абзацев обзора по пулу, каждый абзац отдельной строкой массива.\n"
         "signal: объект с полями time_msk, symbol, price, direction, entry_range, sl, tp1, tp2, rr, "
-        "take_profit_rules, break_even_rule, multi_tf_view, why_asset, news_context, market_context, "
+        "take_profit_rules, break_even_rule, multi_tf_view, why_asset, news_context, upcoming_events, "
+        "macro_risk_summary, market_context, "
         "validity_minutes, cancel_condition, technical_rationale, disclaimer, entry_mode, confidence, "
         "confirmation_rules, alt_entry_range, entries, no_trade, no_trade_reasons, no_trade_hint, "
         "max_valid_minutes, ema20_m15, ema20_h1, ema_guard, day_mid_context, adx_guard, "
         "tp_by_mode, rr_by_mode, exit_plan_by_mode.\n"
+        "upcoming_events: массив объектов будущих событий. Разрешены частично заполненные объекты; не опускай поле.\n"
+        "macro_risk_summary: краткая строка с ближайшими risk windows; если риска нет — пустая строка.\n"
         "news_context: выбери 1–3 строки ПРЯМО из блока [NEWS] или NEWS_FOCUS и вставь их БЕЗ ИЗМЕНЕНИЙ, "
         "сохраняя префикс времени вида \"[YYYY-MM-DD HH:MM МСК]\" и тег [impact:…]. Нельзя удалять/менять "
         "timestamp/impact или переписывать заголовок. Допускается добавить пояснение только в конце через "
@@ -4863,6 +5943,20 @@ if args.multi:
             user_prompt += "\n[DAY REPORT]\n" + day_txt + "\n"
         if mid_txt:
             user_prompt += "\n[MID REPORT]\n" + mid_txt + "\n"
+    if day_report_payload or mid_report_payload:
+        user_prompt += (
+            "\n=== DAY/MID STRUCTURED FORWARD RISK ===\n"
+            "Ниже — структурированный календарь риска из последних DAY/MID JSON. Используй его как risk modifier.\n"
+            + json.dumps(
+                {
+                    "day": day_report_payload or {},
+                    "mid": mid_report_payload or {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        )
 
     resp = client.chat.completions.create(
         model="gpt-5.1",
@@ -4895,6 +5989,12 @@ if args.multi:
     if not isinstance(signal_raw, dict):
         print(content)
         sys.exit(1)
+
+    merge_day_mid_report_context(
+        signal_raw,
+        day_report=day_report_payload,
+        mid_report=mid_report_payload,
+    )
 
     if _DEBUG_TRACE_ENABLED:
         _debug_trace_reset()
@@ -5031,6 +6131,8 @@ schema_single = (
     "- multi_tf_view: объект с ключами m5, m15, h1, h4, d1 — каждое значение короткая строка-описание структуры\n"
     "- why_asset: строка — почему выбран актив\n"
     "- news_context: массив строк из блока [NEWS]/NEWS_FOCUS (уже с префиксом даты и impact), без изменения текста\n"
+    "- upcoming_events: массив объектов ближайших событий; если событий нет — []\n"
+    "- macro_risk_summary: строка с ближайшими risk windows; если их нет — пустая строка\n"
     "- market_context: строка с использованием [BTC_ETH_24H]\n"
     "- validity_minutes: число (например, 90)\n"
     "- cancel_condition: строка — при каких условиях сетап отменяется\n"
@@ -5102,6 +6204,8 @@ if focus:
 # мягкий контекст DAY/MID и для SINGLE (вариант A)
 day_txt = read_latest_report_text("day", limit_chars=2000)
 mid_txt = read_latest_report_text("mid", limit_chars=2000)
+day_report_payload = read_latest_report_payload("day", max_age_hours=36)
+mid_report_payload = read_latest_report_payload("mid", max_age_hours=120)
 if day_txt or mid_txt:
     user_prompt += (
         "\n\n=== DAY/MID CONTEXT (SOFT, DO NOT OVERRIDE PRICE/EMA) ===\n"
@@ -5112,6 +6216,20 @@ if day_txt or mid_txt:
         user_prompt += "\n[DAY REPORT]\n" + day_txt + "\n"
     if mid_txt:
         user_prompt += "\n[MID REPORT]\n" + mid_txt + "\n"
+if day_report_payload or mid_report_payload:
+    user_prompt += (
+        "\n=== DAY/MID STRUCTURED FORWARD RISK ===\n"
+        "Ниже — структурированный календарь риска из последних DAY/MID JSON. Используй его как risk modifier.\n"
+        + json.dumps(
+            {
+                "day": day_report_payload or {},
+                "mid": mid_report_payload or {},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n"
+    )
 
 # === LLM вызов (SINGLE) ===
 resp = client.chat.completions.create(
@@ -5132,6 +6250,12 @@ try:
 except Exception:
     print(content)
     sys.exit(0)
+
+merge_day_mid_report_context(
+    data,
+    day_report=day_report_payload,
+    mid_report=mid_report_payload,
+)
 
 if _DEBUG_TRACE_ENABLED:
     _debug_trace_reset()
