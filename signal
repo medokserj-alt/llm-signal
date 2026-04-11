@@ -11,14 +11,16 @@ fi
 cd "$(dirname "$0")"
 mkdir -p logs
 
-MODEL="gpt-4.1"
+MODEL="${OPENAI_MODEL:-gpt-5.2}"
 PARAMS="params.json"
+is_full_run=0
 
 # Разбор аргументов: "./signal full" | "./signal LINK"
 args=()
 if [[ $# -gt 0 ]]; then
   if [[ "$1" == "full" ]]; then
     shift
+    is_full_run=1
     args+=(--multi)
   elif [[ "$1" != -* && $# -eq 1 ]]; then
     args+=(--symbol "$1")
@@ -183,6 +185,10 @@ last_json="logs/last.json"
 
 # Прогоняем JSON через v2-постобработку (EMA/H1 + DAY/MID + ADX + три входа)
 "$PYTHON_BIN" postprocess_full_last.py >> "$run_log" 2>&1 || echo "[WARN] postprocess_full_last failed" >> "$run_log"
+
+if [[ "$is_full_run" == "1" && "${SIGNAL_SKIP_AIA_SEND:-0}" != "1" ]]; then
+  "$PYTHON_BIN" send_last_signal_to_aia.py "$run_log" | tee -a "$run_log" || true
+fi
 
 # HTML-сигнал из v2 JSON
 "$PYTHON_BIN" render_strict.py < "$last_json" | tee -a "$run_log" || true

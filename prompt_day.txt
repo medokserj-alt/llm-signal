@@ -5,6 +5,7 @@
 — Снимок рынка: [SNAPSHOT] (BTC/ETH last, change_24h + котировки пула)
 — [NEWS] (12h)
 — TIME: hints.time_msk (день недели/сессия)
+— calendar_events: structured scheduled events from local event calendar; primary source of scheduled event timing
 — Правила риска: R:R ≥ 2.0 (нормально), при low-volume (выходные/Азия) — жёстче (R:R ≥ 2.2, только wait_confirm)
 
 ### VOLUME CONTEXT (день)
@@ -15,9 +16,10 @@
 
 ### ВЫХОД (строго):
 1) Краткий дневной макрофон (2–3 абзаца): ликвидность $, доходности UST, календарь дня, сводка новостей [NEWS] (1–3 буллета).
-2) Обзор пула: по 1–2 предложения на актив (фаза/EMA/RSI/объём, без чисел которых нет во входе).
-3) Лучший актив дня (1 шт.): почему он, риски/альтернатива.
-4) СИГНАЛ JSON (строго по схеме ниже).
+2) Отдельный короткий раздел `🗓 Ключевые события периода` (или эквивалент): 1–5 пунктов, в каждом кратко time/date + event + impact.
+3) Обзор пула: по 1–2 предложения на актив (фаза/EMA/RSI/объём, без чисел которых нет во входе).
+4) Лучший актив дня (1 шт.): почему он, риски/альтернатива.
+5) СИГНАЛ JSON (строго по схеме ниже).
 
 JSON-схема (как в проекте): {
  "time_msk": string,
@@ -29,7 +31,10 @@ JSON-схема (как в проекте): {
  "take_profit_rules": string, "break_even_rule": string,
  "multi_tf_view": {"m5":string,"m15":string,"h1":string,"h4":string,"d1":string},
  "why_asset": string,
- "news_context": string[], "market_context": string,
+ "news_context": string[],
+ "upcoming_events": object[],
+ "macro_risk_summary": string,
+ "market_context": string,
  "validity_minutes": 90, "cancel_condition": string,
  "technical_rationale": string, "disclaimer": string,
  "entry_mode": "limit"|"wait_confirm"|"now", "confidence":"Low|Medium|High",
@@ -104,27 +109,61 @@ __PREV_MID__
 
 ### UPCOMING EVENTS / RISK CALENDAR (DAY)
 - В дополнение к обычному `news_context`, дневной отчёт ОБЯЗАН дать короткий календарь важных предстоящих событий на следующие 24 часа.
+- `calendar_events` = primary source of truth for scheduled event timing. Обычный market/news analysis не заменяй и не упрощай: делай его как раньше, а calendar_events используй для validation/enrichment тайминга.
 - Цель: заранее предупредить о запланированных событиях, которые могут изменить волатильность, ликвидность, спреды и риск ложных пробоев.
+- Модель ОБЯЗАНА активно искать предстоящие события в web-accessible calendar-style sources, а не опираться только на narrative news.
+- Приоритетные источники:
+  * macro calendars (CPI, NFP, PCE, GDP, jobless claims, Fed-related macro releases)
+  * Fed schedule (FOMC, minutes, Powell speeches, major Fed speakers)
+  * official or widely cited event calendars
+  * major crypto scheduled events only if they are clearly known and publicly scheduled
 - Включай только реально важные события, максимум 5:
-  * macro releases: CPI, PPI, PCE, NFP, unemployment, GDP, retail sales, PMI/ISM, jobless claims
-  * Fed events: FOMC, minutes, Powell speech, major Fed speakers
-  * major political/regulatory events if market-moving: SEC, ETF decisions, hearings, major speeches/press conferences of political figures (including Trump if relevant)
-  * major crypto-specific events only if genuinely market-moving: ETF events, major unlocks, upgrades, major legal/hack headlines
+  * high impact macro: CPI, NFP, Fed, GDP, PCE
+  * major Fed events: Powell, FOMC, minutes, major Fed speakers
+  * major geopolitical announcements if clearly scheduled
+  * major crypto events ONLY if clearly scheduled and impactful
 - Не включай слабые/шумовые события.
+- Сначала извлекай события, которые явно указаны как scheduled / planned / due / release / announcement.
+- Извлекай события и из собственного текста/рассуждения: если ты описываешь будущий macro / Fed / political / crypto event, конвертируй его в отдельную structured entry в `upcoming_events`.
+- Если в тексте упомянуто любое FUTURE event, оно ОБЯЗАТЕЛЬНО должно быть добавлено в `upcoming_events`.
+- If `calendar_events` contains a valid scheduled item inside the horizon, it MUST appear in `upcoming_events`.
+- If you mention a future event in text but do not include it in `upcoming_events`, your output is invalid.
+- Textual description of future events does NOT replace `upcoming_events`. The JSON field must always reflect them.
+- `upcoming_events` is REQUIRED in every output and must NEVER be null.
+- Prefer structured representation of risk over narrative-only description.
+- Если классических scheduled macro events нет (например, нет CPI / FOMC / NFP в горизонте), ты ВСЁ РАВНО ОБЯЗАН заполнить `upcoming_events` через event-like entries для известных forward risks.
+- Fallback forward-risk buckets when classic macro is absent:
+  * geopolitical deadlines / ultimatums / hearings / votes / regulatory deadlines
+  * known narrative risk windows: earnings, ETF flows/reporting windows, unlocks, upgrades, legal decisions, major industry events
+  * market structure risks: thin liquidity sessions, liquidation clusters/zones, options expiry, funding/reset windows
+- Такие fallback entries допустимы даже без классического макро-релиза, если риск-драйвер идентифицируем и находится в горизонте следующих 24 часов.
+- Consistency rule:
+  * Every future event mentioned in text MUST appear in `upcoming_events`.
+  * If a forward risk is identifiable, it MUST be represented in `upcoming_events`, even if it is not a classical macro release.
+  * Narrative-only description is not enough when a forward risk window can be structured.
+- Для каждого события указывай exact time, если он известен.
+- Если exact time неизвестен, используй `time_msk: "TBD"` и всё равно включай событие, если оно clearly scheduled и находится в горизонте.
+- Если известен только approximate timing, используй best available estimate и НЕ выдумывай ложную точность.
+- Для fallback risk windows без точного часа используй `time_msk: "TBD"`; не выдумывай ложные exact timestamps.
+- Игнорируй vague / tentative / rumored / possible mentions, если невозможно идентифицировать сам future risk window.
 - `news_context` = что уже произошло.
 - `upcoming_events` = что скоро может изменить торговый режим.
 - Горизонт: только следующие 24 часа.
-- Если важных событий нет, верни:
-  * `"upcoming_events": []`
+- `upcoming_events` ОБЯЗАТЕЛЬНО должен существовать всегда.
+- Returning `upcoming_events`: [] is allowed ONLY if there are truly no identifiable forward risks in the next 24 hours after checking both scheduled events and fallback risk windows.
+- If `calendar_events` is empty, do not invent scheduled events. В таком случае можно оставить `upcoming_events`: [] и вынести только общий unscheduled risk в `macro_risk_summary`.
+- Do NOT guess or hallucinate events. Only include items that are clearly identifiable as scheduled releases / announcements OR as real forward-risk windows.
+- Better to include fewer events with partial data than to omit clearly referenced scheduled ones.
+- Если нет надёжных событий из календарных источников, переходи к fallback forward-risk representation, а не к prose-only описанию.
 - `note` должен быть коротким и торгово-релевантным.
 
 Добавь в итоговый DAY JSON обязательные поля:
 ```json
 "upcoming_events": [
   {
-    "time_msk": "dd.mm.yyyy, HH:MM",
+    "time_msk": "dd.mm.yyyy, HH:MM or TBD",
     "event": "short event name",
-    "category": "macro|fed|politics|crypto",
+    "category": "macro|fed|politics|crypto|flows|market_structure|earnings",
     "impact": "high|medium|low",
     "window_before_min": 90,
     "window_after_min": 120,

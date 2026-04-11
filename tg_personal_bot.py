@@ -1403,7 +1403,7 @@ async def handle_full(update,context):
     try:
         set_params_mode(get_user_mode(uid))
         proc = subprocess.run(
-            ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
+            ["bash","-lc", f"cd '{PROJECT_ROOT}' && SIGNAL_SKIP_AIA_SEND=1 ./signal full"],
             capture_output=True, text=True, timeout=900
         )
 
@@ -1488,7 +1488,7 @@ async def handle_current_analysis(update,context):
     try:
         set_params_mode(get_user_mode(uid))
         proc = subprocess.run(
-            ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
+            ["bash","-lc", f"cd '{PROJECT_ROOT}' && SIGNAL_SKIP_AIA_SEND=1 ./signal full"],
             capture_output=True, text=True, timeout=900
         )
         analysis = latest("analysis_*.md")

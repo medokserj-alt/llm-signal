@@ -18,8 +18,11 @@ export PREV_MID="$(grep -A200 '=== LAST MID ===' /tmp/prev_reports.txt | sed -n 
 # сохраняем фактически использованный промпт
 cp -f prompt_analysis.txt "$OUT/_prompt_used.txt" || true
 
+# обновляем event calendar перед DAY; при сбое оставляем последний валидный файл
+python3 tools/update_event_calendar.py >/tmp/event_calendar_day_${TS}.out 2>&1 || true
+
 # генерация
-DISABLE_STATUS_SNAPSHOT=1 ./signal full >"/tmp/day_${TS}.out" 2>&1 || true
+EVENT_CALENDAR_PROFILE=day DISABLE_STATUS_SNAPSHOT=1 SIGNAL_SKIP_AIA_SEND=1 ./signal full >"/tmp/day_${TS}.out" 2>&1 || true
 
 # сбор артефактов
 cp -f analysis_*.md      "$OUT"/ 2>/dev/null || true

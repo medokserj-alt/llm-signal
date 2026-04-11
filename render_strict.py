@@ -199,6 +199,114 @@ def _sanitize_trend_narrative(
     return ", ".join(parts)
 
 
+def _format_news_item(item) -> str:
+    if isinstance(item, str):
+        return _one_line(item)
+    if isinstance(item, dict):
+        required_keys = ("title", "impact", "time_msk", "url", "summary")
+        if all(isinstance(item.get(key), str) and _one_line(item.get(key, "")) for key in required_keys):
+            return (
+                f"[{_one_line(item['time_msk'])}] "
+                f"[impact:{_one_line(item['impact'])}] "
+                f"{_one_line(item['title'])} — {_one_line(item['url'])} — {_one_line(item['summary'])}"
+            )
+        return _one_line(str(item))
+    return _one_line(str(item))
+
+
+def _render_news_context(news_context, *, limit: int = 3) -> list[str]:
+    if news_context is None:
+        return ["Новостной фон: —"]
+    if isinstance(news_context, str):
+        text = _one_line(news_context)
+        return [text] if text else ["Новостной фон: —"]
+    if not isinstance(news_context, list):
+        text = _one_line(str(news_context))
+        return [text] if text else ["Новостной фон: —"]
+
+    lines: list[str] = []
+    for item in news_context:
+        if len(lines) >= limit:
+            break
+        text = _format_news_item(item)
+        if text:
+            lines.append(text)
+    return lines or ["Новостной фон: —"]
+
+
+def _infer_mtf_fallback(data: dict) -> str:
+    raw_side = data.get("side")
+    raw_direction = raw_side if (isinstance(raw_side, str) and raw_side.strip()) else data.get("direction")
+    direction = _one_line(str(raw_direction)).lower() if raw_direction is not None else ""
+
+    ema_signals = [
+        data.get("price_vs_ema20_m15"),
+        data.get("price_vs_ema20_h1"),
+        data.get("ema20_m15"),
+        data.get("ema20_h1"),
+        data.get("ema_fan_m15_state"),
+        data.get("ema_fan_h1_state"),
+    ]
+    has_ema_context = any(value not in (None, "", "—") for value in ema_signals)
+    if direction in ("long", "short") or has_ema_context:
+        if direction == "short":
+            return "Таймфреймы: 5m–1h: структура соответствует направлению сделки, откаты к EMA используются как точки входа для short."
+        return "Таймфреймы: 5m–1h: структура соответствует направлению сделки, откаты к EMA используются как точки входа."
+    return "Таймфреймы: структура не определена"
+
+
+def _render_mtf_block(data: dict, mtf: dict, mtf_fallback: str) -> list[str]:
+    lines: list[str] = []
+    ema_line = _ema_status_line(data)
+    if ema_line:
+        lines.append(ema_line)
+
+    if mtf_fallback:
+        lines.append(f"Таймфреймы: {_one_line(mtf_fallback)}")
+        return lines
+
+    tf_order = ("m5", "m15", "h1", "h4", "d1")
+    has_meaningful_views = any(_one_line(str(mtf.get(tf, ""))) not in ("", "—") for tf in tf_order)
+    if not has_meaningful_views:
+        lines.append(_infer_mtf_fallback(data))
+        return lines
+
+    m15_view = _sanitize_trend_narrative(
+        str(mtf.get("m15", "—")),
+        price_vs_ema20=data.get("price_vs_ema20_m15"),
+        ema_fan_state=data.get("ema_fan_m15_state"),
+    )
+    h1_view = _sanitize_trend_narrative(
+        str(mtf.get("h1", "—")),
+        price_vs_ema20=data.get("price_vs_ema20_h1"),
+        ema_fan_state=data.get("ema_fan_h1_state"),
+    )
+    lines.append(
+        "5m: "
+        f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(m15_view)}; "
+        f"1h: {_one_line(h1_view)}; 4h: {_one_line(str(mtf.get('h4','—')))}; "
+        f"1D: {_one_line(str(mtf.get('d1','—')))}"
+    )
+    return lines
+
+
+def _iter_event_risk_lines(d: dict) -> list[str]:
+    event_risk = d.get("event_risk")
+    if not isinstance(event_risk, dict):
+        return []
+    raw = event_risk.get("display_lines")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = _one_line(item)
+        if text:
+            out.append(text)
+    return out
+
+
 def main():
     raw = sys.stdin.read().strip()
     if not raw:
@@ -238,7 +346,16 @@ def main():
 
     take_profit_rules = (data.get("take_profit_rules") or "").strip()
     break_even_rule = (data.get("break_even_rule") or "").strip()
-    mtf = data.get("multi_tf_view", {}) or {}
+    raw_mtf = data.get("multi_tf_view")
+    if isinstance(raw_mtf, dict):
+        mtf = raw_mtf
+        mtf_fallback = ""
+    elif isinstance(raw_mtf, str):
+        mtf = {}
+        mtf_fallback = raw_mtf.strip()
+    else:
+        mtf = {}
+        mtf_fallback = ""
     why_asset = (data.get("why_asset") or "").strip()
     news_ctx = data.get("news_context", []) or []
     market_ctx = (data.get("market_context") or "").strip()
@@ -486,6 +603,8 @@ def main():
                         lines.append(note)
             except Exception:
                 pass
+            for event_line in _iter_event_risk_lines(data)[:2]:
+                lines.append(event_line)
             wl = " ".join(w.lower() for w in _iter_warnings(data))
             if mode == "aggressive" and "phase_flip_wait_confirm" in wl:
                 lines.append("⚠️ Phase flip по M15: вход только после подтверждения (wait_confirm).")
@@ -559,42 +678,13 @@ def main():
         # 3) Таймфреймы
         if mode_valid:
             lines.append("3️⃣ Таймфреймы")
-            ema_line = _ema_status_line(data)
-            if ema_line:
-                lines.append(ema_line)
-            m15_view = _sanitize_trend_narrative(
-                str(mtf.get("m15", "—")),
-                price_vs_ema20=data.get("price_vs_ema20_m15"),
-                ema_fan_state=data.get("ema_fan_m15_state"),
-            )
-            h1_view = _sanitize_trend_narrative(
-                str(mtf.get("h1", "—")),
-                price_vs_ema20=data.get("price_vs_ema20_h1"),
-                ema_fan_state=data.get("ema_fan_h1_state"),
-            )
-            lines.append(
-                "5m: "
-                f"{_one_line(str(mtf.get('m5','—')))}; 15m: {_one_line(m15_view)}; "
-                f"1h: {_one_line(h1_view)}; 4h: {_one_line(str(mtf.get('h4','—')))}; "
-                f"1D: {_one_line(str(mtf.get('d1','—')))}"
-            )
+            lines.extend(_render_mtf_block(data, mtf, mtf_fallback))
             lines.append("")
 
         if mode_valid:
             # 4) Новостной фон (1–3 строки, как в news_snapshot.py)
             lines.append("4️⃣ Новостной фон")
-            news_lines: list[str] = []
-            for it in (news_ctx or []):
-                if len(news_lines) >= 3:
-                    break
-                s = _one_line(str(it))
-                if s:
-                    news_lines.append(s)
-            if not news_lines:
-                news_lines = [
-                    f"- [{_now_msk_news_prefix()} МСК] [impact:neutral] Новостных триггеров не выявлено."
-                ]
-            lines.extend(news_lines)
+            lines.extend(_render_news_context(news_ctx, limit=3))
             lines.append("")
 
             # Дисклеймер (одна строка)

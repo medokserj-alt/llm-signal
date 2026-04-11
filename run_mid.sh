@@ -10,7 +10,11 @@ cp -f prompt_mid.txt      prompt_analysis.txt
 
 . /tmp/inject_prev_mid.sh
 cp -f prompt_analysis.txt "$OUT/_prompt_used.txt" || true
-DISABLE_STATUS_SNAPSHOT=1 ./signal full >/tmp/mid_${TS}.out 2>&1 || true
+
+# обновляем event calendar перед MID; при сбое оставляем последний валидный файл
+python3 tools/update_event_calendar.py >/tmp/event_calendar_mid_${TS}.out 2>&1 || true
+
+EVENT_CALENDAR_PROFILE=mid DISABLE_STATUS_SNAPSHOT=1 SIGNAL_SKIP_AIA_SEND=1 ./signal full >/tmp/mid_${TS}.out 2>&1 || true
 
 cp -f analysis_*.md "$OUT"/ 2>/dev/null || true
 cp -f logs/last.json "$OUT"/ 2>/dev/null || true

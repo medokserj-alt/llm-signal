@@ -2,6 +2,8 @@ import json, os, sys
 from dotenv import load_dotenv
 from openai import OpenAI
 
+DEFAULT_OPENAI_AUX_MODEL = "gpt-5.4-nano"
+
 def main():
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
@@ -18,7 +20,7 @@ def main():
 
     user = "Пул активов:\n" + json.dumps(pool, ensure_ascii=False)
     resp = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL","gpt-4.1-mini"),
+        model=os.getenv("OPENAI_AUX_MODEL", DEFAULT_OPENAI_AUX_MODEL),
         response_format={"type":"json_object"},
         messages=[
             {"role":"system","content":p_select},

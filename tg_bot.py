@@ -6,10 +6,53 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest, parse as urlparse
 
-from dotenv import load_dotenv
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+try:
+    from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.constants import ParseMode
+    from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+except ImportError:
+    class _TelegramStub:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    class _DummyFilter:
+        def __and__(self, other):
+            return self
+
+        def __rand__(self, other):
+            return self
+
+    class _Filters:
+        TEXT = _DummyFilter()
+
+        @staticmethod
+        def Regex(pattern):
+            return _DummyFilter()
+
+    class _ContextTypes:
+        DEFAULT_TYPE = object
+
+    class _ParseMode:
+        HTML = "HTML"
+
+    Update = _TelegramStub
+    KeyboardButton = _TelegramStub
+    ReplyKeyboardMarkup = _TelegramStub
+    InlineKeyboardButton = _TelegramStub
+    InlineKeyboardMarkup = _TelegramStub
+    Application = _TelegramStub
+    CommandHandler = _TelegramStub
+    MessageHandler = _TelegramStub
+    CallbackQueryHandler = _TelegramStub
+    ContextTypes = _ContextTypes
+    ParseMode = _ParseMode
+    filters = _Filters()
 
 from pinned_state import get_pinned_message_id, load_pinned_state, save_pinned_state, set_pinned_message_id
 from rbac import analysis_menu_layout, is_admin
@@ -32,7 +75,8 @@ from user_registry import (
 BASE = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE
 
-load_dotenv(BASE / ".env.tg.clean")
+if load_dotenv is not None:
+    load_dotenv(BASE / ".env.tg.clean")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 FALLBACK_CHANNEL = os.getenv("TELEGRAM_TARGET_CHANNEL")
@@ -362,7 +406,7 @@ async def _send_main_publication(
     text: str,
     *,
     parse_mode: str | None = None,
-    protect_content: bool = True,
+    protect_content: bool = False,
 ) -> list[int]:
     chat_id = get_main_publication_chat_id(uid)
     if chat_id is None:
@@ -390,7 +434,7 @@ async def _deliver_publication(
     *,
     delivery_kind: str,
     parse_mode: str | None = None,
-    protect_content: bool = True,
+    protect_content: bool = False,
 ) -> bool:
     if delivery_kind == "personal":
         return _send_personal(uid, text, parse_mode=parse_mode, protect_content=protect_content)
@@ -620,13 +664,13 @@ def _signal_bot_kb() -> InlineKeyboardMarkup:
 async def _send_signal_bot_hint(update: Update) -> None:
     await update.message.reply_text(_signal_bot_hint_text(), reply_markup=_signal_bot_kb())
 
-def _send_via_signal_bot(chat_id: int, text: str, *, parse_mode: str | None = None, protect_content: bool = True) -> bool:
+def _send_via_signal_bot(chat_id: int, text: str, *, parse_mode: str | None = None, protect_content: bool = False) -> bool:
     payload = {"chat_id": chat_id, "text": text, "protect_content": bool(protect_content)}
     if parse_mode:
         payload["parse_mode"] = parse_mode
     return _signal_bot_request_json("POST", "/sendMessage", body=payload)
 
-def _send_personal(uid: int, text: str, *, parse_mode: str | None = None, protect_content: bool = True) -> bool:
+def _send_personal(uid: int, text: str, *, parse_mode: str | None = None, protect_content: bool = False) -> bool:
     ok = _send_via_signal_bot(uid, text, parse_mode=parse_mode, protect_content=protect_content)
     if ok:
         try:
@@ -717,6 +761,38 @@ def _extract_max_wait_minutes(d: dict, default: int = 90) -> int:
             return v
     return int(default)
 
+def _resolve_signal_mode_from_last_json(d: dict, *, uid: int | None = None) -> str:
+    if isinstance(uid, int):
+        return get_user_mode(uid)
+
+    raw_mode = d.get("mode")
+    if isinstance(raw_mode, str):
+        mode = raw_mode.strip().lower()
+        if mode in VALID_MODES:
+            return mode
+
+    decision_path = d.get("decision_path")
+    if isinstance(decision_path, list):
+        first_mode = None
+        for item in decision_path:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("mode")
+            if not isinstance(raw, str):
+                continue
+            mode = raw.strip().lower()
+            if mode not in VALID_MODES:
+                continue
+            if first_mode is None:
+                first_mode = mode
+            result = str(item.get("result") or "").strip().lower()
+            if result == "accepted":
+                return mode
+        if first_mode in VALID_MODES:
+            return first_mode
+
+    return "neutral"
+
 def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
     rules: list[dict] = []
     raw = d.get("confirmation_rules")
@@ -757,9 +833,16 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
 
     symbol = d.get("symbol") or symbol_hint
     direction = d.get("direction") or d.get("side")
-    entry_range = d.get("entry_range") if isinstance(d.get("entry_range"), dict) else {}
-    entry_low = entry_range.get("min")
-    entry_high = entry_range.get("max")
+    entry_range_raw = d.get("entry_range")
+    if isinstance(entry_range_raw, dict):
+        entry_low = entry_range_raw.get("min")
+        entry_high = entry_range_raw.get("max")
+    elif isinstance(entry_range_raw, (list, tuple)) and len(entry_range_raw) == 2:
+        entry_low = entry_range_raw[0]
+        entry_high = entry_range_raw[1]
+    else:
+        entry_low = None
+        entry_high = None
     sl = d.get("sl")
     tp1 = d.get("tp1")
     tp2 = d.get("tp2")
@@ -796,7 +879,7 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         if uid is None and isinstance(_AIA_UID_CONTEXT, int):
             uid = _AIA_UID_CONTEXT
 
-        mode = get_user_mode(uid) if isinstance(uid, int) else "neutral"
+        mode = _resolve_signal_mode_from_last_json(d, uid=uid)
 
         raw_entry_mode = d.get("entry_mode")
         entry_type = None
@@ -890,8 +973,8 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         except Exception:
             entry_price = None
         if entry_price is None:
-            low = _try_float(entry_range.get("min"))
-            high = _try_float(entry_range.get("max"))
+            low = _try_float(entry_zone[0] if len(entry_zone) == 2 else None)
+            high = _try_float(entry_zone[1] if len(entry_zone) == 2 else None)
             if low is not None and high is not None:
                 entry_price = (low + high) / 2.0
         if entry_price is None:
@@ -1074,7 +1157,7 @@ async def _publish_signal_result(
         uid,
         text,
         delivery_kind=delivery_kind,
-        protect_content=True,
+        protect_content=False,
     )
     if not delivered:
         _log_signal_publication(
@@ -1571,7 +1654,7 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
         set_paid(query.from_user)
-        ok = _send_personal(uid, "✅ Подписка активирована. Запрашивай сигналы в основном канале.", protect_content=True)
+        ok = _send_personal(uid, "✅ Подписка активирована. Запрашивай сигналы в основном канале.", protect_content=False)
         if ok:
             await query.answer("Подписка активирована. Проверь личный чат Signal bot.", show_alert=True)
         else:
@@ -1601,13 +1684,13 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "panel:analysis":
-        if not _send_personal(uid, "Готовлю анализ… ⏳", protect_content=True):
+        if not _send_personal(uid, "Готовлю анализ… ⏳", protect_content=False):
             await query.answer("Открой Signal bot и нажми /start.", show_alert=True)
             return
         await query.answer("Готовлю… отправлю в личку.", show_alert=False)
         touch_request(uid)
         if not acquire_gen_lock():
-            _send_personal(uid, "Занято, попробуй позже.", protect_content=True)
+            _send_personal(uid, "Занято, попробуй позже.", protect_content=False)
             return
         try:
             await _run_analysis_core(uid, context, record, status_msg=None, delivery_kind="personal")
@@ -1616,13 +1699,13 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if data == "panel:full":
-        if not _send_personal(uid, "Готовлю FULL… ⏳", protect_content=True):
+        if not _send_personal(uid, "Готовлю FULL… ⏳", protect_content=False):
             await query.answer("Открой Signal bot и нажми /start.", show_alert=True)
             return
         await query.answer("Готовлю… отправлю в личку.", show_alert=False)
         touch_request(uid)
         if not acquire_gen_lock():
-            _send_personal(uid, "Занято, попробуй позже.", protect_content=True)
+            _send_personal(uid, "Занято, попробуй позже.", protect_content=False)
             return
         try:
             await _run_full_core(uid, context, record, status_msg=None, delivery_kind="personal")
@@ -1636,13 +1719,13 @@ async def handle_panel_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("Неизвестный тикер.", show_alert=True)
             return
         symbol = f"{sym}/USDT"
-        if not _send_personal(uid, f"Готовлю сигнал по {symbol}… ⏳", protect_content=True):
+        if not _send_personal(uid, f"Готовлю сигнал по {symbol}… ⏳", protect_content=False):
             await query.answer("Открой Signal bot и нажми /start.", show_alert=True)
             return
         await query.answer("Готовлю… отправлю в личку.", show_alert=False)
         touch_request(uid)
         if not acquire_gen_lock():
-            _send_personal(uid, "Занято, попробуй позже.", protect_content=True)
+            _send_personal(uid, "Занято, попробуй позже.", protect_content=False)
             return
         try:
             await _run_symbol_core(uid, symbol, context, record, status_msg=None, delivery_kind="personal")
@@ -1738,7 +1821,7 @@ async def _run_full_core(
         return
     set_params_mode(get_user_mode(uid))
     proc = subprocess.run(
-        ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
+        ["bash","-lc", f"cd '{PROJECT_ROOT}' && SIGNAL_SKIP_AIA_SEND=1 ./signal full"],
         capture_output=True, text=True, timeout=900
     )
 
@@ -1755,7 +1838,7 @@ async def _run_full_core(
             uid,
             hdr+"\n\n"+txt,
             delivery_kind=delivery_kind,
-            protect_content=True,
+            protect_content=False,
         )
 
     if sig_html:
@@ -1802,7 +1885,7 @@ async def _run_analysis_core(
         return
     set_params_mode(get_user_mode(uid))
     proc = subprocess.run(
-        ["bash","-lc", f"cd '{PROJECT_ROOT}' && ./signal full"],
+        ["bash","-lc", f"cd '{PROJECT_ROOT}' && SIGNAL_SKIP_AIA_SEND=1 ./signal full"],
         capture_output=True, text=True, timeout=900
     )
     analysis = latest("analysis_*.md")
@@ -1820,7 +1903,7 @@ async def _run_analysis_core(
         uid,
         hdr+"\n\n"+txt,
         delivery_kind=delivery_kind,
-        protect_content=True,
+        protect_content=False,
     )
 
     if status_msg is not None:
@@ -1865,7 +1948,7 @@ async def _run_symbol_core(
             uid,
             hdr+"\n\n"+txt,
             delivery_kind=delivery_kind,
-            protect_content=True,
+            protect_content=False,
         )
 
     if sig_html:

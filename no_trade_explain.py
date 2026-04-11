@@ -169,6 +169,10 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "риск-окно по времени/ликвидности"
     if low == "time_window_conservative":
         return "риск-окно по времени/ликвидности (conservative: без сделок)"
+    if low == "upcoming_high_impact_event_neutral_block":
+        return "в активном окне high-impact события neutral не открывает marginal setup"
+    if low == "upcoming_high_impact_event_conservative_block":
+        return "в активном окне high-impact события conservative не открывает новые сделки"
     if low == "risk_off":
         return "режим risk-off (повышенный риск рынка)"
     if low == "low_rr":
@@ -272,7 +276,15 @@ def classify_reason(reason_key: str) -> str:
     }:
         return "Structural"
 
-    if k in {"time_window", "risk_off", "time_window_low_liquidity", "time_window_conservative", "us_open_block_non_aggressive"}:
+    if k in {
+        "time_window",
+        "risk_off",
+        "time_window_low_liquidity",
+        "time_window_conservative",
+        "us_open_block_non_aggressive",
+        "upcoming_high_impact_event_neutral_block",
+        "upcoming_high_impact_event_conservative_block",
+    }:
         return "Risk"
 
     if k in {"mode_disabled", "invalid_mode_setup"} or k.startswith("ema_guard_"):
@@ -310,6 +322,10 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "сейчас риск-окно по времени/ликвидности (без ухудшения качества входа сделку пропускаем)."
     if low == "time_window_conservative":
         return "сейчас риск-окно по времени/ликвидности; в conservative сделки не открываем."
+    if low == "upcoming_high_impact_event_neutral_block":
+        return "активно окно high-impact события; в neutral marginal setup не открываем до реакции рынка."
+    if low == "upcoming_high_impact_event_conservative_block":
+        return "активно окно high-impact события; в conservative новые сделки не открываем до завершения event window."
     if low == "low_rr":
         return "недостаточный R:R при текущем входе/SL/целях."
     if low == "invalid_mode_setup":
@@ -359,6 +375,10 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Дождаться выхода из риск-окна по времени / ликвидности.")
         if low == "time_window_conservative":
             add("– Дождаться выхода из риск-окна по времени / ликвидности (для conservative это обязательно).")
+        if low == "upcoming_high_impact_event_neutral_block":
+            add("– Дождаться завершения окна high-impact события и новой стабилизации после реакции рынка.")
+        if low == "upcoming_high_impact_event_conservative_block":
+            add("– Дождаться завершения окна high-impact события; для conservative вход возможен только после него.")
         if low == "low_rr":
             add("– Улучшить R:R: более выгодный вход (глубже откат) или более понятная цель без роста риска.")
         if low == "ema_guard_below_both_long":
@@ -416,6 +436,10 @@ def format_no_trade_message(d: dict) -> str:
         lines.append(
             f"• {MODE_LABELS_RU.get(m0,'Режим')} режим отклонён: {_reason_to_user_text(r0, m0)} ({cat0})."
         )
+        if r0 in {"upcoming_high_impact_event_neutral_block", "upcoming_high_impact_event_conservative_block"}:
+            hint = str(d.get("no_trade_hint") or "").strip()
+            if hint:
+                lines.append(f"• Деталь: {hint}")
     else:
         lines.append("• Сделка отклонена: нет надёжного сетапа по текущей структуре. (Structural).")
 

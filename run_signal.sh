@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-MODEL=${1:-gpt-4.1-mini}
+MODEL=${1:-${OPENAI_MODEL:-gpt-5.2}}
 
 echo "=== [1] Генерация JSON через $MODEL ==="
 python3 get_signal_json.py --model "$MODEL" --params params.json | tee last.json

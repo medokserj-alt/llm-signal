@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-MODEL="${1:-gpt-4.1-mini}"
+MODEL="${1:-${OPENAI_MODEL:-gpt-5.2}}"
 
 # 1) Получаем анализ+JSON
 python3 get_signal_json.py --model "$MODEL" --multi | tee _multi_raw.txt

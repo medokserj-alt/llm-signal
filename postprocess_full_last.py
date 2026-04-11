@@ -9,8 +9,13 @@ from get_signal_json import (
     apply_ema_blocks_and_derivatives,
     apply_ema_relation_flags,
     enforce_ema_narrative_consistency,
+    apply_upcoming_event_risk,
     apply_ema_exhale_filter,
+    ensure_macro_event_fields,
+    merge_event_calendar_context,
+    merge_day_mid_report_context,
     normalize_no_trade,
+    read_latest_report_payload,
     validate_or_fallback_tvh_by_mode,
     validate_active_mode_setup,
     _round_price,
@@ -157,9 +162,10 @@ def read_latest_report_text(root_dir: str, limit_chars: int = 2000):
         try:
             report_time = datetime.strptime(d.name, "%Y%m%d_%H%M%S")
         except ValueError:
-            pass
-        if report_time is None:
-            report_time = datetime.fromtimestamp(d.stat().st_mtime)
+            report_time = None
+        fs_report_time = datetime.fromtimestamp(max(d.stat().st_mtime, an[-1].stat().st_mtime))
+        if report_time is None or fs_report_time > report_time:
+            report_time = fs_report_time
 
         now = datetime.now()
         age_hours = max((now - report_time).total_seconds() / 3600, 0.0)
@@ -178,6 +184,7 @@ def main():
         return
 
     data = json.loads(p.read_text(encoding="utf-8"))
+    ensure_macro_event_fields(data)
 
     # 1) EMA20(M15/H1) for FULL must come from computed OHLCV provenance (Bybit linear perp).
     try:
@@ -202,9 +209,11 @@ def main():
     except Exception:
         pass
 
-    # 2) Читаем DAY/MID тексты (вариант A)
+    # 2) Читаем DAY/MID тексты (вариант A) + structured risk payloads.
     day_txt, day_age_hours = read_latest_report_text("day", limit_chars=2000)
     mid_txt, mid_age_hours = read_latest_report_text("mid", limit_chars=2000)
+    day_report_payload = read_latest_report_payload("day", max_age_hours=36, base_dir=BASE)
+    mid_report_payload = read_latest_report_payload("mid", max_age_hours=120, base_dir=BASE)
 
     day_context = day_txt
     if day_age_hours is not None and day_age_hours > 36:
@@ -218,6 +227,16 @@ def main():
 
     # 3) прогоняем общий v2-процессор
     data = pp_process(data, day_context, mid_context)
+    merge_day_mid_report_context(
+        data,
+        day_report=day_report_payload,
+        mid_report=mid_report_payload,
+    )
+    merge_event_calendar_context(
+        data,
+        profile="signal",
+        now_msk=data.get("time_msk"),
+    )
     try:
         apply_ema_exhale_filter(data)
     except Exception:
@@ -236,6 +255,12 @@ def main():
         sync_impulse_proxy(data)
     except Exception:
         pass
+    try:
+        apply_upcoming_event_risk(data)
+    except Exception:
+        pass
+    normalize_no_trade(data)
+    ensure_macro_event_fields(data)
 
     # 4) сохраняем обратно
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

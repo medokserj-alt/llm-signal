@@ -27,8 +27,14 @@ except Exception:  # pragma: no cover
 import subprocess
 from pathlib import Path
 import pathlib as _pl
+from event_calendar import (
+    build_calendar_context,
+    build_calendar_risk_summary,
+    render_calendar_section,
+)
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
+DEFAULT_OPENAI_MODEL = "gpt-5.2"
 
 # ---- Variant B+2: neutral semantics guard ----
 # Neutral mode must not recommend entries "too close" to current price.
@@ -1888,11 +1894,18 @@ def merge_day_mid_report_context(
 
     ensure_macro_event_fields(d)
     _normalize_day_mid_context(d)
+    now_dt = _resolve_macro_event_now_dt(d.get("time_msk"))
 
     day_ctx = _normalize_report_macro_context(day_report)
     mid_ctx = _normalize_report_macro_context(mid_report)
     ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
     ctx = dict(ctx)
+
+    if now_dt is not None:
+        _apply_relevant_macro_event_filter(d, now_dt=now_dt)
+        _apply_relevant_macro_event_filter(ctx, now_dt=now_dt)
+        _apply_relevant_macro_event_filter(day_ctx, now_dt=now_dt)
+        _apply_relevant_macro_event_filter(mid_ctx, now_dt=now_dt)
 
     for report_ctx in (day_ctx, mid_ctx):
         if not isinstance(report_ctx, dict):
@@ -2104,6 +2117,78 @@ def _event_display_time(event: dict) -> str:
     return time_text or date_text or "TBD"
 
 
+def _resolve_macro_event_now_dt(now_msk=None) -> datetime | None:
+    now_dt = _parse_msk_datetime(now_msk) if now_msk is not None else None
+    if now_dt is None:
+        now_dt = _parse_msk_datetime(current_msk())
+    return now_dt
+
+
+def _event_reference_date(event: dict) -> datetime | None:
+    if not isinstance(event, dict):
+        return None
+    date_text = _normalize_optional_text(event.get("date_msk")) or _extract_date_from_text(event.get("time_msk"))
+    return _parse_msk_date(date_text)
+
+
+def _event_is_relevant_now(event: dict, *, now_dt: datetime) -> bool:
+    if not isinstance(event, dict):
+        return False
+
+    time_text = _normalize_optional_text(event.get("time_msk"))
+    if _event_time_is_tbd(event):
+        date_dt = _event_reference_date(event)
+        if re.search(r"\btbd\b", time_text, flags=re.IGNORECASE):
+            return date_dt is not None and date_dt.date() >= now_dt.date()
+        if date_dt is not None:
+            return date_dt.date() >= now_dt.date()
+        return True
+
+    event_dt = _parse_msk_datetime(
+        event.get("time_msk"),
+        date_hint=event.get("date_msk"),
+        fallback_dt=now_dt,
+    )
+    if event_dt is None:
+        date_dt = _event_reference_date(event)
+        return date_dt is not None and date_dt.date() >= now_dt.date()
+
+    _, after_min = _event_window_minutes(event)
+    return event_dt >= now_dt or (event_dt + timedelta(minutes=after_min)) >= now_dt
+
+
+def _filter_relevant_upcoming_events(raw_events, *, now_dt: datetime) -> list[dict]:
+    filtered: list[dict] = []
+    for event in _merge_upcoming_event_lists(raw_events):
+        if _event_is_relevant_now(event, now_dt=now_dt):
+            filtered.append(event)
+    return filtered
+
+
+def _sanitize_macro_event_bundle(raw_events, raw_summary, *, now_dt: datetime) -> tuple[list[dict], str]:
+    normalized_events, normalized_summary = _normalize_macro_event_bundle(raw_events, raw_summary)
+    merged_events = _merge_upcoming_event_lists(normalized_events)
+    filtered_events = _filter_relevant_upcoming_events(merged_events, now_dt=now_dt)
+    summary = _merge_unique_texts(normalized_summary, max_fragments=3)
+
+    if merged_events and len(filtered_events) != len(merged_events):
+        summary = build_calendar_risk_summary(filtered_events) if filtered_events else ""
+
+    return filtered_events, summary
+
+
+def _apply_relevant_macro_event_filter(container: dict | None, *, now_dt: datetime) -> None:
+    if not isinstance(container, dict):
+        return
+    events, summary = _sanitize_macro_event_bundle(
+        container.get("upcoming_events"),
+        container.get("macro_risk_summary"),
+        now_dt=now_dt,
+    )
+    container["upcoming_events"] = events
+    container["macro_risk_summary"] = summary
+
+
 def _event_label(event: dict) -> str:
     name = _normalize_optional_text(event.get("event")) or "Upcoming event"
     return f"{name} ({_event_display_time(event)} МСК)"
@@ -2174,10 +2259,23 @@ def apply_upcoming_event_risk(d: dict) -> None:
     ensure_warnings_list(d)
     ensure_macro_event_fields(d)
     _normalize_day_mid_context(d)
+    now_dt = _resolve_macro_event_now_dt(d.get("time_msk"))
+    if now_dt is None:
+        return
 
     ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
-    merged_events = _merge_upcoming_event_lists(ctx.get("upcoming_events"), d.get("upcoming_events"))
-    merged_summary = _merge_unique_texts(ctx.get("macro_risk_summary"), d.get("macro_risk_summary"))
+    own_events, own_summary = _sanitize_macro_event_bundle(
+        d.get("upcoming_events"),
+        d.get("macro_risk_summary"),
+        now_dt=now_dt,
+    )
+    ctx_events, ctx_summary = _sanitize_macro_event_bundle(
+        ctx.get("upcoming_events"),
+        ctx.get("macro_risk_summary"),
+        now_dt=now_dt,
+    )
+    merged_events = _merge_upcoming_event_lists(ctx_events, own_events)
+    merged_summary = _merge_unique_texts(ctx_summary, own_summary)
     d["upcoming_events"] = merged_events
     d["macro_risk_summary"] = merged_summary
     if isinstance(ctx, dict):
@@ -2186,12 +2284,6 @@ def apply_upcoming_event_risk(d: dict) -> None:
         d["day_mid_context"] = ctx
 
     if not merged_events and not merged_summary:
-        return
-
-    now_dt = _parse_msk_datetime(d.get("time_msk"))
-    if now_dt is None:
-        now_dt = _parse_msk_datetime(current_msk())
-    if now_dt is None:
         return
 
     active_high: list[dict] = []
@@ -5699,10 +5791,14 @@ def read_latest_report_payload(
                 tzinfo=ZoneInfo("Europe/Moscow")
             )
         except Exception:
-            report_time = datetime.fromtimestamp(
-                report_dir.stat().st_mtime,
-                tz=ZoneInfo("Europe/Moscow"),
-            )
+            report_time = None
+
+        fs_report_time = datetime.fromtimestamp(
+            max(report_dir.stat().st_mtime, payload_path.stat().st_mtime),
+            tz=ZoneInfo("Europe/Moscow"),
+        )
+        if report_time is None or fs_report_time > report_time:
+            report_time = fs_report_time
 
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         age_hours = max((now - report_time).total_seconds() / 3600.0, 0.0)
@@ -5728,6 +5824,159 @@ def read_latest_report_payload(
         return None
 
 
+def _event_calendar_limit(profile: str) -> int:
+    return 7 if _normalize_optional_text(profile).lower() == "mid" else 5
+
+
+def resolve_event_calendar_profile(
+    profile_hint: str | None = None,
+    *,
+    system_prompt: str | None = None,
+) -> str:
+    hinted = _normalize_optional_text(profile_hint or os.getenv("EVENT_CALENDAR_PROFILE")).lower()
+    if hinted in {"day", "mid", "signal"}:
+        return hinted
+
+    prompt_text = _normalize_optional_text(system_prompt).lower()
+    if "дневной (1–3 дня)" in prompt_text or "следующие 24 часа" in prompt_text:
+        return "day"
+    if "среднесрочный (3–7 дней)" in prompt_text or "горизонт: только следующие 3–7 дней" in prompt_text:
+        return "mid"
+    return "signal"
+
+
+def load_event_calendar_context(
+    profile: str,
+    *,
+    now_msk=None,
+    max_events: int | None = None,
+) -> dict:
+    return build_calendar_context(
+        profile,
+        now_msk=now_msk,
+        max_events=max_events if max_events is not None else _event_calendar_limit(profile),
+    )
+
+
+def build_event_calendar_prompt_block(
+    profile: str,
+    *,
+    now_msk=None,
+    calendar_context: dict | None = None,
+) -> str:
+    ctx = (
+        copy.deepcopy(calendar_context)
+        if isinstance(calendar_context, dict)
+        else load_event_calendar_context(profile, now_msk=now_msk)
+    )
+    return (
+        "\n=== EVENT CALENDAR (PRIMARY SCHEDULED TIMING SOURCE) ===\n"
+        "Ниже — calendar_events из локального event calendar. Это primary source of truth для scheduled event timing.\n"
+        "Продолжай обычный market/news analysis exactly as before; calendar_events используй для validation/enrichment тайминга, а не для замены анализа.\n"
+        "Если valid calendar event есть в calendar_events, он должен попасть в upcoming_events.\n"
+        "If calendar_events contains a valid scheduled item inside the horizon, it must appear in upcoming_events.\n"
+        "Если calendar_events пуст, не выдумывай scheduled events; допускается только общий unscheduled risk в macro_risk_summary.\n"
+        + json.dumps(ctx, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+
+
+def merge_event_calendar_context(
+    d: dict,
+    *,
+    profile: str = "signal",
+    now_msk=None,
+    calendar_context: dict | None = None,
+) -> dict:
+    if not isinstance(d, dict):
+        return {"generated_at_utc": None, "calendar_events": []}
+
+    ensure_macro_event_fields(d)
+    _normalize_day_mid_context(d)
+    now_dt = _resolve_macro_event_now_dt(now_msk or d.get("time_msk"))
+    if now_dt is not None:
+        _apply_relevant_macro_event_filter(d, now_dt=now_dt)
+        _apply_relevant_macro_event_filter(d.get("day_mid_context"), now_dt=now_dt)
+
+    ctx = (
+        copy.deepcopy(calendar_context)
+        if isinstance(calendar_context, dict)
+        else load_event_calendar_context(profile, now_msk=now_msk)
+    )
+    calendar_events = ctx.get("calendar_events") if isinstance(ctx, dict) else []
+    calendar_summary = build_calendar_risk_summary(calendar_events if isinstance(calendar_events, list) else [])
+    if now_dt is not None:
+        normalized_events, normalized_summary = _sanitize_macro_event_bundle(
+            calendar_events,
+            calendar_summary,
+            now_dt=now_dt,
+        )
+    else:
+        normalized_events, normalized_summary = _normalize_macro_event_bundle(calendar_events, calendar_summary)
+    if not normalized_events and not normalized_summary:
+        return ctx
+
+    d["upcoming_events"] = _merge_upcoming_event_lists(normalized_events, d.get("upcoming_events"))
+    d["macro_risk_summary"] = _merge_unique_texts(normalized_summary, d.get("macro_risk_summary"), max_fragments=3)
+
+    dm_ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+    dm_ctx = dict(dm_ctx)
+    dm_ctx["upcoming_events"] = _merge_upcoming_event_lists(normalized_events, dm_ctx.get("upcoming_events"))
+    dm_ctx["macro_risk_summary"] = _merge_unique_texts(
+        normalized_summary,
+        dm_ctx.get("macro_risk_summary"),
+        max_fragments=3,
+    )
+    d["day_mid_context"] = dm_ctx
+    return ctx
+
+
+def read_aia_event_risk_context(event_risk_path: Path | None = None) -> dict:
+    default = {
+        "event_risk_level": "low",
+        "event_risk_window_active": False,
+        "nearest_event_minutes": None,
+        "event_bias": "neutral",
+        "upcoming_events": [],
+    }
+    try:
+        path = event_risk_path or Path(
+            os.getenv("AIA_EVENT_RISK_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/event_risk_context_latest.json"
+        )
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return copy.deepcopy(default)
+    except Exception:
+        return copy.deepcopy(default)
+
+    compact_events = []
+    for item in raw.get("upcoming_events") or []:
+        if not isinstance(item, dict):
+            continue
+        compact_events.append(
+            {
+                "name": item.get("name"),
+                "category": item.get("category"),
+                "impact": item.get("impact"),
+                "minutes_to_event": item.get("minutes_to_event"),
+                "time_msk": item.get("time_msk"),
+                "date_msk": item.get("date_msk"),
+            }
+        )
+        if len(compact_events) >= 3:
+            break
+
+    return {
+        "event_risk_level": raw.get("event_risk_level") if raw.get("event_risk_level") in {"low", "medium", "high"} else "low",
+        "event_risk_window_active": bool(raw.get("event_risk_window_active")),
+        "nearest_event_minutes": raw.get("nearest_event_minutes") if isinstance(raw.get("nearest_event_minutes"), int) else None,
+        "event_bias": raw.get("event_bias")
+        if raw.get("event_bias") in {"risk_on", "risk_off", "uncertain", "mixed", "neutral"}
+        else "neutral",
+        "upcoming_events": compact_events,
+    }
+
+
 # ---------------- Bootstrap ----------------
 BASE = Path(__file__).resolve().parent
 _CLI_CODE = r'''
@@ -5739,7 +5988,7 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+ap.add_argument("--model", default=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL))
 ap.add_argument("--params", default="params.json")
 ap.add_argument("--symbol", default=None, help="Например: ETH/USDT (single-режим)")
 ap.add_argument(
@@ -5751,6 +6000,7 @@ args = ap.parse_args()
 if args.multi:
     system_prompt = read_file("prompt_analysis.txt")
     time_str = current_msk()
+    analysis_profile = resolve_event_calendar_profile(system_prompt=system_prompt)
 
     params_payload = {}
     multi_hints = {}
@@ -5838,11 +6088,13 @@ if args.multi:
 
     news_block = get_news_block(12)
     time_msk = time_str
+    calendar_context = load_event_calendar_context(analysis_profile, now_msk=time_msk)
 
     day_txt = read_latest_report_text("day", limit_chars=2000)
     mid_txt = read_latest_report_text("mid", limit_chars=2000)
     day_report_payload = read_latest_report_payload("day", max_age_hours=36)
     mid_report_payload = read_latest_report_payload("mid", max_age_hours=120)
+    event_risk_context = read_aia_event_risk_context()
 
     pool_symbols = sorted(pool_snapshot.keys())
     pool_payload = {
@@ -5855,6 +6107,9 @@ if args.multi:
             "eth_change_pct": eth_info.get("change"),
         },
         "mode": mode,
+        "event_risk_context": event_risk_context,
+        "calendar_generated_at_utc": calendar_context.get("generated_at_utc"),
+        "calendar_events": calendar_context.get("calendar_events") or [],
     }
     if requested_mode is not None:
         pool_payload["requested_mode"] = requested_mode
@@ -5880,6 +6135,8 @@ if args.multi:
         f"symbol выбирай ТОЛЬКО из списка: {', '.join(pool_symbols)}.\n"
         f"time_msk установи ровно в это значение: {time_msk}.\n"
         "market_context ссылайся на проценты из блока [BTC_ETH_24H] как есть.\n"
+        "event_risk_context используй только как soft bias: он может смещать entry_type к wait_confirm, "
+        "снижать агрессивность и требовать более аккуратного исполнения вокруг окна события, но не должен сам по себе жёстко запрещать сделку.\n"
         "\n=== EMA → TVH (TP) GUIDANCE (SOFT, FOR EXIT ONLY) ===\n"
         "EMA в этом шаге — ТОЛЬКО контекст для мышления при формировании ТВХ/TP (tp_by_mode) и логики выхода "
         "(exit_plan_by_mode). НЕ делай EMA обязательным правилом, НЕ вводи новых no-trade правил и НЕ меняй "
@@ -5921,6 +6178,11 @@ if args.multi:
         + "\n"
         + news_block
     )
+    user_prompt += build_event_calendar_prompt_block(
+        analysis_profile,
+        now_msk=time_msk,
+        calendar_context=calendar_context,
+    )
     if os.getenv("TRACE_LLM_INPUT") == "1":
         print(
             f"\n=== [LLM MODE LINE] ===\nMODE: {mode}. Follow the MODE-SPECIFIC DECISION CONTRACT below.\n"
@@ -5957,9 +6219,16 @@ if args.multi:
             )
             + "\n"
         )
+    user_prompt += (
+        "\n=== AIA EVENT RISK CONTEXT ===\n"
+        "Это отдельный soft-bias слой от AIA. Не превращай его в hard-block: используй для bias к wait_confirm, "
+        "осторожности в aggressive mode и более аккуратного выбора execution вокруг event windows.\n"
+        + json.dumps(event_risk_context, ensure_ascii=False, indent=2)
+        + "\n"
+    )
 
     resp = client.chat.completions.create(
-        model="gpt-5.1",
+        model=args.model,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
@@ -5990,6 +6259,12 @@ if args.multi:
         print(content)
         sys.exit(1)
 
+    merge_event_calendar_context(
+        signal_raw,
+        profile=analysis_profile,
+        now_msk=time_msk,
+        calendar_context=calendar_context,
+    )
     merge_day_mid_report_context(
         signal_raw,
         day_report=day_report_payload,
@@ -6008,6 +6283,12 @@ if args.multi:
     hints = {"time_msk": time_msk, "mode": mode}
     signal = finalize_signal(signal_raw, hints)
     signal["time_msk"] = time_msk
+    merge_event_calendar_context(
+        signal,
+        profile=analysis_profile,
+        now_msk=time_msk,
+        calendar_context=calendar_context,
+    )
 
     _debug_trace_set_entry_range("entry_range_post_finalize", signal)
     _debug_trace_set_entry_range("entry_range_final", signal)
@@ -6016,6 +6297,14 @@ if args.multi:
     if overview_lines:
         print("\n=== [POOL OVERVIEW] ===\n")
         print("\n\n".join(overview_lines))
+        if analysis_profile in {"day", "mid"}:
+            print()
+            print(
+                render_calendar_section(
+                    calendar_context.get("calendar_events") or [],
+                    empty_message="Календарь пуст: подтвержденных scheduled events сейчас нет.",
+                )
+            )
         print("\n==========================\n")
 
     print(json.dumps(signal, ensure_ascii=False))
@@ -6042,6 +6331,8 @@ if args.symbol:
 
 # time hint
 payload["hints"]["time_msk"] = current_msk()
+payload["hints"]["event_risk_context"] = read_aia_event_risk_context()
+signal_calendar_context = load_event_calendar_context("signal", now_msk=payload["hints"]["time_msk"])
 
 # EMA20 hints
 _sym = payload["hints"].get("symbol")
@@ -6152,6 +6443,7 @@ schema_single = (
     "- ema_guard: объект с EMA-контекстом (как в finalize_signal)\n"
     "- day_mid_context: объект с полями day_bias, mid_bias, notes\n"
     "- adx_guard: объект для силы тренда (может быть заглушкой)\n"
+    "- hints.event_risk_context: soft bias от AIA; используй его для более осторожного выбора entry_type / aggressiveness / execution around event windows, но не делай из него hard-block\n"
     "\n=== EMA → TVH (TP) GUIDANCE (SOFT, FOR EXIT ONLY) ===\n"
     "EMA — не жёсткое правило и не повод блокировать сигнал. Используй EMA ТОЛЬКО как ориентир глубины целей "
     "и логики выхода (tp_by_mode + exit_plan_by_mode). Direction/side не меняй из-за EMA.\n"
@@ -6206,6 +6498,7 @@ day_txt = read_latest_report_text("day", limit_chars=2000)
 mid_txt = read_latest_report_text("mid", limit_chars=2000)
 day_report_payload = read_latest_report_payload("day", max_age_hours=36)
 mid_report_payload = read_latest_report_payload("mid", max_age_hours=120)
+event_risk_context = read_aia_event_risk_context()
 if day_txt or mid_txt:
     user_prompt += (
         "\n\n=== DAY/MID CONTEXT (SOFT, DO NOT OVERRIDE PRICE/EMA) ===\n"
@@ -6230,10 +6523,17 @@ if day_report_payload or mid_report_payload:
         )
         + "\n"
     )
+user_prompt += (
+    "\n=== AIA EVENT RISK CONTEXT ===\n"
+    "Это отдельный soft-bias слой от AIA. Не делай из него hard-block: используй его для bias к wait_confirm, "
+    "меньшей агрессии и более аккуратного execution вокруг event windows.\n"
+    + json.dumps(event_risk_context, ensure_ascii=False, indent=2)
+    + "\n"
+)
 
 # === LLM вызов (SINGLE) ===
 resp = client.chat.completions.create(
-    model="gpt-5.1",
+    model=args.model,
     response_format={"type": "json_object"},
     messages=[
         {"role": "system", "content": system_prompt},
@@ -6251,6 +6551,12 @@ except Exception:
     print(content)
     sys.exit(0)
 
+merge_event_calendar_context(
+    data,
+    profile="signal",
+    now_msk=payload.get("hints", {}).get("time_msk"),
+    calendar_context=signal_calendar_context,
+)
 merge_day_mid_report_context(
     data,
     day_report=day_report_payload,
@@ -6268,6 +6574,12 @@ if _DEBUG_TRACE_ENABLED:
         _debug_trace_set_entry_range("entry_range_pre_finalize", data)
 
 data = finalize_signal(data, payload.get("hints", {}))
+merge_event_calendar_context(
+    data,
+    profile="signal",
+    now_msk=payload.get("hints", {}).get("time_msk"),
+    calendar_context=signal_calendar_context,
+)
 
 _debug_trace_set_entry_range("entry_range_post_finalize", data)
 _debug_trace_set_entry_range("entry_range_final", data)

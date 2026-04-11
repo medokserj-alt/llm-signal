@@ -265,6 +265,9 @@ ENTRY RANGE HANDLING:
   * `news_context` = what already happened
   * `upcoming_events` = what may soon change volatility, liquidity, spreads, and false-breakout risk
 
+- `upcoming_events` must be treated as HIGH-CONFIDENCE inputs only when events are explicitly scheduled.
+- If `upcoming_events` is empty, do not assume hidden risk.
+
 - Reaction to high-impact upcoming events:
   * aggressive:
     prefer `wait_confirm` near such events
@@ -275,6 +278,14 @@ ENTRY RANGE HANDLING:
     avoid thin RR / weak continuation setups
   * conservative:
     avoid opening new trades shortly before such events
+
+- If `upcoming_events` contains a high-impact event within 90 minutes:
+  * aggressive:
+    strongly prefer `wait_confirm`
+  * neutral:
+    avoid marginal setups
+  * conservative:
+    no new trades
 
 - Time-window logic:
   If current time falls inside `event_window`:
