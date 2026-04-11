@@ -48,3 +48,7 @@ user_subscriptions*.jsonl
 worktrees/
 ai-agent/
 ai-agent.old/
+.codex
+data/
+user_registry.json
+core_signal_state.json
