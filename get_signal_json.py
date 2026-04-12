@@ -2370,6 +2370,16 @@ def _downgrade_confidence(d: dict, steps: int = 1) -> None:
     d["confidence"] = order[idx]
 
 
+def _upgrade_confidence(d: dict, steps: int = 1) -> None:
+    order = ("Low", "Medium", "High")
+    current = _normalize_optional_text(d.get("confidence"))
+    if current not in order:
+        current = "Medium"
+    idx = order.index(current)
+    idx = min(idx + max(int(steps), 0), len(order) - 1)
+    d["confidence"] = order[idx]
+
+
 def _event_risk_setup_is_marginal(d: dict, *, mode: str) -> bool:
     confidence = _normalize_optional_text(d.get("confidence"))
     if confidence in {"Low", "Medium"}:
@@ -6271,6 +6281,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         apply_upcoming_event_risk(d)
     except Exception:
         pass
+    try:
+        apply_signal_asset_flow_overlay(d)
+    except Exception:
+        pass
     return normalize_no_trade(d)
 
 
@@ -6507,6 +6521,32 @@ def read_aia_event_risk_context(event_risk_path: Path | None = None) -> dict:
     }
 
 
+def _sanitize_flow_market_context(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    drivers = value.get("drivers") if isinstance(value.get("drivers"), list) else []
+    return {
+        "bias": value.get("bias") if value.get("bias") in {"bullish", "bearish", "neutral", "mixed"} else "neutral",
+        "confidence": max(0.0, min(float(value.get("confidence")), 1.0))
+        if isinstance(value.get("confidence"), (int, float))
+        else 0.0,
+        "crowding_state": value.get("crowding_state")
+        if value.get("crowding_state") in {"long_crowded", "short_crowded", "neutral", "mixed"}
+        else "neutral",
+        "exchange_pressure": value.get("exchange_pressure")
+        if value.get("exchange_pressure") in {"high", "medium", "low"}
+        else "low",
+        "stablecoin_support": value.get("stablecoin_support")
+        if value.get("stablecoin_support") in {"high", "medium", "low"}
+        else "low",
+        "unlock_pressure": value.get("unlock_pressure")
+        if value.get("unlock_pressure") in {"high", "medium", "low"}
+        else "low",
+        "drivers": [str(item).strip() for item in drivers if isinstance(item, str) and str(item).strip()],
+        "summary": str(value.get("summary") or "").strip(),
+    }
+
+
 def _normalize_external_context_asset(value) -> str | None:
     if not isinstance(value, str):
         return None
@@ -6526,10 +6566,28 @@ def _normalize_external_context_asset(value) -> str | None:
     return text or None
 
 
-def read_aia_flow_derivatives_context(flow_path: Path | None = None, *, asset: str | None = None) -> dict:
+def _sanitize_flow_asset_context(value, *, asset_hint: str | None = None) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    raw_context = value.get("flow_derivatives_context") if isinstance(value.get("flow_derivatives_context"), dict) else value
+    if not isinstance(raw_context, dict):
+        return {}
+    asset = _normalize_external_context_asset(value.get("asset")) or _normalize_external_context_asset(asset_hint)
+    context = _sanitize_flow_market_context(raw_context)
+    if not context:
+        return {}
+    return {
+        "asset": asset,
+        "timestamp_utc": _normalize_optional_text(value.get("timestamp_utc")),
+        "mode": _normalize_optional_text(value.get("mode")) or "observe_only",
+        "flow_derivatives_context": context,
+    }
+
+
+def read_aia_flow_derivatives_context(flow_path: Path | None = None) -> dict:
     try:
         path = flow_path or Path(
-            os.getenv("AIA_FLOW_DERIVATIVES_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/flow_derivatives_context.json"
+            os.getenv("AIA_FLOW_DERIVATIVES_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/flow_derivatives_context_v2.json"
         )
         raw = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
@@ -6537,57 +6595,120 @@ def read_aia_flow_derivatives_context(flow_path: Path | None = None, *, asset: s
     except Exception:
         return {}
 
-    snapshot_asset = _normalize_external_context_asset(raw.get("asset"))
-    target_asset = _normalize_external_context_asset(asset)
-    if snapshot_asset is None:
+    market_context = _sanitize_flow_market_context(raw.get("market_context"))
+    if not market_context:
         return {}
-    if target_asset is not None and snapshot_asset != target_asset:
-        return {}
-    if raw.get("mode") != "observe_only":
-        return {}
-
-    context = raw.get("flow_derivatives_context")
-    if not isinstance(context, dict):
-        return {}
-    drivers = context.get("drivers") if isinstance(context.get("drivers"), list) else []
 
     return {
-        "asset": snapshot_asset,
-        "timestamp_utc": raw.get("timestamp_utc") if isinstance(raw.get("timestamp_utc"), str) else "",
-        "mode": "observe_only",
-        "flow_derivatives_context": {
-            "bias": context.get("bias") if context.get("bias") in {"bullish", "bearish", "neutral"} else "neutral",
-            "confidence": max(0.0, min(float(context.get("confidence")), 1.0))
-            if isinstance(context.get("confidence"), (int, float))
-            else 0.0,
-            "crowding_state": context.get("crowding_state")
-            if context.get("crowding_state") in {"long_crowded", "short_crowded", "neutral"}
-            else "neutral",
-            "exchange_pressure": context.get("exchange_pressure")
-            if context.get("exchange_pressure") in {"high", "medium", "low"}
-            else "low",
-            "stablecoin_support": context.get("stablecoin_support")
-            if context.get("stablecoin_support") in {"high", "medium", "low"}
-            else "low",
-            "unlock_pressure": context.get("unlock_pressure")
-            if context.get("unlock_pressure") in {"high", "medium", "low"}
-            else "low",
-            "drivers": [str(item) for item in drivers if isinstance(item, str)],
-            "summary": str(context.get("summary") or "").strip(),
-        },
-        "raw_metrics": raw.get("raw_metrics") if isinstance(raw.get("raw_metrics"), dict) else {},
+        "market_context": market_context,
     }
 
 
-def build_flow_derivatives_prompt_block(snapshot: dict | None) -> str:
+def _has_valid_flow_market_context_payload(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    drivers = value.get("drivers")
+    if isinstance(drivers, list) and any(isinstance(item, str) and item.strip() for item in drivers):
+        return True
+    if str(value.get("summary") or "").strip():
+        return True
+    if value.get("bias") in {"bullish", "bearish", "neutral", "mixed"}:
+        return True
+    if isinstance(value.get("confidence"), (int, float)):
+        return True
+    if value.get("crowding_state") in {"long_crowded", "short_crowded", "neutral", "mixed"}:
+        return True
+    if value.get("exchange_pressure") in {"high", "medium", "low"}:
+        return True
+    if value.get("stablecoin_support") in {"high", "medium", "low"}:
+        return True
+    if value.get("unlock_pressure") in {"high", "medium", "low"}:
+        return True
+    return False
+
+
+def read_mid_aia_flow_derivatives_context(flow_path: Path | None = None) -> dict:
+    snapshot = read_aia_flow_derivatives_context(flow_path)
+    if not snapshot:
+        return {}
+    raw_market_context = {}
+    try:
+        path = flow_path or Path(
+            os.getenv("AIA_FLOW_DERIVATIVES_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/flow_derivatives_context_v2.json"
+        )
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("market_context"), dict):
+            raw_market_context = raw.get("market_context") or {}
+    except Exception:
+        return {}
+    if not _has_valid_flow_market_context_payload(raw_market_context):
+        return {}
+    return snapshot
+
+
+def read_signal_asset_flow_context(symbol: str | None, flow_path: Path | None = None) -> dict:
+    asset = _normalize_external_context_asset(symbol)
+    if asset is None:
+        return {}
+    try:
+        path = flow_path or Path(
+            os.getenv("AIA_FLOW_DERIVATIVES_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/flow_derivatives_context_v2.json"
+        )
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+    except Exception:
+        return {}
+
+    asset_contexts = raw.get("asset_contexts")
+    if not isinstance(asset_contexts, dict) or not asset_contexts:
+        return {}
+
+    selected = asset_contexts.get(asset)
+    if not isinstance(selected, dict):
+        selected = None
+        for key, value in asset_contexts.items():
+            if _normalize_external_context_asset(key) != asset:
+                continue
+            if isinstance(value, dict):
+                selected = value
+                break
+    if not isinstance(selected, dict):
+        return {}
+    return _sanitize_flow_asset_context(selected, asset_hint=asset)
+
+
+def build_flow_derivatives_prompt_block(snapshot: dict | None, *, analysis_profile: str = "day") -> str:
     if not isinstance(snapshot, dict) or not snapshot:
         return ""
+    market_context = snapshot.get("market_context") if isinstance(snapshot.get("market_context"), dict) else {}
+    if not market_context:
+        return ""
+    if analysis_profile == "mid":
+        return (
+            "\n=== FLOW / DERIVATIVES CONTEXT (EXTERNAL, ADVISORY ONLY) ===\n"
+            "Это внешний snapshot analysis-layer из AIA. Он строится на своей cadence вне MID и не должен "
+            "пересчитываться внутри MID. Используй его только как positioning/liquidity overlay для 3–7 day context "
+            "и как дополнительную regime nuance.\n"
+            "Он НЕ заменяет собственную оценку MID по price action, market structure, macro/news context и НЕ "
+            "должен сам по себе переворачивать weekly bias или direction.\n"
+            "Если flow bias совпадает с текущим MID view — упомяни подтверждение. Если расходится — опиши это как "
+            "underlying support/fragility, less clean downside или squeeze risk, но оставь MID reading первичной. "
+            "Если flow mixed/neutral — подчеркни нестабильность и two-sided regime.\n"
+            + json.dumps({"market_context": market_context}, ensure_ascii=False, indent=2)
+            + "\n"
+        )
     return (
-        "\n=== FLOW / DERIVATIVES CONTEXT (EXTERNAL, OBSERVE_ONLY) ===\n"
+        "\n=== FLOW / DERIVATIVES CONTEXT (EXTERNAL, ADVISORY ONLY) ===\n"
         "Это внешний snapshot analysis-layer из AIA. Он строится на своей cadence вне DAY и не должен "
-        "пересчитываться внутри DAY. Считай builder источником истины для crowding/exchange pressure/"
-        "stablecoin support/unlock risk; используй snapshot только как explanatory/advisory context.\n"
-        + json.dumps(snapshot, ensure_ascii=False, indent=2)
+        "пересчитываться внутри DAY. Используй его только как positioning/liquidity overlay и дополнительную "
+        "regime nuance.\n"
+        "Он НЕ заменяет собственную оценку DAY по price action, market structure, macro/news context и НЕ "
+        "должен сам по себе переворачивать direction.\n"
+        "Если flow bias совпадает с текущим DAY view — упомяни подтверждение. Если расходится — опиши это как "
+        "underlying support/fragility, но оставь DAY reading первичной. Если flow mixed/neutral — подчеркни "
+        "нестабильность и two-sided risk.\n"
+        + json.dumps({"market_context": market_context}, ensure_ascii=False, indent=2)
         + "\n"
     )
 
@@ -6600,39 +6721,264 @@ def render_flow_derivatives_context_section(
 ) -> str:
     if not isinstance(snapshot, dict) or not snapshot:
         return ""
-    symbol = signal_payload.get("symbol") if isinstance(signal_payload, dict) else None
-    target_asset = _normalize_external_context_asset(symbol)
-    snapshot_asset = _normalize_external_context_asset(snapshot.get("asset"))
-    if snapshot_asset is None:
+    context = snapshot.get("market_context") if isinstance(snapshot.get("market_context"), dict) else {}
+    if not context:
         return ""
-    if target_asset is not None and snapshot_asset != target_asset:
-        return ""
-
-    context = snapshot.get("flow_derivatives_context") if isinstance(snapshot.get("flow_derivatives_context"), dict) else {}
-    drivers = context.get("drivers") if isinstance(context.get("drivers"), list) else []
     lines = [title]
-    lines.append(
-        f"- Asset: {snapshot_asset} | mode: {snapshot.get('mode') or 'n/a'} | "
-        f"timestamp_utc: {snapshot.get('timestamp_utc') or 'n/a'}"
-    )
     if isinstance(context.get("confidence"), (int, float)):
-        lines.append(f"- Bias: {context.get('bias') or 'neutral'} | confidence: {float(context.get('confidence')):.2f}")
+        lines.append(
+            f"- Market bias: {context.get('bias') or 'neutral'} (confidence {float(context.get('confidence')):.2f})"
+        )
     else:
-        lines.append(f"- Bias: {context.get('bias') or 'neutral'} | confidence: 0.00")
-    lines.append(
-        f"- Crowding: {context.get('crowding_state') or 'neutral'} | exchange pressure: "
-        f"{context.get('exchange_pressure') or 'low'}"
-    )
-    lines.append(
-        f"- Stablecoin support: {context.get('stablecoin_support') or 'low'} | unlock pressure: "
-        f"{context.get('unlock_pressure') or 'low'}"
-    )
-    if drivers:
-        lines.append("- Drivers: " + "; ".join(str(item) for item in drivers[:4] if str(item).strip()))
+        lines.append(f"- Market bias: {context.get('bias') or 'neutral'} (confidence 0.00)")
+    lines.append(f"- Crowding: {context.get('crowding_state') or 'neutral'}")
+    lines.append(f"- Exchange pressure: {context.get('exchange_pressure') or 'low'}")
+    lines.append(f"- Stablecoin support: {context.get('stablecoin_support') or 'low'}")
+    lines.append(f"- Unlock pressure: {context.get('unlock_pressure') or 'low'}")
     summary = str(context.get("summary") or "").strip()
     if summary:
         lines.append("- Summary: " + summary)
     return "\n".join(lines)
+
+
+def _signal_has_clean_continuation_structure(d: dict) -> bool:
+    if bool(d.get("no_trade")):
+        return False
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in ("long", "short"):
+        return False
+
+    vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+    fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+
+    if side == "long":
+        continuation = (vs_h1 == "above") and (fan_h1 == "bull") and (fan_m15 == "bull")
+    else:
+        continuation = (vs_h1 == "below") and (fan_h1 == "bear") and (fan_m15 == "bear")
+    if not continuation:
+        return False
+
+    warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+    wl = " ".join(str(w or "").strip().lower() for w in warnings)
+    if any(token in wl for token in ("impulse_no_exhale", "phase_between", "ema_between_m15_h1", "ema_source_suspect")):
+        return False
+    if re.search(r"overextended_(no_exhale|h1)\b", wl):
+        return False
+    return True
+
+
+def _derive_asset_flow_support_for_direction(
+    *,
+    side: str,
+    asset_bias: str,
+    crowding_state: str,
+) -> str:
+    if side not in {"long", "short"}:
+        return "neutral"
+
+    if asset_bias == "mixed":
+        support = "mixed"
+    elif asset_bias == "neutral":
+        support = "neutral"
+    elif (side == "long" and asset_bias == "bullish") or (side == "short" and asset_bias == "bearish"):
+        support = "supportive"
+    else:
+        support = "opposed"
+
+    adverse_crowding = (side == "long" and crowding_state == "long_crowded") or (
+        side == "short" and crowding_state == "short_crowded"
+    )
+    if adverse_crowding and support in {"supportive", "neutral"}:
+        return "mixed"
+    if crowding_state == "mixed" and support == "neutral":
+        return "mixed"
+    return support
+
+
+def _derive_signal_asset_flow_overlay_summary(d: dict, snapshot: dict) -> dict:
+    default = {
+        "summary": {},
+        "warnings": [],
+        "display_lines": [],
+        "prefer_wait_confirm": False,
+        "continuation_stricter": False,
+        "confidence_up_steps": 0,
+        "confidence_down_steps": 0,
+    }
+    if not isinstance(d, dict) or not isinstance(snapshot, dict):
+        return copy.deepcopy(default)
+
+    context = snapshot.get("flow_derivatives_context") if isinstance(snapshot.get("flow_derivatives_context"), dict) else {}
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in {"long", "short"} or not context:
+        return copy.deepcopy(default)
+
+    asset_bias = _normalize_optional_text(context.get("bias")).lower()
+    if asset_bias not in {"bullish", "bearish", "neutral", "mixed"}:
+        asset_bias = "neutral"
+    crowding_state = _normalize_optional_text(context.get("crowding_state")).lower()
+    if crowding_state not in {"long_crowded", "short_crowded", "neutral", "mixed"}:
+        crowding_state = "neutral"
+    exchange_pressure = _normalize_optional_text(context.get("exchange_pressure")).lower()
+    if exchange_pressure not in {"high", "medium", "low"}:
+        exchange_pressure = "low"
+    stablecoin_support = _normalize_optional_text(context.get("stablecoin_support")).lower()
+    if stablecoin_support not in {"high", "medium", "low"}:
+        stablecoin_support = "low"
+    unlock_pressure = _normalize_optional_text(context.get("unlock_pressure")).lower()
+    if unlock_pressure not in {"high", "medium", "low"}:
+        unlock_pressure = "low"
+    flow_confidence = context.get("confidence") if isinstance(context.get("confidence"), (int, float)) else 0.0
+    flow_confidence = max(0.0, min(float(flow_confidence), 1.0))
+
+    flow_support = _derive_asset_flow_support_for_direction(
+        side=side,
+        asset_bias=asset_bias,
+        crowding_state=crowding_state,
+    )
+    continuation_setup = _signal_has_clean_continuation_structure(d)
+    adverse_crowding = (side == "long" and crowding_state == "long_crowded") or (
+        side == "short" and crowding_state == "short_crowded"
+    )
+
+    long_tailwind = stablecoin_support == "high" and exchange_pressure in {"low", "medium"} and unlock_pressure != "high"
+    short_tailwind = exchange_pressure == "high" and stablecoin_support in {"low", "medium"} and unlock_pressure != "low"
+
+    execution_caution = "low"
+    warnings: list[str] = []
+    display_lines: list[str] = []
+    prefer_wait_confirm = False
+    continuation_stricter = False
+    confidence_up_steps = 0
+    confidence_down_steps = 0
+
+    if flow_support == "opposed":
+        execution_caution = "high"
+        warnings.append("flow_opposes_direction")
+        prefer_wait_confirm = True
+        continuation_stricter = True
+        confidence_down_steps = 1
+        if side == "long":
+            display_lines.append("⚠️ Flow opposes this long; confirmation is required.")
+        else:
+            display_lines.append("⚠️ Flow opposes this short; confirmation is required.")
+    elif flow_support == "mixed":
+        execution_caution = "medium"
+        prefer_wait_confirm = adverse_crowding or continuation_setup
+        continuation_stricter = adverse_crowding or continuation_setup
+        if crowding_state == "mixed":
+            warnings.append("mixed_positioning")
+            display_lines.append("⚠️ Mixed positioning increases failed-move risk.")
+        elif side == "long" and adverse_crowding:
+            display_lines.append("⚠️ Long crowding raises dump risk for fresh longs.")
+        elif side == "short" and adverse_crowding:
+            display_lines.append("⚠️ Flow opposes fresh continuation shorts; squeeze risk is elevated.")
+    else:
+        if crowding_state == "mixed":
+            execution_caution = "medium"
+            warnings.append("mixed_positioning")
+            if continuation_setup:
+                prefer_wait_confirm = True
+                continuation_stricter = True
+            display_lines.append("⚠️ Mixed positioning increases failed-move risk.")
+        elif flow_support == "supportive":
+            execution_caution = "low"
+            if side == "long" and long_tailwind and crowding_state != "long_crowded" and flow_confidence >= 0.55:
+                confidence_up_steps = 1
+            elif side == "short" and short_tailwind and crowding_state != "short_crowded" and flow_confidence >= 0.55:
+                confidence_up_steps = 1
+            display_lines.append(f"ℹ️ Flow context is supportive for this {side}.")
+        else:
+            execution_caution = "medium" if crowding_state == "mixed" else "low"
+
+    if side == "long" and crowding_state == "long_crowded":
+        warnings.append("dump_risk_long_crowded")
+        execution_caution = "high" if flow_support in {"opposed", "mixed"} else "medium"
+        prefer_wait_confirm = True
+        continuation_stricter = True
+        confidence_down_steps = max(confidence_down_steps, 1)
+        if not any("dump risk" in line.lower() or "long crowding" in line.lower() for line in display_lines):
+            display_lines.append("⚠️ Long crowding raises dump risk for fresh longs.")
+    elif side == "short" and crowding_state == "short_crowded":
+        warnings.append("squeeze_risk_short_crowded")
+        execution_caution = "high" if flow_support in {"opposed", "mixed"} else "medium"
+        prefer_wait_confirm = True
+        continuation_stricter = True
+        confidence_down_steps = max(confidence_down_steps, 1)
+        if not any("squeeze risk" in line.lower() for line in display_lines):
+            display_lines.append("⚠️ Flow opposes fresh continuation shorts; squeeze risk is elevated.")
+
+    if side == "long" and flow_support != "supportive":
+        if exchange_pressure == "high" or stablecoin_support == "low" or unlock_pressure == "high":
+            continuation_stricter = True
+            prefer_wait_confirm = True
+            execution_caution = "high" if flow_support == "opposed" else execution_caution
+    if side == "short" and flow_support != "supportive":
+        if stablecoin_support == "high" or exchange_pressure == "low":
+            continuation_stricter = True
+            prefer_wait_confirm = True
+
+    if continuation_setup and continuation_stricter:
+        warnings.append("flow_continuation_stricter")
+    if execution_caution == "medium" and flow_support == "mixed" and flow_confidence >= 0.65:
+        confidence_down_steps = max(confidence_down_steps, 1)
+
+    summary = {
+        "asset_bias": asset_bias,
+        "asset_flow_confidence": round(flow_confidence, 3),
+        "crowding_state": crowding_state,
+        "flow_support_for_direction": flow_support,
+        "execution_caution": execution_caution if execution_caution in {"high", "medium", "low"} else "low",
+    }
+    return {
+        "summary": summary,
+        "warnings": warnings,
+        "display_lines": display_lines[:2],
+        "prefer_wait_confirm": bool(prefer_wait_confirm),
+        "continuation_stricter": bool(continuation_stricter),
+        "confidence_up_steps": int(confidence_up_steps),
+        "confidence_down_steps": int(confidence_down_steps),
+    }
+
+
+def apply_signal_asset_flow_overlay(d: dict, flow_path: Path | None = None) -> None:
+    if not isinstance(d, dict):
+        return
+    ensure_warnings_list(d)
+
+    snapshot = read_signal_asset_flow_context(d.get("symbol"), flow_path)
+    if not snapshot:
+        return
+
+    overlay = _derive_signal_asset_flow_overlay_summary(d, snapshot)
+    summary = overlay.get("summary") if isinstance(overlay.get("summary"), dict) else {}
+    if not summary:
+        return
+
+    d["asset_flow_context"] = copy.deepcopy(snapshot)
+    d["asset_flow_summary"] = copy.deepcopy(summary)
+
+    display_lines = overlay.get("display_lines") if isinstance(overlay.get("display_lines"), list) else []
+    if display_lines:
+        d["flow_overlay"] = {
+            "display_lines": [str(line).strip() for line in display_lines if isinstance(line, str) and str(line).strip()][:2],
+            "summary": copy.deepcopy(summary),
+        }
+
+    confidence_down_steps = int(overlay.get("confidence_down_steps") or 0)
+    confidence_up_steps = int(overlay.get("confidence_up_steps") or 0)
+    if confidence_down_steps > 0:
+        _downgrade_confidence(d, confidence_down_steps)
+    elif confidence_up_steps > 0:
+        _upgrade_confidence(d, confidence_up_steps)
+
+    for warning in overlay.get("warnings") or []:
+        _append_unique_str(d, "warnings", str(warning))
+
+    if bool(overlay.get("prefer_wait_confirm")) and not bool(d.get("no_trade")):
+        d["entry_mode"] = "wait_confirm"
 
 
 # ---------------- Bootstrap ----------------
@@ -6757,7 +7103,13 @@ if args.multi:
         calendar_events=calendar_context.get("calendar_events") or [],
     )
     aia_event_risk_context = read_aia_event_risk_context()
-    flow_derivatives_context = read_aia_flow_derivatives_context() if analysis_profile == "day" else {}
+    flow_derivatives_context = (
+        read_aia_flow_derivatives_context()
+        if analysis_profile == "day"
+        else read_mid_aia_flow_derivatives_context()
+        if analysis_profile == "mid"
+        else {}
+    )
 
     pool_symbols = sorted(pool_snapshot.keys())
     pool_payload = {
@@ -6776,7 +7128,7 @@ if args.multi:
         "calendar_events": calendar_context.get("calendar_events") or [],
     }
     if flow_derivatives_context:
-        pool_payload["flow_derivatives_context"] = flow_derivatives_context
+        pool_payload["flow_market_context"] = flow_derivatives_context
     if requested_mode is not None:
         pool_payload["requested_mode"] = requested_mode
 
@@ -6906,6 +7258,8 @@ if args.multi:
     )
     if analysis_profile == "day" and flow_derivatives_context:
         user_prompt += build_flow_derivatives_prompt_block(flow_derivatives_context)
+    elif analysis_profile == "mid" and flow_derivatives_context:
+        user_prompt += build_flow_derivatives_prompt_block(flow_derivatives_context, analysis_profile="mid")
 
     resp = client.chat.completions.create(
         model=args.model,
@@ -7014,7 +7368,15 @@ if args.multi:
                 print(event_risk_section)
             if analysis_profile == "day":
                 flow_derivatives_section = render_flow_derivatives_context_section(
-                    read_aia_flow_derivatives_context(asset=signal.get("symbol")),
+                    read_aia_flow_derivatives_context(),
+                    signal_payload=signal,
+                )
+                if flow_derivatives_section:
+                    print()
+                    print(flow_derivatives_section)
+            elif analysis_profile == "mid":
+                flow_derivatives_section = render_flow_derivatives_context_section(
+                    flow_derivatives_context,
                     signal_payload=signal,
                 )
                 if flow_derivatives_section:

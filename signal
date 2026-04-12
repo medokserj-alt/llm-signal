@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="$(dirname "$0")/.venv/bin/python3"
+PYTHON_BIN="${SIGNAL_PYTHON_BIN:-$(dirname "$0")/.venv/bin/python3}"
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   # fallback на системный python3, если venv по какой-то причине не найден
@@ -9,7 +9,8 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
 fi
 
 cd "$(dirname "$0")"
-mkdir -p logs
+LOGS_DIR="${SIGNAL_LOGS_DIR:-logs}"
+mkdir -p "$LOGS_DIR"
 
 MODEL="${OPENAI_MODEL:-gpt-5.2}"
 PARAMS="params.json"
@@ -30,7 +31,12 @@ fi
 args+=("$@")
 
 ts=$(date -u +%Y%m%d_%H%M%S)
-run_log="logs/signal_${ts}.log"
+run_log="$LOGS_DIR/signal_${ts}.log"
+run_last_json="$LOGS_DIR/last_${ts}.json"
+canonical_last_json="$LOGS_DIR/last.json"
+stream_tmp="$LOGS_DIR/stream.tmp"
+last_raw_json="$LOGS_DIR/last.raw.json"
+last_clean_json="$LOGS_DIR/last.clean.json"
 
 # 1) Генерация + запись логов (сырой поток)
 # --- Step8: refresh LESSONS and export path ---
@@ -39,12 +45,18 @@ export LLM_LESSONS_FILE="$PWD/auto_feedback/lessons/LESSONS_FOR_LLM.md"
 
 "$PYTHON_BIN" get_signal_json.py --model "$MODEL" --params "$PARAMS" "${args[@]}" \
   | tee "$run_log" \
-  | tee -a logs/last_signal.log \
-  > logs/stream.tmp
+  | tee -a "$LOGS_DIR/last_signal.log" \
+  > "$stream_tmp"
 
 # 2) Извлечь ПОСЛЕДНИЙ валидный JSON из лога (баланс скобок, игнорируя строки и экранирования)
+export SIGNAL_RUN_LAST_JSON="$run_last_json"
+export SIGNAL_RUN_LOG="$run_log"
+export SIGNAL_STREAM_TMP="$stream_tmp"
+export SIGNAL_LOGS_DIR="$LOGS_DIR"
+export SIGNAL_LAST_RAW_JSON="$last_raw_json"
+export SIGNAL_LAST_CLEAN_JSON="$last_clean_json"
 python3 - << 'PY'
-import json, re, pathlib, sys
+import json, os, re, pathlib, sys
 
 def sanitize(s: str) -> str:
     # убрать код-фенсы и BOM/CR
@@ -97,13 +109,18 @@ def find_json_candidates(text: str):
         i += 1
     return candidates
 
-log_path = pathlib.Path("logs/stream.tmp")
+logs_dir = pathlib.Path(os.environ.get("SIGNAL_LOGS_DIR", "logs"))
+run_last_json = pathlib.Path(os.environ.get("SIGNAL_RUN_LAST_JSON", "logs/last.json"))
+run_log = pathlib.Path(os.environ.get("SIGNAL_RUN_LOG", ""))
+last_raw_json = pathlib.Path(os.environ.get("SIGNAL_LAST_RAW_JSON", "logs/last.raw.json"))
+last_clean_json = pathlib.Path(os.environ.get("SIGNAL_LAST_CLEAN_JSON", "logs/last.clean.json"))
+log_path = pathlib.Path(os.environ.get("SIGNAL_STREAM_TMP", "logs/stream.tmp"))
 raw = log_path.read_text(encoding="utf-8", errors="ignore")
 
 # Пытаемся сначала по свежему потоку; если пусто — берём сам run_log
 cands = find_json_candidates(raw)
 if not cands:
-    lastlog = sorted(pathlib.Path("logs").glob("signal_*.log"))[-1]
+    lastlog = run_log if run_log.exists() else sorted(logs_dir.glob("signal_*.log"))[-1]
     raw2 = lastlog.read_text(encoding="utf-8", errors="ignore")
     cands = find_json_candidates(raw2)
 
@@ -129,9 +146,9 @@ for chunk in reversed(cands):  # берём последний валидный
             errors.append((e, s[:120] + ('...' if len(s) > 120 else '')))
 
 if ok is None:
-    pathlib.Path("logs/last.raw.json").write_text(raw, encoding="utf-8")
-    pathlib.Path("logs/last.clean.json").write_text("", encoding="utf-8")
-    sys.stderr.write("[FATAL] JSON not found/parsed; wrote logs/last.raw.json for debugging\n")
+    last_raw_json.write_text(raw, encoding="utf-8")
+    last_clean_json.write_text("", encoding="utf-8")
+    sys.stderr.write(f"[FATAL] JSON not found/parsed; wrote {last_raw_json} for debugging\n")
     sys.exit(2)
 
 data, clean = ok
@@ -172,30 +189,32 @@ def _drop_time_window_mentions(obj):
     return obj
 
 data = _drop_time_window_mentions(data)
-pathlib.Path("logs/last.raw.json").write_text(clean, encoding="utf-8")
-pathlib.Path("logs/last.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-print("[OK] extracted + validated JSON -> logs/last.json")
+last_raw_json.write_text(clean, encoding="utf-8")
+run_last_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"[OK] extracted + validated JSON -> {run_last_json}")
 PY
 
 # --- генерируем артефакты для бота (MD + HTML) ---
-last_json="logs/last.json"
+last_json="$run_last_json"
 
 # Анализ (MD) поверх логов
 "$PYTHON_BIN" save_analysis_text.py < "$run_log" | tee -a "$run_log" || true
 
 # Прогоняем JSON через v2-постобработку (EMA/H1 + DAY/MID + ADX + три входа)
-"$PYTHON_BIN" postprocess_full_last.py >> "$run_log" 2>&1 || echo "[WARN] postprocess_full_last failed" >> "$run_log"
+"$PYTHON_BIN" postprocess_full_last.py --last-json "$last_json" >> "$run_log" 2>&1 || echo "[WARN] postprocess_full_last failed" >> "$run_log"
 
 if [[ "$is_full_run" == "1" && "${SIGNAL_SKIP_AIA_SEND:-0}" != "1" ]]; then
-  "$PYTHON_BIN" send_last_signal_to_aia.py "$run_log" | tee -a "$run_log" || true
+  "$PYTHON_BIN" send_last_signal_to_aia.py "$run_log" --last-json "$last_json" | tee -a "$run_log" || true
 fi
+
+cp -f "$last_json" "$canonical_last_json"
 
 # HTML-сигнал из v2 JSON
 "$PYTHON_BIN" render_strict.py < "$last_json" | tee -a "$run_log" || true
 
 echo "----------------------------------------"
 echo "✅ Saved logs: $run_log"
-echo "✅ Last JSON:  logs/last.json"
+echo "✅ Last JSON:  $canonical_last_json"
 
 # --- Show tail of run log to terminal (optional) ---
 LINES="${LOG_TAIL:-120}"

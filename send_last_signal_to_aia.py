@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import sys
@@ -43,14 +44,21 @@ def _allowed_for_aia(uid: int) -> bool:
     return True
 
 
-def _iter_candidate_channel_ids():
+def _read_last_payload(last_json_path: Path) -> dict | None:
+    try:
+        data = json.loads(last_json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _iter_candidate_channel_ids(last_payload: dict | None):
     raw = os.getenv("SIGNAL_AIA_CHANNEL_ID")
     if raw is not None and str(raw).strip():
         yield raw
 
-    last = _read_last_signal_json()
-    if isinstance(last, dict):
-        last_channel = last.get("channel_id")
+    if isinstance(last_payload, dict):
+        last_channel = last_payload.get("channel_id")
         if last_channel is not None:
             yield last_channel
 
@@ -79,9 +87,9 @@ def _iter_candidate_channel_ids():
             yield channel_id
 
 
-def _resolve_channel_id():
+def _resolve_channel_id(last_payload: dict | None = None):
     seen: set[int] = set()
-    for raw in _iter_candidate_channel_ids():
+    for raw in _iter_candidate_channel_ids(last_payload):
         if isinstance(raw, bool) or raw is None:
             continue
         if isinstance(raw, int):
@@ -101,13 +109,12 @@ def _resolve_channel_id():
     return None
 
 
-def _persist_final_signal_payload(signal_json_v1: dict) -> None:
+def _persist_final_signal_payload(signal_json_v1: dict, *, last_json_path: Path | None = None) -> None:
     if not isinstance(signal_json_v1, dict):
         return
-    try:
-        data = json.loads(LAST_JSON_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return
+    if last_json_path is None:
+        last_json_path = LAST_JSON_PATH
+    data = _read_last_payload(last_json_path)
     if not isinstance(data, dict):
         return
 
@@ -140,11 +147,19 @@ def _persist_final_signal_payload(signal_json_v1: dict) -> None:
     if channel_id is not None:
         data["channel_id"] = channel_id
 
-    LAST_JSON_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    last_json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _is_no_trade_last_json(data: dict | None) -> bool:
     return isinstance(data, dict) and bool(data.get("no_trade"))
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run_log", nargs="?")
+    parser.add_argument("--last-json", dest="last_json", default=None)
+    args, _ = parser.parse_known_args(argv)
+    return args
 
 
 def main() -> int:
@@ -152,11 +167,16 @@ def main() -> int:
         print("send_signal_to_aia(full): SKIP (DRY_RUN)")
         return 0
 
-    run_log = Path(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].strip() else None
+    args = _parse_args(sys.argv[1:])
+    run_log = Path(args.run_log) if args.run_log and args.run_log.strip() else None
+    last_json_path = Path(args.last_json).resolve() if args.last_json else LAST_JSON_PATH
+    last_payload = _read_last_payload(last_json_path)
     published_at = _utc_now_z()
     signal_id = _infer_signal_id(None, run_log, published_at)
-    channel_id = _resolve_channel_id()
-    last_payload = _read_last_signal_json()
+    try:
+        channel_id = _resolve_channel_id(last_payload)
+    except TypeError:
+        channel_id = _resolve_channel_id()
 
     if _is_no_trade_last_json(last_payload):
         print("send_signal_to_aia(full): SKIP (NO_TRADE)")
@@ -167,12 +187,14 @@ def main() -> int:
         published_at=published_at,
         channel_id=channel_id,
         symbol_hint=None,
+        last_payload=last_payload,
+        last_json_path=last_json_path,
     )
     if not signal_json_v1:
         print("send_signal_to_aia(full): FAIL (payload_build)")
         return 0
 
-    _persist_final_signal_payload(signal_json_v1)
+    _persist_final_signal_payload(signal_json_v1, last_json_path=last_json_path)
 
     if channel_id is None:
         print("send_signal_to_aia(full): FAIL (channel_id_missing)")

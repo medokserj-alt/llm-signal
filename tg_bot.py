@@ -679,8 +679,8 @@ def _send_personal(uid: int, text: str, *, parse_mode: str | None = None, protec
             pass
     return ok
 
-def _read_last_signal_json() -> dict | None:
-    p = PROJECT_ROOT / "logs" / "last.json"
+def _read_last_signal_json(path: Path | None = None) -> dict | None:
+    p = path if path is not None else (PROJECT_ROOT / "logs" / "last.json")
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
@@ -826,8 +826,22 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
     rules.append({"type": "deadline_minutes", "value": int(max_wait_minutes)})
     return {"version": 1, "rules": rules}
 
-def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symbol_hint: str | None = None) -> dict | None:
-    d = _read_last_signal_json()
+def _build_signal_json_v1(
+    *,
+    signal_id: str,
+    published_at: str,
+    channel_id,
+    symbol_hint: str | None = None,
+    last_payload: dict | None = None,
+    last_json_path: Path | None = None,
+) -> dict | None:
+    if isinstance(last_payload, dict):
+        d = last_payload
+    else:
+        try:
+            d = _read_last_signal_json(path=last_json_path)
+        except TypeError:
+            d = _read_last_signal_json()
     if not isinstance(d, dict):
         return None
 

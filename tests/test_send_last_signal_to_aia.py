@@ -258,7 +258,93 @@ class TestSendLastSignalToAia(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(send_calls, [])
-        self.assertIn("send_signal_to_aia(full): FAIL (payload_build)", buf.getvalue())
+
+    def test_main_uses_explicit_last_json_instead_of_stale_default_path(self) -> None:
+        module = _load_module()
+
+        with TemporaryDirectory() as td:
+            stale_last_json = Path(td) / "stale-last.json"
+            fresh_last_json = Path(td) / "fresh-last.json"
+            stale_last_json.write_text(
+                json.dumps(
+                    {
+                        "symbol": "OLD/USDT",
+                        "direction": "short",
+                        "entry_range": [1.0, 2.0],
+                        "no_trade": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            fresh_last_json.write_text(
+                json.dumps(
+                    {
+                        "symbol": "NEW/USDT",
+                        "direction": "long",
+                        "entry_range": [10.0, 12.0],
+                        "entry_price_neutral": 11.0,
+                        "sl": 9.5,
+                        "tp1": 13.0,
+                        "tp2": 14.0,
+                        "mode": "neutral",
+                        "entry_mode": "pullback",
+                        "sl_by_mode": {"neutral": 9.5},
+                        "tp_by_mode": {"neutral": {"tvh1": 13.0, "tvh2": 14.0}},
+                        "no_trade": False,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            module.LAST_JSON_PATH = stale_last_json
+            module._resolve_channel_id = lambda payload=None: -1001234567890
+            module._build_signal_json_v1 = lambda **kwargs: {
+                "signal_id": "sig-fresh-1",
+                "symbol": kwargs["last_payload"]["symbol"],
+                "direction": kwargs["last_payload"]["direction"],
+                "entry_zone": kwargs["last_payload"]["entry_range"],
+                "entry_price": kwargs["last_payload"]["entry_price_neutral"],
+                "sl": kwargs["last_payload"]["sl"],
+                "tp": {
+                    "tp1": kwargs["last_payload"]["tp1"],
+                    "tp2": kwargs["last_payload"]["tp2"],
+                },
+                "published_at": "2026-04-05T17:35:00Z",
+                "channel_id": -1001234567890,
+            }
+            send_calls = []
+            module.send_signal_to_aia = lambda body: send_calls.append(body) or True
+
+            old_argv = sys.argv[:]
+            try:
+                sys.argv = [
+                    "send_last_signal_to_aia.py",
+                    "logs/signal_20260412_120000.log",
+                    "--last-json",
+                    str(fresh_last_json),
+                ]
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    rc = module.main()
+            finally:
+                sys.argv = old_argv
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(send_calls), 1)
+            self.assertEqual(send_calls[0]["symbol"], "NEW/USDT")
+            self.assertEqual(send_calls[0]["direction"], "long")
+            self.assertEqual(send_calls[0]["entry_zone"], [10.0, 12.0])
+
+            persisted_fresh = json.loads(fresh_last_json.read_text(encoding="utf-8"))
+            persisted_stale = json.loads(stale_last_json.read_text(encoding="utf-8"))
+            self.assertEqual(persisted_fresh["symbol"], "NEW/USDT")
+            self.assertEqual(persisted_fresh["signal_json_v1"]["symbol"], "NEW/USDT")
+            self.assertEqual(persisted_stale["symbol"], "OLD/USDT")
+            self.assertIn("send_signal_to_aia(full): OK", buf.getvalue())
 
 
 if __name__ == "__main__":

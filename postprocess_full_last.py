@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 from datetime import datetime
 from pathlib import Path
@@ -177,10 +178,18 @@ def read_latest_report_text(root_dir: str, limit_chars: int = 2000):
     except Exception:
         return "", None
 
-def main():
-    p = BASE / "logs" / "last.json"
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--last-json", default=None)
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    p = Path(args.last_json).resolve() if args.last_json else (BASE / "logs" / "last.json")
     if not p.exists():
-        print("postprocess_full_last: logs/last.json not found")
+        print(f"postprocess_full_last: {p} not found")
         return
 
     data = json.loads(p.read_text(encoding="utf-8"))

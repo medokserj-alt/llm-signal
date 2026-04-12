@@ -307,6 +307,23 @@ def _iter_event_risk_lines(d: dict) -> list[str]:
     return out
 
 
+def _iter_flow_overlay_lines(d: dict) -> list[str]:
+    flow_overlay = d.get("flow_overlay")
+    if not isinstance(flow_overlay, dict):
+        return []
+    raw = flow_overlay.get("display_lines")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = _one_line(item)
+        if text:
+            out.append(text)
+    return out
+
+
 def main():
     raw = sys.stdin.read().strip()
     if not raw:
@@ -605,6 +622,8 @@ def main():
                 pass
             for event_line in _iter_event_risk_lines(data)[:2]:
                 lines.append(event_line)
+            for flow_line in _iter_flow_overlay_lines(data)[:2]:
+                lines.append(flow_line)
             wl = " ".join(w.lower() for w in _iter_warnings(data))
             if mode == "aggressive" and "phase_flip_wait_confirm" in wl:
                 lines.append("⚠️ Phase flip по M15: вход только после подтверждения (wait_confirm).")
