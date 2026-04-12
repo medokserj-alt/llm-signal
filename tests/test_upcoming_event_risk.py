@@ -62,18 +62,17 @@ class TestUpcomingEventRisk(unittest.TestCase):
         self.assertIn("upcoming_high_impact_event_neutral_caution", d.get("warnings") or [])
         self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "wait_confirm")
 
-    def test_conservative_high_impact_event_blocks_new_trade(self) -> None:
+    def test_conservative_high_impact_event_enforces_wait_confirm_without_no_trade(self) -> None:
         d = self._base_signal("conservative")
 
         get_signal_json.apply_upcoming_event_risk(d)
 
-        self.assertTrue(bool(d.get("no_trade")))
-        self.assertIn(
-            "upcoming_high_impact_event_conservative_block",
-            d.get("no_trade_reasons") or [],
-        )
-        self.assertIn("Trump press conference", d.get("no_trade_hint") or "")
-        self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "no_trade")
+        self.assertFalse(bool(d.get("no_trade")))
+        self.assertEqual(d.get("entry_mode"), "wait_confirm")
+        self.assertEqual(d.get("confidence"), "Medium")
+        self.assertIn("upcoming_high_impact_event_conservative_caution", d.get("warnings") or [])
+        self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "wait_confirm")
+        self.assertIn("Trump press conference", " ".join((d.get("event_risk") or {}).get("display_lines") or []))
 
     def test_tbd_event_does_not_hard_block_but_lowers_confidence(self) -> None:
         d = self._base_signal("aggressive")

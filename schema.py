@@ -28,6 +28,19 @@ class UpcomingEvent(BaseModel):
     expected_regime_effect: str | None = None
     note: str | None = None
 
+
+class EventRiskItem(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    event: str | None = None
+    category: str | None = None
+    phase: str | None = None
+    impact: str | None = None
+    directional_risk: str | None = None
+    time_text: str | None = None
+    drivers: List[str] = Field(default_factory=list)
+    summary: str | None = None
+
 class SignalPayload(BaseModel):
     time_msk: str
     symbol: str
@@ -45,6 +58,7 @@ class SignalPayload(BaseModel):
     news_context: List[str] = []
     upcoming_events: List[UpcomingEvent] = Field(default_factory=list)
     macro_risk_summary: str = ""
+    event_risk_context: List[EventRiskItem] = Field(default_factory=list)
     market_context: str
     validity_minutes: int
     cancel_condition: str

@@ -1,0 +1,16 @@
+[Unit]
+Description=LLM Signal Telegram Signal Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/llm-signal-next
+EnvironmentFile=/root/llm-signal-next/.env.tg.clean
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/llm-signal-next/.venv/bin/python3 /root/llm-signal-next/tg_signal_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

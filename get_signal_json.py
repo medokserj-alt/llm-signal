@@ -27,6 +27,13 @@ except Exception:  # pragma: no cover
 import subprocess
 from pathlib import Path
 import pathlib as _pl
+from event_risk_context import (
+    attach_event_risk_context,
+    build_event_risk_context,
+    merge_event_risk_snapshots,
+    normalize_event_risk_snapshot,
+    render_event_risk_context_section,
+)
 from event_calendar import (
     build_calendar_context,
     build_calendar_risk_summary,
@@ -1438,6 +1445,117 @@ def _merge_upcoming_event_lists(*groups) -> list[dict]:
 def _merge_unique_texts(*values, max_fragments: int | None = None) -> str:
     return " ".join(_collect_unique_text_fragments(*values, max_fragments=max_fragments))
 
+
+def _summary_fragment_mentions_event(fragment: str, event: dict) -> bool:
+    if not isinstance(event, dict):
+        return False
+    text = _normalize_optional_text(fragment)
+    if not text:
+        return False
+
+    label = _normalize_optional_text(event.get("event"))
+    if label and _semantic_texts_match(text, label):
+        return True
+
+    time_text = _event_display_time(event)
+    if time_text and time_text in text:
+        return True
+
+    date_text = _normalize_optional_text(event.get("date_msk"))
+    hhmm = _extract_hhmm_from_text(event.get("time_msk"))
+    if date_text and date_text in text:
+        return True
+    if hhmm and hhmm in text and label:
+        return True
+    return False
+
+
+def _is_calendar_summary_fragment(fragment: str, events: list[dict]) -> bool:
+    text = _normalize_optional_text(fragment)
+    if not text:
+        return False
+    return any(_summary_fragment_mentions_event(text, event) for event in events if isinstance(event, dict))
+
+
+def _is_explicit_calendar_listing_fragment(fragment: str, events: list[dict]) -> bool:
+    text = _normalize_optional_text(fragment)
+    if not text or not _is_calendar_summary_fragment(text, events):
+        return False
+    return bool(_extract_date_from_text(text) or _extract_hhmm_from_text(text) or "—" in text)
+
+
+def _join_macro_risk_components(components: list[str], *, calendar_events: list[dict] | None = None) -> str:
+    cleaned = [_normalize_optional_text(component) for component in components if _normalize_optional_text(component)]
+    if not cleaned:
+        return ""
+
+    calendar_events = calendar_events or []
+    out = cleaned[0].rstrip(" ;")
+    prev_is_explicit_calendar = _is_explicit_calendar_listing_fragment(cleaned[0], calendar_events)
+
+    for component in cleaned[1:]:
+        current = component.rstrip(" ;")
+        current_is_explicit_calendar = _is_explicit_calendar_listing_fragment(current, calendar_events)
+        if prev_is_explicit_calendar and current_is_explicit_calendar:
+            separator = "; "
+        elif out.endswith((".", "!", "?")):
+            separator = " "
+        else:
+            separator = ". "
+        out = f"{out}{separator}{current}"
+        prev_is_explicit_calendar = current_is_explicit_calendar
+    return out.strip()
+
+
+def _compose_macro_risk_summary(
+    raw_summary,
+    *,
+    structured_fragment="",
+    calendar_events: list[dict] | None = None,
+) -> str:
+    events = [event for event in (calendar_events or []) if isinstance(event, dict)]
+    raw_fragments = _collect_unique_text_fragments(raw_summary, max_fragments=6)
+    structured_text = _normalize_optional_text(structured_fragment)
+
+    if not structured_text:
+        return _join_macro_risk_components(raw_fragments[:3], calendar_events=events)
+
+    residual_fragments: list[str] = []
+    for fragment in raw_fragments:
+        if _semantic_texts_match(fragment, structured_text):
+            continue
+        if _is_calendar_summary_fragment(fragment, events):
+            continue
+        residual_fragments.append(fragment)
+
+    calendar_summary = build_calendar_risk_summary(events) if events else ""
+    components: list[str] = [structured_text]
+    if calendar_summary:
+        components.append(calendar_summary)
+    if residual_fragments:
+        components.extend(residual_fragments[: max(0, 3 - len(components))])
+
+    return _join_macro_risk_components(components[:3], calendar_events=events)
+
+
+def _harmonize_event_risk_warning_tokens(d: dict) -> None:
+    warnings = d.get("warnings")
+    if not isinstance(warnings, list) or not warnings:
+        return
+
+    legacy_wait_confirm = {
+        "upcoming_high_impact_event_wait_confirm",
+        "upcoming_high_impact_event_neutral_caution",
+        "upcoming_high_impact_event_conservative_caution",
+    }
+    if any(item in legacy_wait_confirm for item in warnings):
+        warnings = [item for item in warnings if item != "event_risk_wait_confirm_preferred"]
+
+    if any(item in legacy_wait_confirm for item in warnings):
+        warnings = [item for item in warnings if item != "event_risk_no_chasing"]
+
+    d["warnings"] = warnings
+
 def normalize_no_trade(d: dict) -> dict:
     """
     Нормализует no_trade-ветку (без “чистки” семантических маркеров).
@@ -1855,6 +1973,14 @@ def _normalize_day_mid_context(d: dict) -> None:
     )
     ctx["upcoming_events"] = _merge_upcoming_event_lists(ctx_events)
     ctx["macro_risk_summary"] = _merge_unique_texts(ctx_summary, max_fragments=3)
+    event_risk_snapshot = normalize_event_risk_snapshot(
+        {
+            "timestamp_utc": ctx.get("event_risk_context_timestamp_utc"),
+            "event_risk_context": ctx.get("event_risk_context"),
+        }
+    )
+    ctx["event_risk_context"] = event_risk_snapshot.get("event_risk_context") or []
+    ctx["event_risk_context_timestamp_utc"] = event_risk_snapshot.get("timestamp_utc")
 
     d["day_mid_context"] = ctx
 
@@ -1870,6 +1996,14 @@ def _normalize_report_macro_context(report_payload) -> dict | None:
     )
     out["upcoming_events"] = _merge_upcoming_event_lists(events)
     out["macro_risk_summary"] = _merge_unique_texts(summary, max_fragments=3)
+    event_risk_snapshot = normalize_event_risk_snapshot(
+        {
+            "timestamp_utc": out.get("event_risk_context_timestamp_utc"),
+            "event_risk_context": out.get("event_risk_context"),
+        }
+    )
+    out["event_risk_context"] = event_risk_snapshot.get("event_risk_context") or []
+    out["event_risk_context_timestamp_utc"] = event_risk_snapshot.get("timestamp_utc")
 
     tmp = {"day_mid_context": out.get("day_mid_context")}
     _normalize_day_mid_context(tmp)
@@ -1879,6 +2013,8 @@ def _normalize_report_macro_context(report_payload) -> dict | None:
         "notes": None,
         "upcoming_events": [],
         "macro_risk_summary": "",
+        "event_risk_context": [],
+        "event_risk_context_timestamp_utc": event_risk_snapshot.get("timestamp_utc"),
     }
     return out
 
@@ -1933,6 +2069,34 @@ def merge_day_mid_report_context(
         ctx.get("notes"),
     )
     ctx["notes"] = merged_notes or None
+    event_risk_snapshot = merge_event_risk_snapshots(
+        {
+            "timestamp_utc": ((day_ctx or {}).get("day_mid_context") or {}).get("event_risk_context_timestamp_utc"),
+            "event_risk_context": ((day_ctx or {}).get("day_mid_context") or {}).get("event_risk_context"),
+        },
+        {
+            "timestamp_utc": ((mid_ctx or {}).get("day_mid_context") or {}).get("event_risk_context_timestamp_utc"),
+            "event_risk_context": ((mid_ctx or {}).get("day_mid_context") or {}).get("event_risk_context"),
+        },
+        {
+            "timestamp_utc": (day_ctx or {}).get("event_risk_context_timestamp_utc"),
+            "event_risk_context": (day_ctx or {}).get("event_risk_context"),
+        },
+        {
+            "timestamp_utc": (mid_ctx or {}).get("event_risk_context_timestamp_utc"),
+            "event_risk_context": (mid_ctx or {}).get("event_risk_context"),
+        },
+        {
+            "timestamp_utc": ctx.get("event_risk_context_timestamp_utc"),
+            "event_risk_context": ctx.get("event_risk_context"),
+        },
+        {
+            "timestamp_utc": d.get("event_risk_context_timestamp_utc"),
+            "event_risk_context": d.get("event_risk_context"),
+        },
+    )
+    ctx["event_risk_context"] = copy.deepcopy(event_risk_snapshot.get("event_risk_context") or [])
+    ctx["event_risk_context_timestamp_utc"] = event_risk_snapshot.get("timestamp_utc")
 
     if isinstance(day_ctx, dict):
         if day_ctx.get("time_msk"):
@@ -1944,6 +2108,8 @@ def merge_day_mid_report_context(
     d["day_mid_context"] = ctx
     d["upcoming_events"] = _merge_upcoming_event_lists(ctx.get("upcoming_events"), d.get("upcoming_events"))
     d["macro_risk_summary"] = _merge_unique_texts(ctx.get("macro_risk_summary"), d.get("macro_risk_summary"))
+    d["event_risk_context"] = copy.deepcopy(event_risk_snapshot.get("event_risk_context") or [])
+    d["event_risk_context_timestamp_utc"] = event_risk_snapshot.get("timestamp_utc")
 
 
 def _resolve_lessons_path():
@@ -2252,6 +2418,288 @@ def _ensure_event_wait_confirm_rules(d: dict, event_label: str) -> None:
     d["confirmation_rules"] = text
 
 
+def _ensure_structured_event_confirmation_rules(
+    d: dict,
+    *,
+    event_label: str,
+    phase: str,
+    volatility_risk: str,
+) -> None:
+    label = event_label.strip() or "headline catalyst"
+    phase_key = _normalize_optional_text(phase).lower()
+    risk_key = _normalize_optional_text(volatility_risk).lower()
+    if phase_key in {"pre_event", "ongoing"}:
+        text = (
+            f"{label}: вход только после подтверждения структуры/ретеста; "
+            "не догонять первый импульс и ждать удержания уровня."
+        )
+    elif phase_key == "post_event" and risk_key == "high":
+        text = (
+            f"{label}: после события ждать стабилизации follow-through и ретеста; "
+            "ложные пробои и нестабильные продолжения вероятны."
+        )
+    else:
+        text = (
+            f"{label}: вход только после подтверждения структуры; "
+            "исполнение без подтверждения не допускается."
+        )
+
+    raw = d.get("confirmation_rules")
+    if isinstance(raw, str):
+        if text not in raw:
+            d["confirmation_rules"] = (raw.strip() + " " + text).strip()
+        return
+    if isinstance(raw, list):
+        joined = " ".join(str(x).strip() for x in raw if str(x).strip())
+        if text not in joined:
+            raw.append(text)
+        return
+    d["confirmation_rules"] = text
+
+
+def _event_risk_level_rank(value) -> int:
+    text = _normalize_optional_text(value).lower()
+    return {
+        "none": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+    }.get(text, 0)
+
+
+def _max_event_risk_level(*values) -> str:
+    best = "none"
+    best_rank = -1
+    for value in values:
+        rank = _event_risk_level_rank(value)
+        if rank > best_rank:
+            best = _normalize_optional_text(value).lower() or "none"
+            best_rank = rank
+    return best if best in {"none", "low", "medium", "high"} else "none"
+
+
+def _signal_event_driver_from_category(value) -> str:
+    category = _normalize_optional_text(value).lower()
+    if category == "geopolitics":
+        return "geopolitics"
+    if category == "crypto_market_structure":
+        return "crypto_structure"
+    if category:
+        return "macro"
+    return "none"
+
+
+def _merged_signal_event_risk_snapshot(d: dict) -> dict:
+    ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+    return merge_event_risk_snapshots(
+        {
+            "timestamp_utc": ctx.get("event_risk_context_timestamp_utc"),
+            "event_risk_context": ctx.get("event_risk_context"),
+        },
+        {
+            "timestamp_utc": d.get("event_risk_context_timestamp_utc"),
+            "event_risk_context": d.get("event_risk_context"),
+        },
+    )
+
+
+def _structured_event_text_blob(item: dict) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return " ".join(
+        [
+            _normalize_optional_text(item.get("event")),
+            _normalize_optional_text(item.get("summary")),
+            " ".join(item.get("drivers") or []),
+            " ".join(item.get("confirmed_facts") or []),
+            " ".join(item.get("anticipated_consequences") or []),
+            " ".join(item.get("realized_market_events") or []),
+            " ".join(item.get("recent_developments") or []),
+        ]
+    ).lower()
+
+
+def _structured_event_volatility_risk(item: dict) -> str:
+    if not isinstance(item, dict):
+        return "low"
+    driver = _signal_event_driver_from_category(item.get("category"))
+    impact = _normalize_event_impact(item.get("impact")) or "none"
+    phase = _normalize_optional_text(item.get("phase")).lower() or "none"
+    blob = _structured_event_text_blob(item)
+    high_vol_needles = (
+        "headline sensitivity",
+        "volatility",
+        "risk premium",
+        "liquidation",
+        "false break",
+        "unstable",
+        "fragile",
+        "shipping",
+        "blockade",
+        "sanctions",
+        "tariff",
+        "attack",
+        "strike",
+        "outage",
+    )
+
+    if impact == "high":
+        if phase in {"pre_event", "ongoing"}:
+            return "high"
+        if phase == "post_event":
+            if driver == "geopolitics" or any(needle in blob for needle in high_vol_needles):
+                return "high"
+            return "medium"
+    if impact == "medium":
+        if phase in {"pre_event", "ongoing"}:
+            return "medium"
+        if phase == "post_event" and any(needle in blob for needle in high_vol_needles):
+            return "medium"
+    return "low"
+
+
+def _build_structured_macro_risk_fragment(item: dict, *, driver: str, volatility_risk: str) -> str:
+    if not isinstance(item, dict) or driver == "none":
+        return ""
+
+    phase = _normalize_optional_text(item.get("phase")).lower() or "none"
+    if driver == "geopolitics":
+        if phase in {"pre_event", "ongoing"}:
+            return "geopolitical escalation path remains unresolved; markets remain headline-driven."
+        if phase == "post_event" and volatility_risk == "high":
+            return "geopolitical shock aftermath remains unstable; follow-through remains headline-driven."
+        return "geopolitical risk remains a live execution factor."
+
+    if driver == "macro":
+        if phase in {"pre_event", "ongoing"}:
+            return "macro catalyst path remains unresolved; first-move volatility can be misleading."
+        if phase == "post_event" and volatility_risk in {"medium", "high"}:
+            return "macro repricing remains unstable after the event; follow-through needs confirmation."
+        return "macro catalyst risk still matters for execution."
+
+    if driver == "crypto_structure":
+        if phase in {"pre_event", "ongoing"}:
+            return "crypto structure stress remains unresolved; false breaks and liquidation-led moves are possible."
+        if phase == "post_event" and volatility_risk in {"medium", "high"}:
+            return "crypto structure stress remains elevated after the catalyst; follow-through is still unstable."
+        return "crypto structure stress remains a live execution risk."
+
+    return _merge_unique_texts(item.get("summary"), max_fragments=1)
+
+
+def _derive_signal_event_risk_summary(
+    d: dict,
+    *,
+    merged_events: list[dict],
+    merged_summary: str,
+    now_dt: datetime,
+) -> dict:
+    snapshot = _merged_signal_event_risk_snapshot(d)
+    items = snapshot.get("event_risk_context") or []
+    dominant_item = items[0] if items else None
+
+    driver = _signal_event_driver_from_category((dominant_item or {}).get("category"))
+    impact = _normalize_event_impact((dominant_item or {}).get("impact")) or "none"
+    if impact not in {"high", "medium", "low"}:
+        impact = "none"
+    phase = _normalize_optional_text((dominant_item or {}).get("phase")).lower() or "none"
+    if phase not in {"pre_event", "ongoing", "post_event"}:
+        phase = "none"
+
+    volatility_risk = _structured_event_volatility_risk(dominant_item)
+
+    active_high = False
+    active_other = False
+    tbd_high = False
+    for event in merged_events:
+        event_impact = _normalize_event_impact(event.get("impact"))
+        if _event_time_is_tbd(event):
+            if event_impact == "high":
+                tbd_high = True
+            continue
+        event_dt = _parse_msk_datetime(
+            event.get("time_msk"),
+            date_hint=event.get("date_msk"),
+            fallback_dt=now_dt,
+        )
+        if event_dt is None:
+            continue
+        before_min, after_min = _event_window_minutes(event)
+        is_active = (event_dt - timedelta(minutes=before_min)) <= now_dt <= (event_dt + timedelta(minutes=after_min))
+        if not is_active:
+            continue
+        if event_impact == "high":
+            active_high = True
+        else:
+            active_other = True
+
+    execution_caution = "low"
+    unresolved_high_impact = bool(driver != "none" and impact == "high" and phase in {"pre_event", "ongoing"})
+    post_event_unstable = bool(driver != "none" and phase == "post_event" and volatility_risk == "high")
+
+    if driver == "geopolitics" and impact == "high":
+        execution_caution = "high"
+    elif unresolved_high_impact:
+        execution_caution = "high"
+    elif post_event_unstable:
+        execution_caution = "high"
+    elif driver != "none" and (impact in {"high", "medium"} or volatility_risk == "medium"):
+        execution_caution = "medium"
+
+    if active_high:
+        volatility_risk = _max_event_risk_level(volatility_risk, "high")
+        execution_caution = _max_event_risk_level(execution_caution, "high")
+    elif active_other or tbd_high:
+        volatility_risk = _max_event_risk_level(volatility_risk, "medium")
+        execution_caution = _max_event_risk_level(execution_caution, "medium")
+
+    macro_fragment = _build_structured_macro_risk_fragment(
+        dominant_item,
+        driver=driver,
+        volatility_risk=volatility_risk,
+    )
+
+    execution_line = ""
+    if post_event_unstable:
+        execution_line = "post-event volatility remains unstable; avoid chasing false breaks."
+    elif driver == "geopolitics" and impact == "high":
+        execution_line = "headline-driven volatility is elevated; prefer confirmation and avoid chasing first move."
+    elif unresolved_high_impact:
+        execution_line = "unresolved catalyst risk is high; prefer confirmation over the first impulse."
+    elif execution_caution == "medium" and driver != "none":
+        execution_line = "headline sensitivity is elevated; confirmation is preferred."
+
+    warning_tokens: list[str] = []
+    if driver == "geopolitics" and impact == "high":
+        warning_tokens.append("event_risk_geopolitical_execution_caution")
+    if unresolved_high_impact:
+        warning_tokens.append("event_risk_unresolved_high_impact_catalyst")
+    if post_event_unstable:
+        warning_tokens.append("event_risk_post_event_unstable_follow_through")
+    if execution_caution in {"medium", "high"}:
+        warning_tokens.append("event_risk_no_chasing")
+    if unresolved_high_impact or post_event_unstable:
+        warning_tokens.append("event_risk_continuation_stricter")
+
+    return {
+        "summary": {
+            "dominant_driver": driver,
+            "max_impact": impact,
+            "dominant_phase": phase,
+            "volatility_risk": volatility_risk if volatility_risk in {"high", "medium", "low"} else "low",
+            "execution_caution": execution_caution if execution_caution in {"high", "medium", "low"} else "low",
+        },
+        "dominant_item": copy.deepcopy(dominant_item) if isinstance(dominant_item, dict) else None,
+        "macro_fragment": macro_fragment,
+        "execution_line": execution_line,
+        "warning_tokens": warning_tokens,
+        "prefer_wait_confirm": bool(unresolved_high_impact or (driver == "geopolitics" and impact == "high")),
+        "confidence_steps": 1 if driver != "none" and (impact in {"high", "medium"} or execution_caution in {"medium", "high"}) else 0,
+        "snapshot": snapshot,
+        "has_structured_risk": bool(driver != "none"),
+    }
+
+
 def apply_upcoming_event_risk(d: dict) -> None:
     if not isinstance(d, dict):
         return
@@ -2276,14 +2724,35 @@ def apply_upcoming_event_risk(d: dict) -> None:
     )
     merged_events = _merge_upcoming_event_lists(ctx_events, own_events)
     merged_summary = _merge_unique_texts(ctx_summary, own_summary)
+
+    structured_state = _derive_signal_event_risk_summary(
+        d,
+        merged_events=merged_events,
+        merged_summary=merged_summary,
+        now_dt=now_dt,
+    )
+    event_risk_summary = structured_state.get("summary") or {
+        "dominant_driver": "none",
+        "max_impact": "none",
+        "dominant_phase": "none",
+        "volatility_risk": "low",
+        "execution_caution": "low",
+    }
+
+    merged_summary = _compose_macro_risk_summary(
+        merged_summary,
+        structured_fragment=structured_state.get("macro_fragment"),
+        calendar_events=merged_events,
+    )
     d["upcoming_events"] = merged_events
     d["macro_risk_summary"] = merged_summary
+    d["event_risk_summary"] = copy.deepcopy(event_risk_summary)
     if isinstance(ctx, dict):
         ctx["upcoming_events"] = copy.deepcopy(merged_events)
         ctx["macro_risk_summary"] = merged_summary
         d["day_mid_context"] = ctx
 
-    if not merged_events and not merged_summary:
+    if not merged_events and not merged_summary and event_risk_summary.get("dominant_driver") == "none":
         return
 
     active_high: list[dict] = []
@@ -2336,6 +2805,7 @@ def apply_upcoming_event_risk(d: dict) -> None:
         "macro_risk_summary": merged_summary,
         "mode_action": "none",
         "display_lines": [],
+        "signal_summary": copy.deepcopy(event_risk_summary),
     }
 
     if active_other:
@@ -2347,6 +2817,7 @@ def apply_upcoming_event_risk(d: dict) -> None:
     if active_high:
         primary = active_high[0]
         label = f"{primary['event']} ({primary['time_msk']} МСК)"
+        marginal_setup = _event_risk_setup_is_marginal(d, mode=mode)
         if mode == "aggressive":
             d["entry_mode"] = "wait_confirm"
             _append_unique_str(d, "warnings", "upcoming_high_impact_event_wait_confirm")
@@ -2357,36 +2828,39 @@ def apply_upcoming_event_risk(d: dict) -> None:
                 f"⚠️ Event risk: {label} — активное окно high-impact события; aggressive переведён в wait_confirm."
             )
         elif mode == "neutral":
-            if _event_risk_setup_is_marginal(d, mode=mode):
-                _set_no_trade_primary_reason(d, "upcoming_high_impact_event_neutral_block")
-                d["no_trade_hint"] = (
-                    f"{label}: активное окно high-impact события; neutral не открывает новый marginal setup."
-                )
-                event_risk["mode_action"] = "no_trade"
+            d["entry_mode"] = "wait_confirm"
+            _append_unique_str(d, "warnings", "upcoming_high_impact_event_neutral_caution")
+            if marginal_setup:
+                _append_unique_str(d, "warnings", "upcoming_high_impact_event_marginal_setup_strict")
+            _ensure_event_wait_confirm_rules(d, label)
+            event_risk["mode_action"] = "wait_confirm"
+            if marginal_setup:
                 event_risk["display_lines"].append(
-                    f"⚠️ Event risk: {label} — активное окно high-impact события; marginal neutral setup заблокирован."
+                    f"⚠️ Event risk: {label} — активное окно high-impact события; marginal neutral setup не блокируется, но требует подтверждения/ретеста без погони за первым импульсом."
                 )
             else:
-                d["entry_mode"] = "wait_confirm"
-                _append_unique_str(d, "warnings", "upcoming_high_impact_event_neutral_caution")
-                _ensure_event_wait_confirm_rules(d, label)
-                event_risk["mode_action"] = "wait_confirm"
                 event_risk["display_lines"].append(
                     f"⚠️ Event risk: {label} — активное окно high-impact события; neutral требует wait_confirm."
                 )
             _downgrade_confidence(d, 1)
         elif mode == "conservative":
-            _set_no_trade_primary_reason(d, "upcoming_high_impact_event_conservative_block")
-            d["no_trade_hint"] = (
-                f"{label}: активное окно high-impact события; conservative не открывает новые сделки."
-            )
+            d["entry_mode"] = "wait_confirm"
+            _append_unique_str(d, "warnings", "upcoming_high_impact_event_conservative_caution")
+            if marginal_setup:
+                _append_unique_str(d, "warnings", "upcoming_high_impact_event_marginal_setup_strict")
+            _ensure_event_wait_confirm_rules(d, label)
             _downgrade_confidence(d, 1)
-            event_risk["mode_action"] = "no_trade"
-            event_risk["display_lines"].append(
-                f"⚠️ Event risk: {label} — активное окно high-impact события; conservative блокирует новый вход."
-            )
+            event_risk["mode_action"] = "wait_confirm"
+            if marginal_setup:
+                event_risk["display_lines"].append(
+                    f"⚠️ Event risk: {label} — активное окно high-impact события; conservative требует подтверждения/ретеста и не допускает погоню за первым движением."
+                )
+            else:
+                event_risk["display_lines"].append(
+                    f"⚠️ Event risk: {label} — активное окно high-impact события; conservative требует wait_confirm."
+                )
 
-    if (tbd_events or merged_summary) and not active_high:
+    if (tbd_events or (merged_summary and merged_events)) and not active_high:
         _append_unique_str(d, "warnings", "upcoming_event_tbd_macro_caution")
         _downgrade_confidence(d, 1)
         if tbd_events:
@@ -2401,8 +2875,62 @@ def apply_upcoming_event_risk(d: dict) -> None:
         if event_risk["mode_action"] == "none":
             event_risk["mode_action"] = "confidence_down"
 
-    if merged_summary and len(event_risk["display_lines"]) < 2:
-        event_risk["display_lines"].append(f"🗓 Macro risk summary: {merged_summary}")
+    if structured_state.get("has_structured_risk"):
+        dominant_item = structured_state.get("dominant_item") if isinstance(structured_state.get("dominant_item"), dict) else {}
+        dominant_event_label = _normalize_optional_text(dominant_item.get("event")) or "headline catalyst"
+        dominant_phase = _normalize_optional_text(event_risk_summary.get("dominant_phase")).lower()
+        volatility_risk = _normalize_optional_text(event_risk_summary.get("volatility_risk")).lower()
+        if structured_state.get("prefer_wait_confirm") and mode in {"aggressive", "neutral", "conservative"} and not bool(d.get("no_trade")):
+            d["entry_mode"] = "wait_confirm"
+            if event_risk["mode_action"] in {"none", "confidence_down"}:
+                event_risk["mode_action"] = "wait_confirm"
+            _append_unique_str(d, "warnings", "event_risk_wait_confirm_preferred")
+            _ensure_structured_event_confirmation_rules(
+                d,
+                event_label=dominant_event_label,
+                phase=dominant_phase,
+                volatility_risk=volatility_risk,
+            )
+        if structured_state.get("confidence_steps"):
+            _downgrade_confidence(d, int(structured_state.get("confidence_steps") or 0))
+        for warning in structured_state.get("warning_tokens") or []:
+            _append_unique_str(d, "warnings", warning)
+        _harmonize_event_risk_warning_tokens(d)
+
+        structured_lines: list[str] = []
+        macro_fragment = _normalize_optional_text(structured_state.get("macro_fragment"))
+        if macro_fragment:
+            structured_lines.append(f"⚠️ Macro risk: {macro_fragment}")
+        execution_line = _normalize_optional_text(structured_state.get("execution_line"))
+        if execution_line:
+            structured_lines.append(f"⚠️ Execution risk: {execution_line}")
+        if structured_lines:
+            event_risk["display_lines"] = [*structured_lines, *(event_risk.get("display_lines") or [])]
+
+    has_event_risk_factor = bool(
+        active_high
+        or active_other
+        or tbd_events
+        or structured_state.get("has_structured_risk")
+    )
+    if bool(d.get("no_trade")) and has_event_risk_factor:
+        secondary_line = (
+            "⚠️ Event risk: elevated catalyst risk is a secondary factor only; "
+            "the primary no-trade reason remains structural."
+        )
+        existing_lines_low = " ".join(str(x or "").strip().lower() for x in (event_risk.get("display_lines") or []))
+        if secondary_line.lower() not in existing_lines_low:
+            event_risk["display_lines"].append(secondary_line)
+
+    if merged_summary:
+        calendar_summary = build_calendar_risk_summary(merged_events) if merged_events else ""
+        summary_line = calendar_summary or merged_summary
+        existing_lines = " ".join(event_risk.get("display_lines") or [])
+        if summary_line and summary_line not in existing_lines and len(event_risk["display_lines"]) < 3:
+            event_risk["display_lines"].append(f"🗓 Macro risk summary: {summary_line}")
+
+    if not event_risk.get("active_events"):
+        event_risk.pop("active_events", None)
 
     d["event_risk"] = event_risk
 
@@ -5814,6 +6342,8 @@ def read_latest_report_payload(
             "time_msk": raw.get("time_msk"),
             "upcoming_events": copy.deepcopy(raw.get("upcoming_events") or []),
             "macro_risk_summary": raw.get("macro_risk_summary") or "",
+            "event_risk_context": copy.deepcopy(raw.get("event_risk_context") or []),
+            "event_risk_context_timestamp_utc": raw.get("event_risk_context_timestamp_utc") or "",
             "day_mid_context": copy.deepcopy(raw.get("day_mid_context")),
             "_report_dir": report_dir.name,
             "_age_hours": age_hours,
@@ -5977,6 +6507,134 @@ def read_aia_event_risk_context(event_risk_path: Path | None = None) -> dict:
     }
 
 
+def _normalize_external_context_asset(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().upper()
+    if not text:
+        return None
+    for suffix in ("/USDT", "-USDT", "_USDT"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    for sep in ("/", "-", "_"):
+        if sep in text:
+            text = text.split(sep, 1)[0].strip()
+            break
+    if text.endswith("USDT") and len(text) > 4:
+        text = text[:-4]
+    return text or None
+
+
+def read_aia_flow_derivatives_context(flow_path: Path | None = None, *, asset: str | None = None) -> dict:
+    try:
+        path = flow_path or Path(
+            os.getenv("AIA_FLOW_DERIVATIVES_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/flow_derivatives_context.json"
+        )
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+    except Exception:
+        return {}
+
+    snapshot_asset = _normalize_external_context_asset(raw.get("asset"))
+    target_asset = _normalize_external_context_asset(asset)
+    if snapshot_asset is None:
+        return {}
+    if target_asset is not None and snapshot_asset != target_asset:
+        return {}
+    if raw.get("mode") != "observe_only":
+        return {}
+
+    context = raw.get("flow_derivatives_context")
+    if not isinstance(context, dict):
+        return {}
+    drivers = context.get("drivers") if isinstance(context.get("drivers"), list) else []
+
+    return {
+        "asset": snapshot_asset,
+        "timestamp_utc": raw.get("timestamp_utc") if isinstance(raw.get("timestamp_utc"), str) else "",
+        "mode": "observe_only",
+        "flow_derivatives_context": {
+            "bias": context.get("bias") if context.get("bias") in {"bullish", "bearish", "neutral"} else "neutral",
+            "confidence": max(0.0, min(float(context.get("confidence")), 1.0))
+            if isinstance(context.get("confidence"), (int, float))
+            else 0.0,
+            "crowding_state": context.get("crowding_state")
+            if context.get("crowding_state") in {"long_crowded", "short_crowded", "neutral"}
+            else "neutral",
+            "exchange_pressure": context.get("exchange_pressure")
+            if context.get("exchange_pressure") in {"high", "medium", "low"}
+            else "low",
+            "stablecoin_support": context.get("stablecoin_support")
+            if context.get("stablecoin_support") in {"high", "medium", "low"}
+            else "low",
+            "unlock_pressure": context.get("unlock_pressure")
+            if context.get("unlock_pressure") in {"high", "medium", "low"}
+            else "low",
+            "drivers": [str(item) for item in drivers if isinstance(item, str)],
+            "summary": str(context.get("summary") or "").strip(),
+        },
+        "raw_metrics": raw.get("raw_metrics") if isinstance(raw.get("raw_metrics"), dict) else {},
+    }
+
+
+def build_flow_derivatives_prompt_block(snapshot: dict | None) -> str:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return ""
+    return (
+        "\n=== FLOW / DERIVATIVES CONTEXT (EXTERNAL, OBSERVE_ONLY) ===\n"
+        "Это внешний snapshot analysis-layer из AIA. Он строится на своей cadence вне DAY и не должен "
+        "пересчитываться внутри DAY. Считай builder источником истины для crowding/exchange pressure/"
+        "stablecoin support/unlock risk; используй snapshot только как explanatory/advisory context.\n"
+        + json.dumps(snapshot, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+
+
+def render_flow_derivatives_context_section(
+    snapshot: dict | None,
+    *,
+    signal_payload: dict | None = None,
+    title: str = "Flow / Derivatives Context",
+) -> str:
+    if not isinstance(snapshot, dict) or not snapshot:
+        return ""
+    symbol = signal_payload.get("symbol") if isinstance(signal_payload, dict) else None
+    target_asset = _normalize_external_context_asset(symbol)
+    snapshot_asset = _normalize_external_context_asset(snapshot.get("asset"))
+    if snapshot_asset is None:
+        return ""
+    if target_asset is not None and snapshot_asset != target_asset:
+        return ""
+
+    context = snapshot.get("flow_derivatives_context") if isinstance(snapshot.get("flow_derivatives_context"), dict) else {}
+    drivers = context.get("drivers") if isinstance(context.get("drivers"), list) else []
+    lines = [title]
+    lines.append(
+        f"- Asset: {snapshot_asset} | mode: {snapshot.get('mode') or 'n/a'} | "
+        f"timestamp_utc: {snapshot.get('timestamp_utc') or 'n/a'}"
+    )
+    if isinstance(context.get("confidence"), (int, float)):
+        lines.append(f"- Bias: {context.get('bias') or 'neutral'} | confidence: {float(context.get('confidence')):.2f}")
+    else:
+        lines.append(f"- Bias: {context.get('bias') or 'neutral'} | confidence: 0.00")
+    lines.append(
+        f"- Crowding: {context.get('crowding_state') or 'neutral'} | exchange pressure: "
+        f"{context.get('exchange_pressure') or 'low'}"
+    )
+    lines.append(
+        f"- Stablecoin support: {context.get('stablecoin_support') or 'low'} | unlock pressure: "
+        f"{context.get('unlock_pressure') or 'low'}"
+    )
+    if drivers:
+        lines.append("- Drivers: " + "; ".join(str(item) for item in drivers[:4] if str(item).strip()))
+    summary = str(context.get("summary") or "").strip()
+    if summary:
+        lines.append("- Summary: " + summary)
+    return "\n".join(lines)
+
+
 # ---------------- Bootstrap ----------------
 BASE = Path(__file__).resolve().parent
 _CLI_CODE = r'''
@@ -6094,7 +6752,12 @@ if args.multi:
     mid_txt = read_latest_report_text("mid", limit_chars=2000)
     day_report_payload = read_latest_report_payload("day", max_age_hours=36)
     mid_report_payload = read_latest_report_payload("mid", max_age_hours=120)
-    event_risk_context = read_aia_event_risk_context()
+    local_event_risk_snapshot = build_event_risk_context(
+        news_block,
+        calendar_events=calendar_context.get("calendar_events") or [],
+    )
+    aia_event_risk_context = read_aia_event_risk_context()
+    flow_derivatives_context = read_aia_flow_derivatives_context() if analysis_profile == "day" else {}
 
     pool_symbols = sorted(pool_snapshot.keys())
     pool_payload = {
@@ -6107,10 +6770,13 @@ if args.multi:
             "eth_change_pct": eth_info.get("change"),
         },
         "mode": mode,
-        "event_risk_context": event_risk_context,
+        "event_risk_context": local_event_risk_snapshot,
+        "aia_event_risk_context": aia_event_risk_context,
         "calendar_generated_at_utc": calendar_context.get("generated_at_utc"),
         "calendar_events": calendar_context.get("calendar_events") or [],
     }
+    if flow_derivatives_context:
+        pool_payload["flow_derivatives_context"] = flow_derivatives_context
     if requested_mode is not None:
         pool_payload["requested_mode"] = requested_mode
 
@@ -6121,13 +6787,16 @@ if args.multi:
         "overview: 4–6 абзацев обзора по пулу, каждый абзац отдельной строкой массива.\n"
         "signal: объект с полями time_msk, symbol, price, direction, entry_range, sl, tp1, tp2, rr, "
         "take_profit_rules, break_even_rule, multi_tf_view, why_asset, news_context, upcoming_events, "
-        "macro_risk_summary, market_context, "
+        "macro_risk_summary, event_risk_context, event_risk_context_timestamp_utc, market_context, "
         "validity_minutes, cancel_condition, technical_rationale, disclaimer, entry_mode, confidence, "
         "confirmation_rules, alt_entry_range, entries, no_trade, no_trade_reasons, no_trade_hint, "
         "max_valid_minutes, ema20_m15, ema20_h1, ema_guard, day_mid_context, adx_guard, "
         "tp_by_mode, rr_by_mode, exit_plan_by_mode.\n"
         "upcoming_events: массив объектов будущих событий. Разрешены частично заполненные объекты; не опускай поле.\n"
         "macro_risk_summary: краткая строка с ближайшими risk windows; если риска нет — пустая строка.\n"
+        "event_risk_context: отдельный structured layer для unscheduled / developing catalysts. "
+        "Не смешивай его с scheduled calendar_events или upcoming_events.\n"
+        "event_risk_context_timestamp_utc: timestamp построения structured catalyst layer.\n"
         "news_context: выбери 1–3 строки ПРЯМО из блока [NEWS] или NEWS_FOCUS и вставь их БЕЗ ИЗМЕНЕНИЙ, "
         "сохраняя префикс времени вида \"[YYYY-MM-DD HH:MM МСК]\" и тег [impact:…]. Нельзя удалять/менять "
         "timestamp/impact или переписывать заголовок. Допускается добавить пояснение только в конце через "
@@ -6135,7 +6804,9 @@ if args.multi:
         f"symbol выбирай ТОЛЬКО из списка: {', '.join(pool_symbols)}.\n"
         f"time_msk установи ровно в это значение: {time_msk}.\n"
         "market_context ссылайся на проценты из блока [BTC_ETH_24H] как есть.\n"
-        "event_risk_context используй только как soft bias: он может смещать entry_type к wait_confirm, "
+        "event_risk_context — это локальный analysis-layer для headline catalysts: используй его как explanatory/advisory context "
+        "и держи ОТДЕЛЬНО от scheduled calendar_events.\n"
+        "aia_event_risk_context используй только как soft bias: он может смещать entry_type к wait_confirm, "
         "снижать агрессивность и требовать более аккуратного исполнения вокруг окна события, но не должен сам по себе жёстко запрещать сделку.\n"
         "\n=== EMA → TVH (TP) GUIDANCE (SOFT, FOR EXIT ONLY) ===\n"
         "EMA в этом шаге — ТОЛЬКО контекст для мышления при формировании ТВХ/TP (tp_by_mode) и логики выхода "
@@ -6220,12 +6891,21 @@ if args.multi:
             + "\n"
         )
     user_prompt += (
+        "\n=== EVENT-RISK CONTEXT (LOCAL, SEPARATE FROM SCHEDULED CALENDAR) ===\n"
+        "Это локальный structured layer по unscheduled / developing catalysts из headline inputs. "
+        "Scheduled calendar_events НЕ смешивай с этим блоком.\n"
+        + json.dumps(local_event_risk_snapshot, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+    user_prompt += (
         "\n=== AIA EVENT RISK CONTEXT ===\n"
         "Это отдельный soft-bias слой от AIA. Не превращай его в hard-block: используй для bias к wait_confirm, "
         "осторожности в aggressive mode и более аккуратного выбора execution вокруг event windows.\n"
-        + json.dumps(event_risk_context, ensure_ascii=False, indent=2)
+        + json.dumps(aia_event_risk_context, ensure_ascii=False, indent=2)
         + "\n"
     )
+    if analysis_profile == "day" and flow_derivatives_context:
+        user_prompt += build_flow_derivatives_prompt_block(flow_derivatives_context)
 
     resp = client.chat.completions.create(
         model=args.model,
@@ -6270,6 +6950,16 @@ if args.multi:
         day_report=day_report_payload,
         mid_report=mid_report_payload,
     )
+    attach_event_risk_context(signal_raw, local_event_risk_snapshot)
+    raw_ctx = signal_raw.get("day_mid_context") if isinstance(signal_raw.get("day_mid_context"), dict) else {}
+    raw_ctx = dict(raw_ctx)
+    attach_event_risk_context(
+        raw_ctx,
+        local_event_risk_snapshot,
+        field_name="event_risk_context",
+        timestamp_field="event_risk_context_timestamp_utc",
+    )
+    signal_raw["day_mid_context"] = raw_ctx
 
     if _DEBUG_TRACE_ENABLED:
         _debug_trace_reset()
@@ -6289,6 +6979,16 @@ if args.multi:
         now_msk=time_msk,
         calendar_context=calendar_context,
     )
+    attach_event_risk_context(signal, local_event_risk_snapshot)
+    final_ctx = signal.get("day_mid_context") if isinstance(signal.get("day_mid_context"), dict) else {}
+    final_ctx = dict(final_ctx)
+    attach_event_risk_context(
+        final_ctx,
+        local_event_risk_snapshot,
+        field_name="event_risk_context",
+        timestamp_field="event_risk_context_timestamp_utc",
+    )
+    signal["day_mid_context"] = final_ctx
 
     _debug_trace_set_entry_range("entry_range_post_finalize", signal)
     _debug_trace_set_entry_range("entry_range_final", signal)
@@ -6305,6 +7005,21 @@ if args.multi:
                     empty_message="Календарь пуст: подтвержденных scheduled events сейчас нет.",
                 )
             )
+            event_risk_section = render_event_risk_context_section(
+                local_event_risk_snapshot,
+                profile=analysis_profile,
+            )
+            if event_risk_section:
+                print()
+                print(event_risk_section)
+            if analysis_profile == "day":
+                flow_derivatives_section = render_flow_derivatives_context_section(
+                    read_aia_flow_derivatives_context(asset=signal.get("symbol")),
+                    signal_payload=signal,
+                )
+                if flow_derivatives_section:
+                    print()
+                    print(flow_derivatives_section)
         print("\n==========================\n")
 
     print(json.dumps(signal, ensure_ascii=False))
