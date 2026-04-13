@@ -222,6 +222,56 @@ class TestTgBotRouting(unittest.TestCase):
             "aia_no_trade_calls": aia_no_trade_calls,
         }
 
+    def _run_full_publish(self, uid: int, *, delivery_kind: str = "main", first_part: str = "BTC/USDT signal body"):
+        context = _FakeContext()
+        signal_events = []
+        personal_calls = []
+        aia_signal_calls = []
+        aia_no_trade_calls = []
+
+        self.tg_bot.set_params_mode = lambda mode: None
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
+        analysis_path = REPO_ROOT / "analysis_20260329_010203.md"
+        sig_path = REPO_ROOT / "signal_20260329_010203.html"
+        run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        self.tg_bot.latest = lambda pattern: {
+            "analysis_*.md": analysis_path,
+            "signal_*.html": sig_path,
+            "logs/signal_*.log": run_log,
+        }.get(pattern)
+        self.tg_bot.html_file_to_tg_text = lambda path: [first_part]
+        self.tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "long",
+            "entry_range": {"min": 1.0, "max": 2.0},
+            "sl": 0.5,
+            "tp1": 3.0,
+            "tp2": 4.0,
+        }
+        self.tg_bot._log_signal_publication = lambda **kwargs: signal_events.append(kwargs)
+        self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: aia_signal_calls.append((payload, kwargs))
+        self.tg_bot._queue_aia_no_trade_forward = lambda payload, **kwargs: aia_no_trade_calls.append((payload, kwargs))
+        self.tg_bot._send_personal = lambda target_uid, text, **kwargs: personal_calls.append(
+            {"uid": target_uid, "text": text, **kwargs}
+        ) or True
+
+        asyncio.run(
+            self.tg_bot._run_full_core(
+                uid,
+                context,
+                {"status": "paid"},
+                delivery_kind=delivery_kind,
+            )
+        )
+
+        return {
+            "context": context,
+            "signal_events": signal_events,
+            "personal_calls": personal_calls,
+            "aia_signal_calls": aia_signal_calls,
+            "aia_no_trade_calls": aia_no_trade_calls,
+        }
+
     def test_enzo_routes_only_to_dedicated_channel(self) -> None:
         self.assertEqual(
             self.tg_bot.get_main_publication_targets(6308066297),
@@ -335,6 +385,60 @@ class TestTgBotRouting(unittest.TestCase):
             1,
         )
 
+    def test_full_mode_skips_separate_llm_full_analysis_publish(self) -> None:
+        result = self._run_full_publish(6308066297, first_part="📌 Сигнал не выдан\n\nwait")
+
+        self.assertEqual(len(result["context"].bot.calls), 1)
+        self.assertEqual(result["context"].bot.calls[0]["chat_id"], -1003492385200)
+        self.assertIn("📌 Сигнал не выдан", result["context"].bot.calls[0]["text"])
+        self.assertNotIn("LLM Full анализ", result["context"].bot.calls[0]["text"])
+
+    def test_single_mode_skips_separate_analysis_header_publish(self) -> None:
+        result = self._run_symbol_publish(6308066297, symbol="SOL/USDT")
+
+        self.assertEqual(len(result["context"].bot.calls), 1)
+        self.assertEqual(result["context"].bot.calls[0]["chat_id"], -1003492385200)
+        self.assertIn("SOL/USDT signal body", result["context"].bot.calls[0]["text"])
+        self.assertNotIn("📝 Анализ SOL/USDT", result["context"].bot.calls[0]["text"])
+
+    def test_single_mode_does_not_prepend_duplicate_signal_header(self) -> None:
+        context = _FakeContext()
+        self.tg_bot.set_params_mode = lambda mode: None
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
+        sig_path = REPO_ROOT / "signal_20260329_010203.html"
+        run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        rendered = "📣 Сигнал\n🕗 Время (МСК): 12:00\n💰 Текущая цена: 100\n📊 Актив: SOL/USDT"
+        self.tg_bot.latest = lambda pattern: {
+            "analysis_*.md": None,
+            "signal_*.html": sig_path,
+            "logs/signal_*.log": run_log,
+        }.get(pattern)
+        self.tg_bot.html_file_to_tg_text = lambda path: [rendered]
+        self.tg_bot._read_last_signal_json = lambda: {
+            "symbol": "SOL/USDT",
+            "direction": "long",
+            "entry_range": {"min": 1.0, "max": 2.0},
+            "sl": 0.5,
+            "tp1": 3.0,
+            "tp2": 4.0,
+        }
+        self.tg_bot._log_signal_publication = lambda **kwargs: None
+        self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: None
+        self.tg_bot._queue_aia_no_trade_forward = lambda payload, **kwargs: None
+        self.tg_bot._send_personal = lambda *args, **kwargs: True
+
+        asyncio.run(
+            self.tg_bot._run_symbol_core(
+                6308066297,
+                "SOL/USDT",
+                context,
+                {"status": "paid"},
+            )
+        )
+
+        self.assertEqual(context.bot.calls[0]["text"], rendered)
+        self.assertEqual(context.bot.calls[0]["text"].count("📣 Сигнал"), 1)
+
     def test_personal_delivery_does_not_duplicate_main_channel_publish(self) -> None:
         result = self._run_symbol_publish(6308066297, delivery_kind="personal", symbol="TON/USDT")
 
@@ -347,6 +451,9 @@ class TestTgBotRouting(unittest.TestCase):
             [event["delivery_kind"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
             ["personal"],
         )
+
+    def test_bot_pool_is_fixed_to_agreed_five_assets(self) -> None:
+        self.assertEqual(self.tg_bot.SYMBOLS, ["BTC", "ETH", "BNB", "SOL", "XRP"])
 
 
 if __name__ == "__main__":

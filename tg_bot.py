@@ -74,6 +74,7 @@ from user_registry import (
 
 BASE = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE
+FIXED_BOT_ASSETS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 
 if load_dotenv is not None:
     load_dotenv(BASE / ".env.tg.clean")
@@ -335,9 +336,8 @@ async def _broadcast_core_signal(app: Application, sig_html: Path) -> None:
     symbol = _resolve_signal_symbol(None)
     for chat_id in targets:
         for idx, part in enumerate(parts):
-            prefix = "📣 Сигнал\n\n" if idx == 0 else ""
             try:
-                await app.bot.send_message(chat_id=chat_id, text=prefix + part)
+                await app.bot.send_message(chat_id=chat_id, text=part)
                 if idx == 0:
                     _log_signal_publication(
                         event="telegram_publish",
@@ -1414,7 +1414,7 @@ def load_symbols():
             pool = json.load(f)["pool"]
         return [s.split("/")[0] for s in pool]
     except Exception:
-        return ["BTC","ETH","SOL","AVAX","SUI","APT","AAVE","LINK","TON","ARB"]
+        return FIXED_BOT_ASSETS.copy()
 
 SYMBOLS     = load_symbols()
 SYMBOLS_SET = set(SYMBOLS)
@@ -1843,18 +1843,6 @@ async def _run_full_core(
     sig_html = latest("signal_*.html")
     run_log = latest("logs/signal_*.log")
 
-    if analysis:
-        hdr = make_header("📝 LLM Full анализ")
-        txt_raw = Path(analysis).read_text(encoding="utf-8")
-        txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
-        await _deliver_publication(
-            context,
-            uid,
-            hdr+"\n\n"+txt,
-            delivery_kind=delivery_kind,
-            protect_content=False,
-        )
-
     if sig_html:
         parts = html_file_to_tg_text(Path(sig_html))
         if parts:
@@ -1862,7 +1850,7 @@ async def _run_full_core(
             await _publish_signal_result(
                 context,
                 uid,
-                text="📣 Сигнал\n\n" + part0,
+                text=part0,
                 target_chat_id=target_chat_id,
                 delivery_kind=delivery_kind,
                 source="tg_bot.py:_run_full_core",
@@ -1953,18 +1941,6 @@ async def _run_symbol_core(
     sig_html = latest("signal_*.html")
     run_log = latest("logs/signal_*.log")
 
-    if analysis:
-        hdr = make_header(f"📝 Анализ {symbol}")
-        txt_raw = Path(analysis).read_text(encoding="utf-8")
-        txt = strip_snapshot(txt_raw).strip()
-        await _deliver_publication(
-            context,
-            uid,
-            hdr+"\n\n"+txt,
-            delivery_kind=delivery_kind,
-            protect_content=False,
-        )
-
     if sig_html:
         parts = html_file_to_tg_text(Path(sig_html))
         if parts:
@@ -1972,7 +1948,7 @@ async def _run_symbol_core(
             await _publish_signal_result(
                 context,
                 uid,
-                text="📣 Сигнал\n\n" + part0,
+                text=part0,
                 target_chat_id=target_chat_id,
                 delivery_kind=delivery_kind,
                 source="tg_bot.py:_run_symbol_core",

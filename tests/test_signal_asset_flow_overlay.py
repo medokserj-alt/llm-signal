@@ -300,6 +300,31 @@ class TestSignalAssetFlowOverlay(unittest.TestCase):
 
         self.assertEqual(d, before)
 
+    def test_flow_v2_ignores_asset_contexts_outside_fixed_bot_universe(self) -> None:
+        path = self._write_snapshot(
+            self._v2_snapshot(
+                asset_contexts={
+                    "DOGE": {
+                        "asset": "DOGE",
+                        "flow_derivatives_context": {
+                            "bias": "bullish",
+                            "confidence": 0.8,
+                            "crowding_state": "neutral",
+                            "exchange_pressure": "low",
+                            "stablecoin_support": "high",
+                            "unlock_pressure": "low",
+                            "drivers": ["irrelevant for fixed pool"],
+                            "summary": "Should be ignored.",
+                        },
+                    }
+                }
+            )
+        )
+
+        out = get_signal_json.read_signal_asset_flow_context("DOGE/USDT", path)
+
+        self.assertEqual(out, {})
+
 
 if __name__ == "__main__":
     unittest.main()

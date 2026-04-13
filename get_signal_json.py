@@ -42,6 +42,7 @@ from event_calendar import (
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
+FIXED_BOT_ASSET_UNIVERSE = frozenset({"BTC", "ETH", "BNB", "SOL", "XRP"})
 
 # ---- Variant B+2: neutral semantics guard ----
 # Neutral mode must not recommend entries "too close" to current price.
@@ -6648,7 +6649,7 @@ def read_mid_aia_flow_derivatives_context(flow_path: Path | None = None) -> dict
 
 def read_signal_asset_flow_context(symbol: str | None, flow_path: Path | None = None) -> dict:
     asset = _normalize_external_context_asset(symbol)
-    if asset is None:
+    if asset is None or asset not in FIXED_BOT_ASSET_UNIVERSE:
         return {}
     try:
         path = flow_path or Path(

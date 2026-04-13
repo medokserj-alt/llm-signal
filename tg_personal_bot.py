@@ -19,6 +19,7 @@ from rbac import analysis_menu_layout, is_admin
 
 BASE = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE
+FIXED_BOT_ASSETS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 
 load_dotenv(BASE / ".env.tg.clean")
 
@@ -218,9 +219,8 @@ async def _broadcast_signal_to_subscribers(app: Application, sig_html: Path) -> 
         if pref_mode != "all" and signal_mode and pref_mode != signal_mode:
             continue
         for idx, part in enumerate(parts):
-            prefix = "📣 Сигнал\n\n" if idx == 0 else ""
             try:
-                await app.bot.send_message(chat_id=chat_id, text=prefix + part)
+                await app.bot.send_message(chat_id=chat_id, text=part)
             except Exception:
                 continue
 
@@ -1059,10 +1059,11 @@ def set_params_mode(mode: str):
 
 def load_symbols():
     try:
-        pool = json.load(open(PROJECT_ROOT/"pool.json","r",encoding="utf-8"))["pool"]
+        with open(PROJECT_ROOT / "pool.json", "r", encoding="utf-8") as f:
+            pool = json.load(f)["pool"]
         return [s.split("/")[0] for s in pool]
     except Exception:
-        return ["BTC","ETH","SOL","AVAX","SUI","APT","AAVE","LINK","TON","ARB"]
+        return FIXED_BOT_ASSETS.copy()
 
 SYMBOLS     = load_symbols()
 SYMBOLS_SET = set(SYMBOLS)
@@ -1411,18 +1412,12 @@ async def handle_full(update,context):
         sig_html = latest("signal_*.html")
         run_log = latest("logs/signal_*.log")
 
-        if analysis:
-            hdr = make_header("📝 LLM Full анализ")
-            txt_raw = Path(analysis).read_text(encoding="utf-8")
-            txt = strip_snapshot(txt_raw).split("2️⃣ Сетап")[0].strip()
-            await context.bot.send_message(chat_id=target, text=hdr+"\n\n"+txt)
-
         if sig_html:
             parts = html_file_to_tg_text(Path(sig_html))
             if parts:
                 part0 = parts[0]
                 for ch in targets:
-                    await context.bot.send_message(chat_id=ch, text="📣 Сигнал\n\n"+part0)
+                    await context.bot.send_message(chat_id=ch, text=part0)
                 if "📌 Сигнал не выдан" in part0:
                     if target is not None:
                         payload = _build_no_trade_decision_payload(
@@ -1559,18 +1554,12 @@ async def handle_symbol(update,context):
         sig_html = latest("signal_*.html")
         run_log = latest("logs/signal_*.log")
 
-        if analysis:
-            hdr = make_header(f"📝 Анализ {symbol}")
-            txt_raw = Path(analysis).read_text(encoding="utf-8")
-            txt = strip_snapshot(txt_raw).strip()   # ВЕСЬ анализ, не режем по 2️⃣ Сетап
-            await context.bot.send_message(chat_id=target, text=hdr+"\n\n"+txt)
-
         if sig_html:
             parts = html_file_to_tg_text(Path(sig_html))
             if parts:
                 part0 = parts[0]
                 for ch in targets:
-                    await context.bot.send_message(chat_id=ch, text="📣 Сигнал\n\n"+part0)
+                    await context.bot.send_message(chat_id=ch, text=part0)
                 if "📌 Сигнал не выдан" in part0:
                     if target is not None:
                         payload = _build_no_trade_decision_payload(

@@ -52,6 +52,18 @@ def _read_last_payload(last_json_path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _load_last_payload(last_json_path: Path, *, allow_tg_bot_fallback: bool) -> dict | None:
+    if allow_tg_bot_fallback:
+        try:
+            data = _read_last_signal_json()
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data:
+            return data
+    data = _read_last_payload(last_json_path)
+    return data if isinstance(data, dict) else None
+
+
 def _iter_candidate_channel_ids(last_payload: dict | None):
     raw = os.getenv("SIGNAL_AIA_CHANNEL_ID")
     if raw is not None and str(raw).strip():
@@ -169,8 +181,9 @@ def main() -> int:
 
     args = _parse_args(sys.argv[1:])
     run_log = Path(args.run_log) if args.run_log and args.run_log.strip() else None
-    last_json_path = Path(args.last_json).resolve() if args.last_json else LAST_JSON_PATH
-    last_payload = _read_last_payload(last_json_path)
+    explicit_last_json = bool(args.last_json)
+    last_json_path = Path(args.last_json).resolve() if explicit_last_json else LAST_JSON_PATH
+    last_payload = _load_last_payload(last_json_path, allow_tg_bot_fallback=not explicit_last_json)
     published_at = _utc_now_z()
     signal_id = _infer_signal_id(None, run_log, published_at)
     try:
