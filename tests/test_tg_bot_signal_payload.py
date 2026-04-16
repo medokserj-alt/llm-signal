@@ -183,6 +183,101 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(out["entry_price"], 587.0)
         self.assertEqual(out["meta"]["entry_type"], "pullback")
 
+    def test_wait_confirm_payload_caps_timeout_to_three_hours(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BNB/USDT",
+            "direction": "long",
+            "entry_range": [613.0, 618.0],
+            "sl": 609.35,
+            "tp1": 625.0,
+            "tp2": 634.0,
+            "mode": "aggressive",
+            "entry_mode": "wait_confirm",
+            "entry_price_aggressive": 615.5,
+            "sl_by_mode": {"aggressive": 609.35},
+            "tp_by_mode": {"aggressive": {"tvh1": 625.0, "tvh2": 634.0}},
+            "max_valid_minutes": 1440,
+            "validity_minutes": 720,
+            "confirmation_rules": "Вход только после удержания зоны entry_range и ретеста.",
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="sig-wait-cap-1",
+            published_at="2026-04-15T09:52:00Z",
+            channel_id=-1001234567890,
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out["meta"]["entry_type"], "wait_confirm")
+        self.assertEqual(out["meta"]["max_wait_minutes"], 180)
+        self.assertEqual(out["meta"]["confirm_timeout_minutes"], 180)
+        self.assertIn({"type": "close_in_entry_zone"}, out["meta"]["confirm_rule_v1"]["rules"])
+        self.assertIn({"type": "retest_entry_zone", "required": True}, out["meta"]["confirm_rule_v1"]["rules"])
+        self.assertIn({"type": "deadline_minutes", "value": 180}, out["meta"]["confirm_rule_v1"]["rules"])
+
+    def test_wait_confirm_parser_supports_hold_retest_session_and_event_window_patterns(self) -> None:
+        tg_bot = _load_tg_bot_module()
+
+        rule = tg_bot._build_confirm_rule_v1(
+            {
+                "direction": "long",
+                "confirmation_rules": (
+                    "Вход только после удержания зоны entry_range и ретеста после прокола. "
+                    "Подтверждение в EU/US сессии. "
+                    "Не открывать новую позицию в пределах окна ±60 минут до/после US PPI."
+                ),
+            },
+            max_wait_minutes=180,
+        )
+
+        self.assertEqual(rule["version"], 1)
+        self.assertIn({"type": "close_in_entry_zone"}, rule["rules"])
+        self.assertIn({"type": "retest_entry_zone", "required": True}, rule["rules"])
+        self.assertIn({"type": "session_gate", "allowed_sessions": ["eu", "us"]}, rule["rules"])
+        self.assertIn(
+            {"type": "event_window_clear", "min_minutes": 60, "max_event_risk": "low"},
+            rule["rules"],
+        )
+
+    def test_wait_confirm_parser_supports_reclaim_and_impulse_patterns(self) -> None:
+        tg_bot = _load_tg_bot_module()
+
+        rule = tg_bot._build_confirm_rule_v1(
+            {
+                "direction": "short",
+                "confirmation_rules": (
+                    "После касания зоны нужен возврат под верхнюю границу диапазона и импульс вниз "
+                    "как подтверждение продавца."
+                ),
+            },
+            max_wait_minutes=120,
+        )
+
+        self.assertIn({"type": "reclaim_entry_zone", "side": "short"}, rule["rules"])
+        self.assertIn({"type": "m15_impulse_in_direction", "side": "short"}, rule["rules"])
+        self.assertIn({"type": "deadline_minutes", "value": 120}, rule["rules"])
+
+    def test_wait_confirm_parser_keeps_legacy_supported_rules_backward_compatible(self) -> None:
+        tg_bot = _load_tg_bot_module()
+
+        rule = tg_bot._build_confirm_rule_v1(
+            {
+                "direction": "long",
+                "confirmation_rules": (
+                    "M15 EMA20: закрытие не ниже EMA20; объём M15 выше среднего 20; "
+                    "тенью зайти внутрь зоны."
+                ),
+            },
+            max_wait_minutes=90,
+        )
+
+        self.assertIn({"type": "m15_close_vs_ema20", "op": "above"}, rule["rules"])
+        self.assertIn({"type": "volume_m15_vs_avg20", "op": ">="}, rule["rules"])
+        self.assertIn({"type": "wick_into_entry_zone", "required": True}, rule["rules"])
+        self.assertIn({"type": "deadline_minutes", "value": 90}, rule["rules"])
+
 
 if __name__ == "__main__":
     unittest.main()

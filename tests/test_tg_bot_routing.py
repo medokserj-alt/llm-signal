@@ -172,6 +172,16 @@ class TestTgBotRouting(unittest.TestCase):
         }
         self.tg_bot.SUBSCRIBERS = {82052103, 177651027, 5278300959, 7879055214}
 
+    def _proc_with_artifacts(self, *, sig_path: Path, run_log: Path):
+        stdout = "\n".join(
+            (
+                f"✅ Saved logs: {run_log.relative_to(REPO_ROOT).as_posix()}",
+                "✅ Last JSON: logs/last.json",
+                f"✅ Signal HTML: {sig_path.relative_to(REPO_ROOT).as_posix()}",
+            )
+        )
+        return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
     def _run_symbol_publish(self, uid: int, *, delivery_kind: str = "main", symbol: str = "BTC/USDT"):
         context = _FakeContext()
         signal_events = []
@@ -180,9 +190,12 @@ class TestTgBotRouting(unittest.TestCase):
         aia_no_trade_calls = []
 
         self.tg_bot.set_params_mode = lambda mode: None
-        self.tg_bot.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
         sig_path = REPO_ROOT / "signal_20260329_010203.html"
         run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: self._proc_with_artifacts(
+            sig_path=sig_path,
+            run_log=run_log,
+        )
         self.tg_bot.latest = lambda pattern: {
             "analysis_*.md": None,
             "signal_*.html": sig_path,
@@ -230,10 +243,13 @@ class TestTgBotRouting(unittest.TestCase):
         aia_no_trade_calls = []
 
         self.tg_bot.set_params_mode = lambda mode: None
-        self.tg_bot.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
         analysis_path = REPO_ROOT / "analysis_20260329_010203.md"
         sig_path = REPO_ROOT / "signal_20260329_010203.html"
         run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: self._proc_with_artifacts(
+            sig_path=sig_path,
+            run_log=run_log,
+        )
         self.tg_bot.latest = lambda pattern: {
             "analysis_*.md": analysis_path,
             "signal_*.html": sig_path,
@@ -404,9 +420,12 @@ class TestTgBotRouting(unittest.TestCase):
     def test_single_mode_does_not_prepend_duplicate_signal_header(self) -> None:
         context = _FakeContext()
         self.tg_bot.set_params_mode = lambda mode: None
-        self.tg_bot.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
         sig_path = REPO_ROOT / "signal_20260329_010203.html"
         run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: self._proc_with_artifacts(
+            sig_path=sig_path,
+            run_log=run_log,
+        )
         rendered = "📣 Сигнал\n🕗 Время (МСК): 12:00\n💰 Текущая цена: 100\n📊 Актив: SOL/USDT"
         self.tg_bot.latest = lambda pattern: {
             "analysis_*.md": None,
@@ -438,6 +457,91 @@ class TestTgBotRouting(unittest.TestCase):
 
         self.assertEqual(context.bot.calls[0]["text"], rendered)
         self.assertEqual(context.bot.calls[0]["text"].count("📣 Сигнал"), 1)
+
+    def test_run_symbol_core_uses_explicit_signal_html_from_current_run(self) -> None:
+        context = _FakeContext()
+        stale_sig = REPO_ROOT / "signal_20260328_235959.html"
+        fresh_sig = REPO_ROOT / "signal_20260329_010203.html"
+        run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        seen_paths = []
+
+        self.tg_bot.set_params_mode = lambda mode: None
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: self._proc_with_artifacts(
+            sig_path=fresh_sig,
+            run_log=run_log,
+        )
+        self.tg_bot.latest = lambda pattern: {
+            "analysis_*.md": None,
+            "signal_*.html": stale_sig,
+            "logs/signal_*.log": REPO_ROOT / "logs" / "signal_20260328_235959.log",
+        }.get(pattern)
+        self.tg_bot.html_file_to_tg_text = lambda path: seen_paths.append(path) or ["fresh body"]
+        self.tg_bot._read_last_signal_json = lambda: {
+            "symbol": "SOL/USDT",
+            "direction": "long",
+            "entry_range": {"min": 1.0, "max": 2.0},
+            "sl": 0.5,
+            "tp1": 3.0,
+            "tp2": 4.0,
+        }
+        self.tg_bot._log_signal_publication = lambda **kwargs: None
+        self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: None
+        self.tg_bot._queue_aia_no_trade_forward = lambda payload, **kwargs: None
+        self.tg_bot._send_personal = lambda *args, **kwargs: True
+
+        asyncio.run(
+            self.tg_bot._run_symbol_core(
+                6308066297,
+                "SOL/USDT",
+                context,
+                {"status": "paid"},
+            )
+        )
+
+        self.assertEqual(seen_paths, [fresh_sig])
+        self.assertEqual(context.bot.calls[0]["text"], "fresh body")
+
+    def test_run_full_core_uses_explicit_signal_html_from_current_run(self) -> None:
+        context = _FakeContext()
+        stale_sig = REPO_ROOT / "signal_20260328_235959.html"
+        fresh_sig = REPO_ROOT / "signal_20260329_010203.html"
+        run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        seen_paths = []
+
+        self.tg_bot.set_params_mode = lambda mode: None
+        self.tg_bot.subprocess.run = lambda *args, **kwargs: self._proc_with_artifacts(
+            sig_path=fresh_sig,
+            run_log=run_log,
+        )
+        self.tg_bot.latest = lambda pattern: {
+            "analysis_*.md": REPO_ROOT / "analysis_20260328_235959.md",
+            "signal_*.html": stale_sig,
+            "logs/signal_*.log": REPO_ROOT / "logs" / "signal_20260328_235959.log",
+        }.get(pattern)
+        self.tg_bot.html_file_to_tg_text = lambda path: seen_paths.append(path) or ["fresh full body"]
+        self.tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "long",
+            "entry_range": {"min": 1.0, "max": 2.0},
+            "sl": 0.5,
+            "tp1": 3.0,
+            "tp2": 4.0,
+        }
+        self.tg_bot._log_signal_publication = lambda **kwargs: None
+        self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: None
+        self.tg_bot._queue_aia_no_trade_forward = lambda payload, **kwargs: None
+        self.tg_bot._send_personal = lambda *args, **kwargs: True
+
+        asyncio.run(
+            self.tg_bot._run_full_core(
+                6308066297,
+                context,
+                {"status": "paid"},
+            )
+        )
+
+        self.assertEqual(seen_paths, [fresh_sig])
+        self.assertEqual(context.bot.calls[0]["text"], "fresh full body")
 
     def test_personal_delivery_does_not_duplicate_main_channel_publish(self) -> None:
         result = self._run_symbol_publish(6308066297, delivery_kind="personal", symbol="TON/USDT")

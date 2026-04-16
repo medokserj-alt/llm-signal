@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import sys
 import json
 import re
@@ -325,6 +326,10 @@ def _iter_flow_overlay_lines(d: dict) -> list[str]:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default=None)
+    args = parser.parse_args()
+
     raw = sys.stdin.read().strip()
     if not raw:
         print("ERR: empty stdin", file=sys.stderr)
@@ -375,7 +380,13 @@ def main():
         mtf_fallback = ""
     why_asset = (data.get("why_asset") or "").strip()
     news_ctx = data.get("news_context", []) or []
-    market_ctx = (data.get("market_context") or "").strip()
+    raw_market_ctx = data.get("market_context")
+    if isinstance(raw_market_ctx, dict):
+        market_ctx = str(raw_market_ctx.get("summary") or "").strip()
+    elif isinstance(raw_market_ctx, str):
+        market_ctx = raw_market_ctx.strip()
+    else:
+        market_ctx = str(raw_market_ctx).strip() if raw_market_ctx is not None else ""
     raw_tr = data.get("technical_rationale") or ""
     if isinstance(raw_tr, dict):
         rationale = (raw_tr.get("summary") or "").strip()
@@ -720,8 +731,11 @@ def main():
     html = html.replace("\n", "<br>\n")
 
     # сохранить HTML
-    ts = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y%m%d_%H%M%S")
-    out_name = f"signal_{ts}.html"
+    if args.output:
+        out_name = args.output
+    else:
+        ts = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y%m%d_%H%M%S")
+        out_name = f"signal_{ts}.html"
     pathlib.Path(out_name).write_text(html, encoding="utf-8")
 
     # вывод в stdout

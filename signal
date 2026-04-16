@@ -30,13 +30,17 @@ if [[ $# -gt 0 ]]; then
 fi
 args+=("$@")
 
-ts=$(date -u +%Y%m%d_%H%M%S)
+ts=$(TZ=Europe/Moscow date +%Y%m%d_%H%M%S)
 run_log="$LOGS_DIR/signal_${ts}.log"
 run_last_json="$LOGS_DIR/last_${ts}.json"
 canonical_last_json="$LOGS_DIR/last.json"
-stream_tmp="$LOGS_DIR/stream.tmp"
-last_raw_json="$LOGS_DIR/last.raw.json"
-last_clean_json="$LOGS_DIR/last.clean.json"
+run_signal_html="signal_${ts}.html"
+run_stream_tmp="$LOGS_DIR/stream_${ts}.tmp"
+run_last_raw_json="$LOGS_DIR/last_${ts}.raw.json"
+run_last_clean_json="$LOGS_DIR/last_${ts}.clean.json"
+canonical_stream_tmp="$LOGS_DIR/stream.tmp"
+canonical_last_raw_json="$LOGS_DIR/last.raw.json"
+canonical_last_clean_json="$LOGS_DIR/last.clean.json"
 
 # 1) Генерация + запись логов (сырой поток)
 # --- Step8: refresh LESSONS and export path ---
@@ -46,15 +50,15 @@ export LLM_LESSONS_FILE="$PWD/auto_feedback/lessons/LESSONS_FOR_LLM.md"
 "$PYTHON_BIN" get_signal_json.py --model "$MODEL" --params "$PARAMS" "${args[@]}" \
   | tee "$run_log" \
   | tee -a "$LOGS_DIR/last_signal.log" \
-  > "$stream_tmp"
+  > "$run_stream_tmp"
 
 # 2) Извлечь ПОСЛЕДНИЙ валидный JSON из лога (баланс скобок, игнорируя строки и экранирования)
 export SIGNAL_RUN_LAST_JSON="$run_last_json"
 export SIGNAL_RUN_LOG="$run_log"
-export SIGNAL_STREAM_TMP="$stream_tmp"
+export SIGNAL_STREAM_TMP="$run_stream_tmp"
 export SIGNAL_LOGS_DIR="$LOGS_DIR"
-export SIGNAL_LAST_RAW_JSON="$last_raw_json"
-export SIGNAL_LAST_CLEAN_JSON="$last_clean_json"
+export SIGNAL_LAST_RAW_JSON="$run_last_raw_json"
+export SIGNAL_LAST_CLEAN_JSON="$run_last_clean_json"
 python3 - << 'PY'
 import json, os, re, pathlib, sys
 
@@ -117,11 +121,10 @@ last_clean_json = pathlib.Path(os.environ.get("SIGNAL_LAST_CLEAN_JSON", "logs/la
 log_path = pathlib.Path(os.environ.get("SIGNAL_STREAM_TMP", "logs/stream.tmp"))
 raw = log_path.read_text(encoding="utf-8", errors="ignore")
 
-# Пытаемся сначала по свежему потоку; если пусто — берём сам run_log
+# Пытаемся сначала по свежему per-run потоку; если пусто — берём только текущий run_log.
 cands = find_json_candidates(raw)
-if not cands:
-    lastlog = run_log if run_log.exists() else sorted(logs_dir.glob("signal_*.log"))[-1]
-    raw2 = lastlog.read_text(encoding="utf-8", errors="ignore")
+if not cands and run_log.exists():
+    raw2 = run_log.read_text(encoding="utf-8", errors="ignore")
     cands = find_json_candidates(raw2)
 
 ok = None
@@ -190,9 +193,14 @@ def _drop_time_window_mentions(obj):
 
 data = _drop_time_window_mentions(data)
 last_raw_json.write_text(clean, encoding="utf-8")
+last_clean_json.write_text(clean, encoding="utf-8")
 run_last_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 print(f"[OK] extracted + validated JSON -> {run_last_json}")
 PY
+
+cp -f "$run_stream_tmp" "$canonical_stream_tmp"
+cp -f "$run_last_raw_json" "$canonical_last_raw_json"
+cp -f "$run_last_clean_json" "$canonical_last_clean_json"
 
 # --- генерируем артефакты для бота (MD + HTML) ---
 last_json="$run_last_json"
@@ -210,11 +218,16 @@ fi
 cp -f "$last_json" "$canonical_last_json"
 
 # HTML-сигнал из v2 JSON
-"$PYTHON_BIN" render_strict.py < "$last_json" | tee -a "$run_log" || true
+"$PYTHON_BIN" render_strict.py --output "$run_signal_html" < "$last_json" 2>&1 | tee -a "$run_log" || true
 
 echo "----------------------------------------"
 echo "✅ Saved logs: $run_log"
 echo "✅ Last JSON:  $canonical_last_json"
+if [[ -f "$run_signal_html" ]]; then
+  echo "✅ Signal HTML: $run_signal_html"
+else
+  echo "⚠️ Signal HTML was not created for this run"
+fi
 
 # --- Show tail of run log to terminal (optional) ---
 LINES="${LOG_TAIL:-120}"

@@ -29,6 +29,7 @@ def _render_text(data: dict) -> str:
     buf_out = io.StringIO()
     with (
         patch("sys.stdin", io.StringIO(json.dumps(data))),
+        patch("sys.argv", ["render_strict.py"]),
         patch("render_strict.pathlib.Path.write_text", return_value=None),
         contextlib.redirect_stdout(buf_out),
     ):
@@ -37,6 +38,17 @@ def _render_text(data: dict) -> str:
 
 
 class TestRenderEntryCommentary(unittest.TestCase):
+    def test_market_context_dict_does_not_break_render(self) -> None:
+        d = _base_signal_data()
+        d["market_context"] = {
+            "bias": "bullish",
+            "confidence": 0.68,
+            "summary": "Bullish observe-only context.",
+        }
+        out = _render_text(d)
+        self.assertIn("📣 Сигнал", out)
+        self.assertIn("📊 Актив:", out)
+
     def test_long_entry_range_around_current_marks_aggressive_from_current(self) -> None:
         d = _base_signal_data()
         d["side"] = "long"

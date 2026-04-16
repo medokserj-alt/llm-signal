@@ -145,6 +145,16 @@ class _FakeContext:
 
 
 class TestTgPersonalBotPublishBehavior(unittest.TestCase):
+    def _proc_with_artifacts(self, *, sig_path: Path, run_log: Path):
+        stdout = "\n".join(
+            (
+                f"✅ Saved logs: {run_log.relative_to(REPO_ROOT).as_posix()}",
+                "✅ Last JSON: logs/last.json",
+                f"✅ Signal HTML: {sig_path.relative_to(REPO_ROOT).as_posix()}",
+            )
+        )
+        return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
     def setUp(self) -> None:
         self.bot = _load_personal_bot_module()
         self.bot.is_allowed = lambda uid: True
@@ -157,11 +167,16 @@ class TestTgPersonalBotPublishBehavior(unittest.TestCase):
         self.bot.get_signal_targets = lambda uid: [-1003492385200]
         self.bot.set_params_mode = lambda mode: None
         self.bot.get_user_mode = lambda uid: "neutral"
-        self.bot.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(returncode=0)
+        sig_path = REPO_ROOT / "signal_20260329_010203.html"
+        run_log = REPO_ROOT / "logs" / "signal_20260329_010203.log"
+        self.bot.subprocess.run = lambda *args, **kwargs: self._proc_with_artifacts(
+            sig_path=sig_path,
+            run_log=run_log,
+        )
         self.bot.latest = lambda pattern: {
             "analysis_*.md": REPO_ROOT / "analysis_20260329_010203.md",
-            "signal_*.html": REPO_ROOT / "signal_20260329_010203.html",
-            "logs/signal_*.log": REPO_ROOT / "logs" / "signal_20260329_010203.log",
+            "signal_*.html": sig_path,
+            "logs/signal_*.log": run_log,
         }.get(pattern)
         self.bot._should_send_to_aia_for_target = lambda target: False
 

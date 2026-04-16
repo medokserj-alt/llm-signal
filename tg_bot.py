@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest, parse as urlparse
 
+MSK = ZoneInfo("Europe/Moscow")
+
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -526,6 +528,35 @@ def latest(pattern:str):
     files = list(PROJECT_ROOT.glob(pattern))
     return max(files, key=lambda p:p.stat().st_mtime) if files else None
 
+def _project_path_from_output(raw_path: str | None) -> Path | None:
+    if not isinstance(raw_path, str):
+        return None
+    value = raw_path.strip()
+    if not value:
+        return None
+    p = Path(value)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return p.resolve()
+
+def _extract_signal_artifact_path(output: str | None, label: str) -> Path | None:
+    if not isinstance(output, str) or not output.strip():
+        return None
+    prefix = f"{label}:"
+    for line in reversed(output.splitlines()):
+        if not line.startswith(prefix):
+            continue
+        return _project_path_from_output(line.split(":", 1)[1])
+    return None
+
+def _resolve_signal_run_artifacts(proc) -> tuple[Path | None, Path | None]:
+    stdout = getattr(proc, "stdout", None)
+    stderr = getattr(proc, "stderr", None)
+    combined = "\n".join(part for part in (stdout, stderr) if isinstance(part, str) and part)
+    run_log = _extract_signal_artifact_path(combined, "✅ Saved logs")
+    sig_html = _extract_signal_artifact_path(combined, "✅ Signal HTML")
+    return sig_html, run_log
+
 def latest_report_dir(root_dir: str) -> Path | None:
     root = PROJECT_ROOT / "reports" / root_dir
     roots = sorted(root.glob("*"))
@@ -599,6 +630,13 @@ def format_done(done_line: str, logs_path: str | None = None) -> str:
 def _utc_now_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def _signal_id_from_published_at_msk(published_at: str) -> str:
+    try:
+        dt_utc = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return dt_utc.astimezone(MSK).strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return datetime.now(MSK).strftime("%Y%m%d_%H%M%S")
+
 def _infer_signal_id(sig_html: Path | None, run_log: Path | None, published_at: str) -> str:
     for p in (sig_html, run_log):
         if not p:
@@ -606,12 +644,7 @@ def _infer_signal_id(sig_html: Path | None, run_log: Path | None, published_at: 
         m = re.search(r"_(\d{8}_\d{6})\.", p.name)
         if m:
             return m.group(1)
-    # fallback: YYYYMMDD_HHMMSS from published_at
-    try:
-        dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
-        return dt.strftime("%Y%m%d_%H%M%S")
-    except Exception:
-        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return _signal_id_from_published_at_msk(published_at)
 
 def _aia_request_json(method: str, path: str, *, query: dict | None = None, body: dict | None = None) -> tuple[int, dict | None]:
     url = AIA_BASE_URL.rstrip("/") + path
@@ -754,12 +787,26 @@ def _extract_confirmation_rules_text(d: dict, *, max_len: int | None = None) -> 
         return text[: max_len - 3].rstrip() + "..."
     return text
 
-def _extract_max_wait_minutes(d: dict, default: int = 90) -> int:
+def _extract_max_wait_minutes(d: dict, default: int = 180) -> int:
+    cap = 180
     for k in ("max_wait_minutes", "max_valid_minutes", "validity_minutes", "max_valid_minutes"):
         v = _try_int(d.get(k))
         if isinstance(v, int) and v > 0:
-            return v
-    return int(default)
+            return min(int(v), cap)
+    return min(int(default), cap)
+
+
+def _append_unique_rule(rules: list[dict], rule: dict) -> None:
+    if rule not in rules:
+        rules.append(rule)
+
+
+def _extract_event_window_minutes(text: str) -> int:
+    numbers = [int(match) for match in re.findall(r"(\d{1,3})\s*мин", text)]
+    bounded = [value for value in numbers if 5 <= value <= 240]
+    if bounded:
+        return max(bounded)
+    return 90
 
 def _resolve_signal_mode_from_last_json(d: dict, *, uid: int | None = None) -> str:
     if isinstance(uid, int):
@@ -808,22 +855,148 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
                     text_parts.append(t)
         text = " ".join(text_parts)
     norm = str(text).lower()
+    side = str(d.get("direction") or d.get("side") or "").strip().lower()
+    is_long = side == "long"
+    is_short = side == "short"
+    has_zone = any(token in norm for token in ("entry_range", "диапазон", "зон", "range", "границ"))
+    has_hold = any(
+        token in norm
+        for token in (
+            "удерж",
+            "закреп",
+            "hold",
+            "holds",
+            "удержания",
+            "удерживает",
+            "внутрь диапазона",
+            "выше нижней границы",
+            "ниже верхней границы",
+        )
+    )
+    has_retest = any(
+        token in norm
+        for token in (
+            "ретест",
+            "retest",
+            "после теста",
+            "после касания",
+            "после прокола",
+            "после тестирования",
+            "после тест",
+        )
+    )
+    has_reclaim = any(
+        token in norm
+        for token in (
+            "возврат",
+            "reclaim",
+            "returns inside",
+            "возвращается внутрь",
+            "быстрым возвратом",
+            "возврата под",
+            "возврат под",
+            "возврата выше",
+            "возврат выше",
+            "под уровень",
+        )
+    )
+    has_impulse = any(
+        token in norm
+        for token in (
+            "импульс",
+            "impulse",
+            "отбой",
+            "отскок",
+            "bounce",
+            "rejection",
+            "подтверждение покупателя",
+            "подтверждение продавца",
+            "higher-lows",
+            "lower-highs",
+            "серия свеч",
+            "серия удержаний",
+        )
+    )
+    session_gate = any(
+        token in norm
+        for token in (
+            "eu/us",
+            "eu / us",
+            "us-сесс",
+            "us session",
+            "europe/us",
+            "предпочтительно подтверждение в eu/us",
+            "лучше eu/us",
+            "подтверждение в eu/us",
+            "низкой ликвидности",
+            "thin liquidity",
+            "low-liquidity",
+            "ази",
+            "night",
+        )
+    )
+    event_window_caution = any(
+        token in norm
+        for token in (
+            "upcoming_events",
+            "ppi",
+            "fed",
+            "fomc",
+            "cpi",
+            "headline",
+            "новост",
+            "событ",
+            "реч",
+            "до/после",
+            "до и 90 минут после",
+            "в пределах окна",
+            "перед fed",
+            "fed-speakers",
+        )
+    )
 
     if "m15" in norm and "ema20" in norm:
-        has_above = any(token in norm for token in ("не ниже", ">=", "выше"))
-        has_below = any(token in norm for token in ("не выше", "<=", "ниже"))
-        if has_above and not has_below:
-            rules.append({"type": "m15_close_vs_ema20", "op": "above"})
-        elif has_below and not has_above:
-            rules.append({"type": "m15_close_vs_ema20", "op": "below"})
+        explicit_above = "не ниже" in norm
+        explicit_below = "не выше" in norm
+        has_above = explicit_above or any(token in norm for token in (">=", "выше"))
+        has_below = explicit_below or any(token in norm for token in ("<=", "ниже"))
+        if has_above and not explicit_below and not (has_below and not explicit_above):
+            _append_unique_rule(rules, {"type": "m15_close_vs_ema20", "op": "above"})
+        elif has_below and not explicit_above and not (has_above and not explicit_below):
+            _append_unique_rule(rules, {"type": "m15_close_vs_ema20", "op": "below"})
 
     if "объ" in norm and "средн" in norm and "20" in norm and "m15" in norm:
-        rules.append({"type": "volume_m15_vs_avg20", "op": ">="})
+        _append_unique_rule(rules, {"type": "volume_m15_vs_avg20", "op": ">="})
 
     if "тенью" in norm and ("диапазон" in norm or "зон" in norm) and ("внутр" in norm or "зайти" in norm):
-        rules.append({"type": "wick_into_entry_zone", "required": True})
+        _append_unique_rule(rules, {"type": "wick_into_entry_zone", "required": True})
 
-    rules.append({"type": "deadline_minutes", "value": int(max_wait_minutes)})
+    if has_zone and has_hold:
+        _append_unique_rule(rules, {"type": "close_in_entry_zone"})
+
+    if has_zone and has_retest:
+        _append_unique_rule(rules, {"type": "retest_entry_zone", "required": True})
+
+    if has_zone and has_reclaim and (is_long or is_short):
+        _append_unique_rule(rules, {"type": "reclaim_entry_zone", "side": side})
+
+    if has_impulse and (is_long or is_short):
+        _append_unique_rule(rules, {"type": "m15_impulse_in_direction", "side": side})
+
+    if session_gate:
+        _append_unique_rule(rules, {"type": "session_gate", "allowed_sessions": ["eu", "us"]})
+
+    if event_window_caution:
+        _append_unique_rule(
+            rules,
+            {
+                "type": "event_window_clear",
+                "min_minutes": _extract_event_window_minutes(norm),
+                "max_event_risk": "low",
+            },
+        )
+
+    _append_unique_rule(rules, {"type": "deadline_minutes", "value": int(max_wait_minutes)})
     return {"version": 1, "rules": rules}
 
 def _build_signal_json_v1(
@@ -1044,7 +1217,7 @@ def _build_signal_json_v1(
     if meta is not None:
         out["meta"] = meta
         if meta.get("entry_type") == "wait_confirm":
-            max_wait_minutes = _extract_max_wait_minutes(d, default=90)
+            max_wait_minutes = _extract_max_wait_minutes(d, default=180)
             out["meta"]["max_wait_minutes"] = int(max_wait_minutes)
             out["meta"]["confirm_timeout_minutes"] = int(max_wait_minutes)
             out["meta"]["confirm_rule_v1"] = _build_confirm_rule_v1(d, max_wait_minutes=max_wait_minutes)
@@ -1840,8 +2013,7 @@ async def _run_full_core(
     )
 
     analysis = latest("analysis_*.md")
-    sig_html = latest("signal_*.html")
-    run_log = latest("logs/signal_*.log")
+    sig_html, run_log = _resolve_signal_run_artifacts(proc)
 
     if sig_html:
         parts = html_file_to_tg_text(Path(sig_html))
@@ -1858,6 +2030,9 @@ async def _run_full_core(
                 sig_html=Path(sig_html) if sig_html else None,
                 run_log=Path(run_log) if run_log else None,
             )
+    elif status_msg is not None:
+        await status_msg.edit_text("Не удалось сформировать publish HTML для текущего прогона.")
+        return
 
     if record.get("status") == "trial":
         consume_trial(uid)
@@ -1891,7 +2066,7 @@ async def _run_analysis_core(
         capture_output=True, text=True, timeout=900
     )
     analysis = latest("analysis_*.md")
-    run_log = latest("logs/signal_*.log")
+    _, run_log = _resolve_signal_run_artifacts(proc)
     if not analysis:
         if status_msg is not None:
             await status_msg.edit_text("Не удалось сформировать анализ.")
@@ -1938,8 +2113,7 @@ async def _run_symbol_core(
     )
 
     analysis = latest("analysis_*.md")
-    sig_html = latest("signal_*.html")
-    run_log = latest("logs/signal_*.log")
+    sig_html, run_log = _resolve_signal_run_artifacts(proc)
 
     if sig_html:
         parts = html_file_to_tg_text(Path(sig_html))
@@ -1956,6 +2130,9 @@ async def _run_symbol_core(
                 sig_html=Path(sig_html) if sig_html else None,
                 run_log=Path(run_log) if run_log else None,
             )
+    elif status_msg is not None:
+        await status_msg.edit_text("Не удалось сформировать publish HTML для текущего прогона.")
+        return
 
     if record.get("status") == "trial":
         consume_trial(uid)
