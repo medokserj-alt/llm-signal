@@ -346,6 +346,9 @@ class TestTgBotRouting(unittest.TestCase):
             [event["event"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
             ["telegram_publish"],
         )
+        self.assertEqual(len(result["aia_signal_calls"]), 1)
+        self.assertEqual(result["aia_signal_calls"][0][1]["target_chat_id"], -1003492385200)
+        self.assertEqual(result["aia_signal_calls"][0][1]["source"], "tg_bot.py:_run_symbol_core")
 
     def test_dima_main_signal_publishes_once_to_dedicated_channel(self) -> None:
         result = self._run_symbol_publish(672885732, symbol="ETH/USDT")
@@ -408,6 +411,20 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertEqual(result["context"].bot.calls[0]["chat_id"], -1003492385200)
         self.assertIn("📌 Сигнал не выдан", result["context"].bot.calls[0]["text"])
         self.assertNotIn("LLM Full анализ", result["context"].bot.calls[0]["text"])
+
+    def test_full_mode_publish_queues_aia_send_only_after_bot_publish_path(self) -> None:
+        result = self._run_full_publish(6308066297, first_part="BTC/USDT signal body")
+
+        self.assertEqual(
+            [event["event"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
+            ["telegram_publish"],
+        )
+        self.assertEqual(len(result["aia_signal_calls"]), 1)
+        payload, meta = result["aia_signal_calls"][0]
+        self.assertEqual(meta["target_chat_id"], -1003492385200)
+        self.assertEqual(meta["source"], "tg_bot.py:_run_full_core")
+        self.assertEqual(payload["symbol"], "BTC/USDT")
+        self.assertEqual(payload["channel_id"], -1003492385200)
 
     def test_single_mode_skips_separate_analysis_header_publish(self) -> None:
         result = self._run_symbol_publish(6308066297, symbol="SOL/USDT")

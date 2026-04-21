@@ -211,10 +211,6 @@ last_json="$run_last_json"
 # Прогоняем JSON через v2-постобработку (EMA/H1 + DAY/MID + ADX + три входа)
 "$PYTHON_BIN" postprocess_full_last.py --last-json "$last_json" >> "$run_log" 2>&1 || echo "[WARN] postprocess_full_last failed" >> "$run_log"
 
-if [[ "$is_full_run" == "1" && "${SIGNAL_SKIP_AIA_SEND:-0}" != "1" ]]; then
-  "$PYTHON_BIN" send_last_signal_to_aia.py "$run_log" --last-json "$last_json" | tee -a "$run_log" || true
-fi
-
 cp -f "$last_json" "$canonical_last_json"
 
 # HTML-сигнал из v2 JSON
