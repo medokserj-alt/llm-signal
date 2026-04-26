@@ -320,6 +320,49 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         }
         self.assertEqual(after, before)
 
+    def test_severe_unscheduled_geopolitical_bundle_dominates_empty_calendar_and_hardens_signal_framing(self) -> None:
+        d = self._base_signal()
+        d["day_mid_context"]["event_risk_context"] = [
+            {
+                "event": "Fragile ceasefire and renewed military threat keep negotiations unresolved",
+                "category": "geopolitics",
+                "phase": "ongoing",
+                "impact": "high",
+                "directional_risk": "uncertain",
+                "summary": (
+                    "Negotiations are ongoing, but ceasefire collapse risk increased and renewed military action "
+                    "remains possible."
+                ),
+                "drivers": [
+                    "headline sensitivity stays elevated while tail risk is repriced",
+                    "public threats keep escalation probability elevated",
+                ],
+                "confirmed_facts": ["Negotiations are ongoing"],
+                "anticipated_consequences": [
+                    "Ceasefire collapse risk increased",
+                    "Renewed military action risk increased",
+                ],
+            }
+        ]
+
+        get_signal_json.apply_upcoming_event_risk(d)
+
+        self.assertEqual(d.get("upcoming_events"), [])
+        self.assertEqual((d.get("event_risk_regime") or {}).get("severity"), "severe")
+        self.assertEqual((d.get("event_risk_regime") or {}).get("driver"), "geopolitics")
+        self.assertEqual(d.get("entry_mode"), "wait_confirm")
+        self.assertEqual(d.get("confidence"), "Low")
+        self.assertIn("empty scheduled calendar does not reduce unscheduled headline fragility", (d.get("macro_risk_summary") or "").lower())
+        display_lines = " ".join((d.get("event_risk") or {}).get("display_lines") or []).lower()
+        self.assertIn("tactical-only", display_lines)
+        self.assertIn("buy-the-dip", display_lines)
+        warnings = d.get("warnings") or []
+        self.assertIn("event_risk_geopolitical_regime_severe", warnings)
+        self.assertIn("event_risk_downside_shock_asymmetry", warnings)
+        self.assertIn("event_risk_tactical_only_continuation", warnings)
+        self.assertNotIn("Iran", d.get("macro_risk_summary") or "")
+        self.assertNotIn("Hormuz", d.get("macro_risk_summary") or "")
+
 
 if __name__ == "__main__":
     unittest.main()

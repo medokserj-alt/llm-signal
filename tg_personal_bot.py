@@ -480,6 +480,97 @@ def html_file_to_tg_text(p:Path,max_len:int=4000):
         s=s[max_len:]
     return chunks
 
+REPORT_TELEGRAM_MAX_LEN = 3900
+
+
+def _split_text_for_telegram_sections(text: str, max_len: int = REPORT_TELEGRAM_MAX_LEN) -> list[str]:
+    clean = str(text or "").strip()
+    if not clean:
+        return []
+    if len(clean) <= max_len:
+        return [clean]
+
+    def _split_long_block(block: str) -> list[str]:
+        lines = [ln.rstrip() for ln in block.splitlines()]
+        if len(lines) > 1:
+            out: list[str] = []
+            current = ""
+            for line in lines:
+                candidate = line if not current else current + "\n" + line
+                if len(candidate) <= max_len:
+                    current = candidate
+                    continue
+                if current:
+                    out.append(current)
+                current = line
+            if current:
+                out.append(current)
+            if all(len(item) <= max_len for item in out):
+                return out
+
+        words = block.split()
+        if not words:
+            return []
+        out = []
+        current = ""
+        for word in words:
+            candidate = word if not current else current + " " + word
+            if len(candidate) <= max_len:
+                current = candidate
+                continue
+            if current:
+                out.append(current)
+            current = word
+        if current:
+            out.append(current)
+        return out
+
+    sections = [section.strip() for section in re.split(r"\n\s*\n", clean) if section.strip()]
+    blocks: list[str] = []
+    for section in sections:
+        if len(section) <= max_len:
+            blocks.append(section)
+        else:
+            blocks.extend(_split_long_block(section))
+
+    chunks: list[str] = []
+    current = ""
+    for block in blocks:
+        candidate = block if not current else current + "\n\n" + block
+        if len(candidate) <= max_len:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = block
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _build_report_telegram_messages(root_dir: str, emoji: str, body_text: str) -> list[str]:
+    hdr = make_header(f"{emoji} {root_dir.upper()}")
+    clean = str(body_text or "").strip()
+    if not clean:
+        return []
+
+    title_prefix = f"{emoji} {root_dir.upper()}"
+    chunks = _split_text_for_telegram_sections(clean, max_len=REPORT_TELEGRAM_MAX_LEN)
+    if len(chunks) <= 1:
+        return [hdr + "\n\n" + clean]
+
+    total = len(chunks)
+    messages: list[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        if idx == 1:
+            title = f"{hdr} (part {idx}/{total})"
+        elif idx == total:
+            title = f"{title_prefix} • appendix (part {idx}/{total})"
+        else:
+            title = f"{title_prefix} • part {idx}/{total}"
+        messages.append(title + "\n\n" + chunk)
+    return messages
+
 def _relpath(p: Path) -> str:
     try:
         return p.relative_to(PROJECT_ROOT).as_posix()
@@ -1777,14 +1868,17 @@ async def handle_symbol(update,context):
 # ---------- DAY / MID ----------
 async def _post_report(root_dir, emoji, context, channel, report_dir: Path) -> None:
     d = report_dir
-    hdr = make_header(f"{emoji} {root_dir.upper()}")
     header_line = f"<b><u>{emoji} {root_dir.upper()} REPORT</u></b>\n"
     header_msg = await context.bot.send_message(chat_id=channel, text=header_line, parse_mode=ParseMode.HTML)
     an = sorted(d.glob("analysis_*.md"))
     report_msg = None
     if an:
         txt = an[-1].read_text(encoding="utf-8").strip()
-        report_msg = await context.bot.send_message(chat_id=channel, text=hdr+"\n\n"+txt[:3900])
+        messages = _build_report_telegram_messages(root_dir, emoji, txt)
+        for idx, message in enumerate(messages):
+            sent = await context.bot.send_message(chat_id=channel, text=message)
+            if idx == 0:
+                report_msg = sent
 
     pinned_kind = root_dir.lower()
     if pinned_kind in ("day", "mid"):

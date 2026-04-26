@@ -20,7 +20,7 @@ class TestEMANarrativeConsistency(unittest.TestCase):
             return
 
         try:
-            with tempfile.TemporaryDirectory(dir=str(Path(__file__).resolve().parent)) as td:
+            with tempfile.TemporaryDirectory() as td:
                 base = Path(td)
                 postprocess_full_last.BASE = base
                 (base / "logs").mkdir(parents=True, exist_ok=True)
@@ -54,18 +54,20 @@ class TestEMANarrativeConsistency(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                # For this test we want to validate narrative fixes using the explicitly provided EMA values
-                # without overriding them from provenance.
+                # Even with provenance overwrite muted, postprocess_full_last still recomputes EMA blocks
+                # from fresh OHLCV via apply_ema_blocks_and_derivatives(). The test must therefore validate
+                # consistency against final EMA truth, not against the seeded stale snapshot values.
                 with patch.object(postprocess_full_last, "overwrite_ema20_from_provenance", side_effect=fake_overwrite):
                     postprocess_full_last.main()
 
                 out = json.loads((base / "logs" / "last.json").read_text(encoding="utf-8"))
-                self.assertEqual(out.get("price_vs_ema20_m15"), "below")
                 price = float(out["price"])
-                ema20_h1 = float(out["ema20_h1"])
-                exp_h1 = "above" if price > ema20_h1 else ("below" if price < ema20_h1 else "equal")
-                self.assertEqual(out.get("price_vs_ema20_h1"), exp_h1)
                 ema20_m15 = float(out["ema20_m15"])
+                ema20_h1 = float(out["ema20_h1"])
+                exp_m15 = "above" if price > ema20_m15 else ("below" if price < ema20_m15 else "equal")
+                exp_h1 = "above" if price > ema20_h1 else ("below" if price < ema20_h1 else "equal")
+                self.assertEqual(out.get("price_vs_ema20_m15"), exp_m15)
+                self.assertEqual(out.get("price_vs_ema20_h1"), exp_h1)
                 if price > ema20_m15 and price > ema20_h1:
                     exp_state = "above_both"
                 elif price < ema20_m15 and price < ema20_h1:
@@ -75,12 +77,34 @@ class TestEMANarrativeConsistency(unittest.TestCase):
                 self.assertEqual(out.get("ema_guard_state"), exp_state)
 
                 mtf = out.get("multi_tf_view") or {}
-                self.assertIsInstance(mtf, dict)
-                self.assertNotRegex(str(mtf.get("m15", "")), re.compile(r"(?i)выше\\s+ema20"))
+                if isinstance(mtf, dict):
+                    m15_text = str(mtf.get("m15", ""))
+                    h1_text = str(mtf.get("h1", ""))
+                else:
+                    self.assertIsInstance(mtf, str)
+                    m15_text = str(mtf)
+                    h1_text = str(mtf)
+                if exp_m15 == "above":
+                    self.assertNotRegex(m15_text, re.compile(r"(?i)(ниже|под)\\s+ema20"))
+                elif exp_m15 == "below":
+                    self.assertNotRegex(m15_text, re.compile(r"(?i)(выше|над)\\s+ema20"))
+                else:
+                    self.assertNotRegex(m15_text, re.compile(r"(?i)(выше|над|ниже|под)\\s+ema20"))
+                if exp_h1 == "above":
+                    self.assertNotRegex(h1_text, re.compile(r"(?i)(ниже|под)\\s+ema20"))
+                elif exp_h1 == "below":
+                    self.assertNotRegex(h1_text, re.compile(r"(?i)(выше|над)\\s+ema20"))
+                else:
+                    self.assertNotRegex(h1_text, re.compile(r"(?i)(выше|над|ниже|под)\\s+ema20"))
 
-                # between -> generic "выше/ниже EMA20" in why_asset must be neutralized
+                # why_asset must remain consistent with final EMA guard state.
                 why = str(out.get("why_asset") or "")
-                self.assertNotRegex(why, re.compile(r"(?i)выше\\s+ema20"))
+                if exp_state == "above_both":
+                    self.assertNotRegex(why, re.compile(r"(?i)(ниже|под)\\s+ema20"))
+                elif exp_state == "below_both":
+                    self.assertNotRegex(why, re.compile(r"(?i)(выше|над)\\s+ema20"))
+                else:
+                    self.assertNotRegex(why, re.compile(r"(?i)(выше|над|ниже|под)\\s+ema20"))
         finally:
             postprocess_full_last.BASE = old_base
 
@@ -106,6 +130,7 @@ class TestEMANarrativeConsistency(unittest.TestCase):
         buf_out = io.StringIO()
         with (
             patch("sys.stdin", io.StringIO(json.dumps(d))),
+            patch("sys.argv", ["render_strict.py"]),
             patch("render_strict.pathlib.Path.write_text", return_value=None),
             contextlib.redirect_stdout(buf_out),
         ):
@@ -145,6 +170,7 @@ class TestEMANarrativeConsistency(unittest.TestCase):
         buf_out = io.StringIO()
         with (
             patch("sys.stdin", io.StringIO(json.dumps(d))),
+            patch("sys.argv", ["render_strict.py"]),
             patch("render_strict.pathlib.Path.write_text", return_value=None),
             contextlib.redirect_stdout(buf_out),
         ):
@@ -153,6 +179,68 @@ class TestEMANarrativeConsistency(unittest.TestCase):
 
         self.assertNotRegex(rendered, re.compile(r"(?i)15m\\s*:\\s*.*выше\\s+ema20"))
         self.assertIn("EMA статус: M15: НИЖЕ EMA20", rendered)
+
+    def test_string_multi_tf_view_is_replaced_with_ema_consistent_summary(self) -> None:
+        d = {
+            "price": 600.0,
+            "ema20_m15": 605.0,
+            "ema20_h1": 590.0,
+            "multi_tf_view": "M15 и H1: цена выше EMA20/60, структура восходящая",
+        }
+
+        get_signal_json.enforce_ema_narrative_consistency(d)
+
+        self.assertEqual(
+            d.get("multi_tf_view"),
+            "M15: цена ниже EMA20; H1: цена выше EMA20; по EMA20 структура смешанная, единого подтверждения нет.",
+        )
+
+    def test_why_asset_comparison_does_not_treat_h1_above_ema60_as_negative(self) -> None:
+        d = {
+            "why_asset": "BTC предпочтительнее, чем хай-бета/активы с H1 выше EMA60: структура чище.",
+        }
+
+        get_signal_json.enforce_ema_narrative_consistency(d)
+
+        why = str(d.get("why_asset") or "")
+        self.assertNotIn("активы с H1 выше EMA60", why)
+        self.assertIn("смешанной H1-структурой или ниже EMA60", why)
+
+    def test_render_guard_fixes_raw_string_multi_tf_view_without_postprocess(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "BNB/USDT",
+            "price": 600.0,
+            "ema20_m15": 605.0,
+            "ema20_h1": 590.0,
+            "mode": "neutral",
+            "why_asset": "test",
+            "multi_tf_view": "M15 и H1: цена выше EMA20/60, структура восходящая",
+            "news_context": [],
+            "entries": {"neutral": {"enabled": True}},
+            "entry_price_neutral": 599.0,
+            "sl_by_mode": {"neutral": 590.0},
+            "tp_by_mode": {"neutral": {"tvh1": 610.0, "tvh2": 620.0}},
+            "rr_by_mode": {"neutral": 1.2},
+            "exit_plan_by_mode": {"neutral": "plan"},
+        }
+
+        buf_out = io.StringIO()
+        with (
+            patch("sys.stdin", io.StringIO(json.dumps(d))),
+            patch("sys.argv", ["render_strict.py"]),
+            patch("render_strict.pathlib.Path.write_text", return_value=None),
+            contextlib.redirect_stdout(buf_out),
+        ):
+            render_strict.main()
+        rendered = buf_out.getvalue()
+
+        self.assertIn("EMA статус: M15: НИЖЕ EMA20 | H1: ВЫШЕ EMA20", rendered)
+        self.assertIn(
+            "Таймфреймы: M15: цена ниже EMA20; H1: цена выше EMA20; по EMA20 структура смешанная, единого подтверждения нет.",
+            rendered,
+        )
+        self.assertNotIn("цена выше EMA20/60, структура восходящая", rendered)
 
 
 if __name__ == "__main__":

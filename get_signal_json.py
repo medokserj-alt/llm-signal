@@ -41,8 +41,14 @@ from event_calendar import (
 )
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
+VALID_HOLDING_HORIZONS = {"intraday", "intraday_to_1_2d", "short_swing", "multi_day"}
 DEFAULT_OPENAI_MODEL = "gpt-5.2"
 FIXED_BOT_ASSET_UNIVERSE = frozenset({"BTC", "ETH", "BNB", "SOL", "XRP"})
+FLOW_STALENESS_LIMITS_MINUTES = {
+    "day": 60.0,
+    "mid": 180.0,
+    "signal": 60.0,
+}
 
 # ---- Variant B+2: neutral semantics guard ----
 # Neutral mode must not recommend entries "too close" to current price.
@@ -65,6 +71,10 @@ NEUTRAL_BUFFER_TICKS = 10
 # and no aggressive_option exists, split into (aggressive_option=original) + buffered neutral entry.
 NEUTRAL_NEAR_TICKS = 20
 
+# Published signal quality floor:
+# TP1 must provide at least 1% clean movement from the selected entry anchor.
+TP1_MIN_NET_MOVE_PCT = 0.01
+
 # ---- Flush gate (neutral must not knife-catch) ----
 # "Flush" is defined relative to ATR(14) on M15 candles.
 # X: two consecutive candles body >= X * ATR(14)
@@ -84,6 +94,114 @@ except Exception:  # pragma: no cover
 _DEBUG_TRACE_ENABLED = os.getenv("DEBUG_TRACE") == "1"
 _DEBUG_TRACE: dict | None = {} if _DEBUG_TRACE_ENABLED else None
 _DEBUG_TRACE_PATH = Path(__file__).resolve().parent / "logs" / "debug_trace.json"
+
+
+def _normalize_holding_horizon(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "intraday_to_12d": "intraday_to_1_2d",
+        "intraday_1_2d": "intraday_to_1_2d",
+        "intraday_to_1_2_days": "intraday_to_1_2d",
+        "intraday_to_2d": "intraday_to_1_2d",
+        "shortswing": "short_swing",
+        "swing_short": "short_swing",
+        "multi": "multi_day",
+        "multiday": "multi_day",
+    }
+    normalized = aliases.get(text, text)
+    return normalized if normalized in VALID_HOLDING_HORIZONS else None
+
+
+def _holding_horizon_label(value) -> str:
+    horizon = _normalize_holding_horizon(value) or ""
+    return {
+        "intraday": "intraday",
+        "intraday_to_1_2d": "intraday / 1–2 дня",
+        "short_swing": "1–3 дня / short swing",
+        "multi_day": "1–3 дня / multi-day",
+    }.get(horizon, "по структуре сетапа")
+
+
+def _derive_holding_horizon(d: dict) -> str:
+    explicit = _normalize_holding_horizon(d.get("holding_horizon"))
+    if explicit:
+        return explicit
+
+    mode = normalize_mode(d.get("mode"))
+    entry_mode = str(d.get("entry_mode") or "").strip().lower()
+    if mode == "aggressive":
+        if entry_mode in {"now"}:
+            return "intraday"
+        return "intraday_to_1_2d"
+    if mode == "conservative":
+        return "multi_day"
+    return "short_swing"
+
+
+def _apply_holding_horizon_contract(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+    horizon = _derive_holding_horizon(d)
+    d["holding_horizon"] = horizon
+    d["holding_horizon_label"] = _holding_horizon_label(horizon)
+
+
+def _rewrite_signal_horizon_wording(text, *, horizon_label: str, mode: str) -> str:
+    if not isinstance(text, str):
+        return text
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    if mode not in {"aggressive", "neutral"}:
+        return cleaned
+
+    low = cleaned.lower()
+    if "3–7" not in low and "3-7" not in low:
+        return cleaned
+
+    replacements = (
+        (
+            r"(?i)собрать\s+rr\s+для\s+горизонта\s+3[\-–]7\s+дн(?:ей|я)",
+            f"собрать RR для тактического сетапа {horizon_label}",
+        ),
+        (
+            r"(?i)для\s+горизонта\s+3[\-–]7\s+дн(?:ей|я)",
+            f"для тактического сетапа {horizon_label}",
+        ),
+        (
+            r"(?i)на\s+горизонте\s+3[\-–]7\s+дн(?:ей|я)",
+            f"в тактическом горизонте {horizon_label}",
+        ),
+        (
+            r"(?i)горизонт(?:ом)?\s+3[\-–]7\s+дн(?:ей|я)",
+            horizon_label,
+        ),
+    )
+
+    out = cleaned
+    for pattern, replacement in replacements:
+        out = re.sub(pattern, replacement, out)
+    return out
+
+
+def _sanitize_signal_horizon_wording(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+    _apply_holding_horizon_contract(d)
+    mode = normalize_mode(d.get("mode"))
+    horizon_label = str(d.get("holding_horizon_label") or "").strip() or _holding_horizon_label(d.get("holding_horizon"))
+    for field in ("why_asset", "technical_rationale"):
+        value = d.get(field)
+        if isinstance(value, dict):
+            summary = value.get("summary")
+            if isinstance(summary, str):
+                value["summary"] = _rewrite_signal_horizon_wording(summary, horizon_label=horizon_label, mode=mode)
+                d[field] = value
+        elif isinstance(value, str):
+            d[field] = _rewrite_signal_horizon_wording(value, horizon_label=horizon_label, mode=mode)
 
 
 def _debug_trace_reset() -> None:
@@ -793,6 +911,7 @@ def ensure_defaults(d: dict) -> dict:
     if em == "now":
         d.setdefault("warnings", []).append("market_entry_high_conf")
         d["entry_mode"] = "market"
+    _sanitize_signal_horizon_wording(d)
     return d
 
 
@@ -2361,6 +2480,54 @@ def _event_label(event: dict) -> str:
     return f"{name} ({_event_display_time(event)} МСК)"
 
 
+def _calendar_empty_message_for_event_risk(snapshot) -> str:
+    default = "Календарь пуст: подтвержденных scheduled events сейчас нет."
+    normalized = normalize_event_risk_snapshot(snapshot)
+    items = normalized.get("event_risk_context") if isinstance(normalized, dict) else []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if _normalize_optional_text(item.get("category")).lower() != "geopolitics":
+            continue
+        if _normalize_optional_text(item.get("phase")).lower() not in {"pre_event", "ongoing"}:
+            continue
+        blob = " ".join(
+            [
+                _normalize_optional_text(item.get("event")),
+                _normalize_optional_text(item.get("source_title")),
+                " ".join(str(x) for x in (item.get("confirmed_facts") or []) if isinstance(x, str)),
+                " ".join(str(x) for x in (item.get("anticipated_consequences") or []) if isinstance(x, str)),
+            ]
+        ).lower()
+        if any(
+            marker in blob
+            for marker in (
+                "white house",
+                "oval office",
+                "press conference",
+                "briefing",
+                "remarks",
+                "talks",
+                "meeting",
+                "ceasefire",
+                "truce",
+                "deadline",
+            )
+        ):
+            label = _normalize_optional_text(item.get("event")) or "geopolitical headline event"
+            return (
+                "Календарь scheduled events пуст, но active scheduled-adjacent geopolitical headline risk: "
+                f"{label}."
+            )
+    regime_layer = normalized.get("regime_layer") if isinstance(normalized.get("regime_layer"), dict) else {}
+    if (
+        _normalize_optional_text(regime_layer.get("driver")).lower() == "geopolitics"
+        and _normalize_optional_text(regime_layer.get("severity")).lower() in {"high", "severe"}
+    ):
+        return "Календарь scheduled events пуст, но active unscheduled geopolitical headline risk остаётся в силе."
+    return default
+
+
 def _downgrade_confidence(d: dict, steps: int = 1) -> None:
     order = ("Low", "Medium", "High")
     current = _normalize_optional_text(d.get("confidence"))
@@ -2489,6 +2656,35 @@ def _max_event_risk_level(*values) -> str:
     return best if best in {"none", "low", "medium", "high"} else "none"
 
 
+def _event_risk_regime_rank(value) -> int:
+    text = _normalize_optional_text(value).lower()
+    return {
+        "": 0,
+        "low": 1,
+        "medium": 2,
+        "high": 3,
+        "severe": 4,
+    }.get(text, 0)
+
+
+def _structured_event_regime_layer(snapshot: dict) -> dict:
+    if not isinstance(snapshot, dict):
+        return {}
+    layer = snapshot.get("regime_layer") if isinstance(snapshot.get("regime_layer"), dict) else {}
+    if not layer:
+        return {}
+    return {
+        "driver": _normalize_optional_text(layer.get("driver")).lower(),
+        "severity": _normalize_optional_text(layer.get("severity")).lower(),
+        "flags": list(layer.get("flags") or []) if isinstance(layer.get("flags"), list) else [],
+        "dominant_event": _normalize_optional_text(layer.get("dominant_event")),
+        "summary": _normalize_optional_text(layer.get("summary")),
+        "risk_asymmetry": _normalize_optional_text(layer.get("risk_asymmetry")).lower(),
+        "continuation_mode": _normalize_optional_text(layer.get("continuation_mode")).lower(),
+        "strictness": _normalize_optional_text(layer.get("strictness")).lower(),
+    }
+
+
 def _signal_event_driver_from_category(value) -> str:
     category = _normalize_optional_text(value).lower()
     if category == "geopolitics":
@@ -2569,31 +2765,50 @@ def _structured_event_volatility_risk(item: dict) -> str:
     return "low"
 
 
-def _build_structured_macro_risk_fragment(item: dict, *, driver: str, volatility_risk: str) -> str:
+def _build_structured_macro_risk_fragment(
+    item: dict,
+    *,
+    driver: str,
+    volatility_risk: str,
+    regime_layer: dict | None = None,
+    calendar_empty: bool = False,
+) -> str:
     if not isinstance(item, dict) or driver == "none":
         return ""
 
     phase = _normalize_optional_text(item.get("phase")).lower() or "none"
+    regime_layer = regime_layer if isinstance(regime_layer, dict) else {}
+    regime_driver = _normalize_optional_text(regime_layer.get("driver")).lower()
+    regime_severity = _normalize_optional_text(regime_layer.get("severity")).lower()
+    if regime_driver == "geopolitics" and regime_severity == "severe":
+        text = (
+            "тяжёлый геополитический режим остаётся нерешённым; фон чувствителен к эскалации и "
+            "сохраняет асимметричный риск резкого downside-движения."
+        )
+        if calendar_empty:
+            text += " Пустой scheduled calendar не снижает уязвимость к внеплановым заголовкам."
+        return text
+
     if driver == "geopolitics":
         if phase in {"pre_event", "ongoing"}:
-            return "geopolitical escalation path remains unresolved; markets remain headline-driven."
+            return "геополитическая траектория эскалации остаётся нерешённой; рынок по-прежнему живёт заголовками."
         if phase == "post_event" and volatility_risk == "high":
-            return "geopolitical shock aftermath remains unstable; follow-through remains headline-driven."
-        return "geopolitical risk remains a live execution factor."
+            return "последствия геополитического шока остаются нестабильными; follow-through всё ещё задаётся заголовками."
+        return "геополитический риск остаётся живым execution-фактором."
 
     if driver == "macro":
         if phase in {"pre_event", "ongoing"}:
-            return "macro catalyst path remains unresolved; first-move volatility can be misleading."
+            return "траектория макрокатализатора остаётся нерешённой; волатильность первого движения может вводить в заблуждение."
         if phase == "post_event" and volatility_risk in {"medium", "high"}:
-            return "macro repricing remains unstable after the event; follow-through needs confirmation."
-        return "macro catalyst risk still matters for execution."
+            return "после события макропереоценка остаётся нестабильной; follow-through требует подтверждения."
+        return "макрориск по-прежнему важен для исполнения."
 
     if driver == "crypto_structure":
         if phase in {"pre_event", "ongoing"}:
-            return "crypto structure stress remains unresolved; false breaks and liquidation-led moves are possible."
+            return "стресс в crypto-structure остаётся нерешённым; возможны ложные пробои и движения на ликвидациях."
         if phase == "post_event" and volatility_risk in {"medium", "high"}:
-            return "crypto structure stress remains elevated after the catalyst; follow-through is still unstable."
-        return "crypto structure stress remains a live execution risk."
+            return "после катализатора stress в crypto-structure остаётся повышенным; follow-through всё ещё нестабилен."
+        return "стресс в crypto-structure остаётся актуальным риском исполнения."
 
     return _merge_unique_texts(item.get("summary"), max_fragments=1)
 
@@ -2608,6 +2823,7 @@ def _derive_signal_event_risk_summary(
     snapshot = _merged_signal_event_risk_snapshot(d)
     items = snapshot.get("event_risk_context") or []
     dominant_item = items[0] if items else None
+    regime_layer = _structured_event_regime_layer(snapshot)
 
     driver = _signal_event_driver_from_category((dominant_item or {}).get("category"))
     impact = _normalize_event_impact((dominant_item or {}).get("impact")) or "none"
@@ -2618,6 +2834,9 @@ def _derive_signal_event_risk_summary(
         phase = "none"
 
     volatility_risk = _structured_event_volatility_risk(dominant_item)
+    regime_driver = _normalize_optional_text(regime_layer.get("driver")).lower()
+    regime_severity = _normalize_optional_text(regime_layer.get("severity")).lower()
+    severe_geopolitical_regime = regime_driver == "geopolitics" and regime_severity == "severe"
 
     active_high = False
     active_other = False
@@ -2647,6 +2866,7 @@ def _derive_signal_event_risk_summary(
     execution_caution = "low"
     unresolved_high_impact = bool(driver != "none" and impact == "high" and phase in {"pre_event", "ongoing"})
     post_event_unstable = bool(driver != "none" and phase == "post_event" and volatility_risk == "high")
+    calendar_empty = not bool(merged_events)
 
     if driver == "geopolitics" and impact == "high":
         execution_caution = "high"
@@ -2656,6 +2876,11 @@ def _derive_signal_event_risk_summary(
         execution_caution = "high"
     elif driver != "none" and (impact in {"high", "medium"} or volatility_risk == "medium"):
         execution_caution = "medium"
+
+    if severe_geopolitical_regime:
+        volatility_risk = _max_event_risk_level(volatility_risk, "high")
+        execution_caution = _max_event_risk_level(execution_caution, "high")
+        unresolved_high_impact = True
 
     if active_high:
         volatility_risk = _max_event_risk_level(volatility_risk, "high")
@@ -2668,21 +2893,36 @@ def _derive_signal_event_risk_summary(
         dominant_item,
         driver=driver,
         volatility_risk=volatility_risk,
+        regime_layer=regime_layer,
+        calendar_empty=calendar_empty,
     )
 
     execution_line = ""
-    if post_event_unstable:
-        execution_line = "post-event volatility remains unstable; avoid chasing false breaks."
+    if severe_geopolitical_regime:
+        execution_line = (
+            "тяжёлый геополитический режим: continuation допустим только тактически; нужен ретест/подтверждение, "
+            "invalidation должен быть явным, без небрежного buy-the-dip."
+        )
+    elif post_event_unstable:
+        execution_line = "послесобытийная волатильность остаётся нестабильной; не преследуй ложные пробои."
     elif driver == "geopolitics" and impact == "high":
-        execution_line = "headline-driven volatility is elevated; prefer confirmation and avoid chasing first move."
+        execution_line = "волатильность на заголовках повышена; нужен confirm, без погони за первым движением."
     elif unresolved_high_impact:
-        execution_line = "unresolved catalyst risk is high; prefer confirmation over the first impulse."
+        execution_line = "риск по нерешённому катализатору высок; подтверждение важнее первого импульса."
     elif execution_caution == "medium" and driver != "none":
-        execution_line = "headline sensitivity is elevated; confirmation is preferred."
+        execution_line = "чувствительность к заголовкам повышена; предпочтителен confirm."
 
     warning_tokens: list[str] = []
     if driver == "geopolitics" and impact == "high":
         warning_tokens.append("event_risk_geopolitical_execution_caution")
+    if severe_geopolitical_regime:
+        warning_tokens.extend(
+            [
+                "event_risk_geopolitical_regime_severe",
+                "event_risk_downside_shock_asymmetry",
+                "event_risk_tactical_only_continuation",
+            ]
+        )
     if unresolved_high_impact:
         warning_tokens.append("event_risk_unresolved_high_impact_catalyst")
     if post_event_unstable:
@@ -2704,8 +2944,19 @@ def _derive_signal_event_risk_summary(
         "macro_fragment": macro_fragment,
         "execution_line": execution_line,
         "warning_tokens": warning_tokens,
-        "prefer_wait_confirm": bool(unresolved_high_impact or (driver == "geopolitics" and impact == "high")),
-        "confidence_steps": 1 if driver != "none" and (impact in {"high", "medium"} or execution_caution in {"medium", "high"}) else 0,
+        "prefer_wait_confirm": bool(
+            unresolved_high_impact
+            or (driver == "geopolitics" and impact == "high")
+            or severe_geopolitical_regime
+        ),
+        "confidence_steps": (
+            2
+            if severe_geopolitical_regime
+            else 1
+            if (driver != "none" and (impact in {"high", "medium"} or execution_caution in {"medium", "high"}))
+            else 0
+        ),
+        "regime_layer": copy.deepcopy(regime_layer) if regime_layer else {},
         "snapshot": snapshot,
         "has_structured_risk": bool(driver != "none"),
     }
@@ -2758,6 +3009,11 @@ def apply_upcoming_event_risk(d: dict) -> None:
     d["upcoming_events"] = merged_events
     d["macro_risk_summary"] = merged_summary
     d["event_risk_summary"] = copy.deepcopy(event_risk_summary)
+    regime_layer = structured_state.get("regime_layer") if isinstance(structured_state.get("regime_layer"), dict) else {}
+    if regime_layer:
+        d["event_risk_regime"] = copy.deepcopy(regime_layer)
+    else:
+        d.pop("event_risk_regime", None)
     if isinstance(ctx, dict):
         ctx["upcoming_events"] = copy.deepcopy(merged_events)
         ctx["macro_risk_summary"] = merged_summary
@@ -2877,11 +3133,11 @@ def apply_upcoming_event_risk(d: dict) -> None:
         if tbd_events:
             primary_tbd = tbd_events[0]
             event_risk["display_lines"].append(
-                f"⚠️ Macro risk: {primary_tbd['event']} ({primary_tbd['time_msk']} МСК) — точное время не задано, жёсткой блокировки нет; confidence снижена."
+                f"⚠️ Макро/геориск: {primary_tbd['event']} ({primary_tbd['time_msk']} МСК) — точное время не задано, жёсткой блокировки нет; уверенность снижена."
             )
         elif merged_summary:
             event_risk["display_lines"].append(
-                "⚠️ Macro risk: ближайшее окно риска без точного времени; жёсткой блокировки нет, но confidence снижена."
+                "⚠️ Макро/геориск: ближайшее окно риска без точного времени; жёсткой блокировки нет, но уверенность снижена."
             )
         if event_risk["mode_action"] == "none":
             event_risk["mode_action"] = "confidence_down"
@@ -2911,10 +3167,10 @@ def apply_upcoming_event_risk(d: dict) -> None:
         structured_lines: list[str] = []
         macro_fragment = _normalize_optional_text(structured_state.get("macro_fragment"))
         if macro_fragment:
-            structured_lines.append(f"⚠️ Macro risk: {macro_fragment}")
+            structured_lines.append(f"⚠️ Макро/геориск: {macro_fragment}")
         execution_line = _normalize_optional_text(structured_state.get("execution_line"))
         if execution_line:
-            structured_lines.append(f"⚠️ Execution risk: {execution_line}")
+            structured_lines.append(f"⚠️ Риск исполнения: {execution_line}")
         if structured_lines:
             event_risk["display_lines"] = [*structured_lines, *(event_risk.get("display_lines") or [])]
 
@@ -2926,8 +3182,8 @@ def apply_upcoming_event_risk(d: dict) -> None:
     )
     if bool(d.get("no_trade")) and has_event_risk_factor:
         secondary_line = (
-            "⚠️ Event risk: elevated catalyst risk is a secondary factor only; "
-            "the primary no-trade reason remains structural."
+            "⚠️ Событийный риск: повышенный риск по катализаторам здесь вторичен; "
+            "основная причина отказа от сделки остаётся структурной."
         )
         existing_lines_low = " ".join(str(x or "").strip().lower() for x in (event_risk.get("display_lines") or []))
         if secondary_line.lower() not in existing_lines_low:
@@ -2938,7 +3194,7 @@ def apply_upcoming_event_risk(d: dict) -> None:
         summary_line = calendar_summary or merged_summary
         existing_lines = " ".join(event_risk.get("display_lines") or [])
         if summary_line and summary_line not in existing_lines and len(event_risk["display_lines"]) < 3:
-            event_risk["display_lines"].append(f"🗓 Macro risk summary: {summary_line}")
+            event_risk["display_lines"].append(f"🗓 Сводка макрорисков: {summary_line}")
 
     if not event_risk.get("active_events"):
         event_risk.pop("active_events", None)
@@ -3015,6 +3271,84 @@ def get_pool_snapshot() -> dict:
     out = {}
     for sym in pool:
         out[sym] = get_pair_ticker(sym)
+    return out
+
+
+def _derive_prompt_structure_levels(ohlcv_tail, *, lookback: int = 20) -> dict:
+    if not isinstance(ohlcv_tail, list):
+        return {}
+
+    highs: list[float] = []
+    lows: list[float] = []
+    for row in ohlcv_tail[-lookback:]:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        hi = _to_float(row[2])
+        lo = _to_float(row[3])
+        if hi is not None:
+            highs.append(float(hi))
+        if lo is not None:
+            lows.append(float(lo))
+
+    out: dict[str, float] = {}
+    if highs:
+        out["recent_high"] = round(max(highs), 6)
+    if lows:
+        out["recent_low"] = round(min(lows), 6)
+    return out
+
+
+def build_symbol_prompt_technical_context(symbol: str, price: float | None = None) -> dict:
+    sym = (symbol or "").strip()
+    if not sym:
+        return {}
+
+    out: dict = {
+        "symbol": sym,
+        "price": _round_price(price, symbol=sym) if _to_float(price) is not None else None,
+        "timeframes": {},
+    }
+
+    warmup_len = max(500, _OHLCV_TAIL_LEN)
+    for timeframe in ("15m", "1h", "4h"):
+        snap = _fetch_closes_from_market(
+            "bybit_swap",
+            timeframe,
+            symbol=sym,
+            limit=warmup_len,
+            min_len=20,
+        )
+        closes = snap.get("closes") if isinstance(snap, dict) else None
+        if not isinstance(closes, list) or len(closes) < 60:
+            continue
+
+        ema20 = _ema_sma_seed(closes, 20)
+        ema60 = _ema_sma_seed(closes, 60)
+        ohlcv_tail = snap.get("ohlcv_tail")
+        frame_block: dict = {
+            "ema20": round(float(ema20), 6) if ema20 is not None else None,
+            "ema60": round(float(ema60), 6) if ema60 is not None else None,
+            "last_candle": snap.get("last_candle"),
+            "structure_levels": _derive_prompt_structure_levels(ohlcv_tail),
+        }
+
+        px = _to_float(out.get("price"))
+        if px is not None:
+            frame_block["price_vs_ema20"] = _ema_relation_flag(px, frame_block.get("ema20"))
+            frame_block["price_vs_ema60"] = _ema_relation_flag(px, frame_block.get("ema60"))
+
+        out["timeframes"][timeframe] = frame_block
+
+    return out
+
+
+def build_pool_prompt_technical_context(pool_snapshot: dict) -> dict:
+    out: dict = {}
+    for symbol, quote in (pool_snapshot or {}).items():
+        price = quote.get("last") if isinstance(quote, dict) else None
+        ctx = build_symbol_prompt_technical_context(symbol, price=price)
+        if ctx.get("timeframes"):
+            out[symbol] = ctx
     return out
 
 
@@ -4051,6 +4385,32 @@ def enforce_ema_narrative_consistency(d: dict) -> None:
     vs_h1 = (d.get("price_vs_ema20_h1") or "equal").strip().lower()
     guard = (d.get("ema_guard_state") or "between").strip().lower()
 
+    def _ema_mtf_summary(m15_flag: str, h1_flag: str) -> str:
+        def _label(flag: str) -> str:
+            return {
+                "above": "выше EMA20",
+                "below": "ниже EMA20",
+                "equal": "у EMA20",
+            }.get(flag, "относительно EMA20 не определена")
+
+        if m15_flag == h1_flag == "above":
+            return "M15 и H1: цена выше EMA20, структура по EMA20 поддерживает рост."
+        if m15_flag == h1_flag == "below":
+            return "M15 и H1: цена ниже EMA20, структура по EMA20 остаётся слабой."
+        return (
+            f"M15: цена {_label(m15_flag)}; "
+            f"H1: цена {_label(h1_flag)}; "
+            "по EMA20 структура смешанная, единого подтверждения нет."
+        )
+
+    def _should_replace_mtf_with_ema_summary(text: str) -> bool:
+        low = str(text or "").lower()
+        if not low.strip():
+            return False
+        if "ema20" in low or "ema60" in low:
+            return True
+        return ("m15" in low and "h1" in low) or ("15m" in low and "1h" in low)
+
     def _fix_line(text: str, desired: str) -> str:
         s = str(text or "")
         low = s.lower()
@@ -4073,11 +4433,18 @@ def enforce_ema_narrative_consistency(d: dict) -> None:
     # multi_tf_view: m15/h1 lines must be consistent if present.
     mtf = d.get("multi_tf_view")
     if isinstance(mtf, dict):
-        if "m15" in mtf and isinstance(mtf.get("m15"), str):
-            mtf["m15"] = _fix_line(mtf.get("m15", ""), vs_m15)
-        if "h1" in mtf and isinstance(mtf.get("h1"), str):
-            mtf["h1"] = _fix_line(mtf.get("h1", ""), vs_h1)
-        d["multi_tf_view"] = mtf
+        joined = " ".join(str(mtf.get(tf, "")) for tf in ("m15", "h1"))
+        if _should_replace_mtf_with_ema_summary(joined):
+            d["multi_tf_view"] = _ema_mtf_summary(vs_m15, vs_h1)
+            mtf = None
+        else:
+            if "m15" in mtf and isinstance(mtf.get("m15"), str):
+                mtf["m15"] = _fix_line(mtf.get("m15", ""), vs_m15)
+            if "h1" in mtf and isinstance(mtf.get("h1"), str):
+                mtf["h1"] = _fix_line(mtf.get("h1", ""), vs_h1)
+            d["multi_tf_view"] = mtf
+    elif isinstance(mtf, str) and _should_replace_mtf_with_ema_summary(mtf):
+        d["multi_tf_view"] = _ema_mtf_summary(vs_m15, vs_h1)
 
     # why_asset: avoid generic "above/below EMA20" claims that contradict guard state.
     why = d.get("why_asset")
@@ -4091,6 +4458,48 @@ def enforce_ema_narrative_consistency(d: dict) -> None:
             else:
                 # between: keep neutral wording
                 d["why_asset"] = re.sub(r"(?i)\b(выше|над|ниже|под)\b", "у", why)
+
+    why = d.get("why_asset")
+    if isinstance(why, str) and why.strip():
+        low = why.lower()
+        comparative = any(token in low for token in ("предпочтительнее", "лучше", "чище", "сильнее"))
+        versus = any(token in low for token in (" чем ", " нежели ", " vs ", " против "))
+        if comparative and versus and "ema60" in low:
+            cleaned = why
+            cleaned = re.sub(
+                r"(?i)хай[-\s]*бета\s*/\s*актив(?:ы|ов)?\s+с\s+h1\s+(?:выше|над)\s+ema\s*60",
+                "хай-беты и активы со смешанной H1-структурой или ниже EMA60",
+                cleaned,
+            )
+            cleaned = re.sub(
+                r"(?i)актив(?:ы|ов)?\s+с\s+h1\s+(?:выше|над)\s+ema\s*60",
+                "активы со смешанной H1-структурой или ниже EMA60",
+                cleaned,
+            )
+            cleaned = re.sub(
+                r"(?i)h1\s+(?:выше|над)\s+ema\s*60",
+                "H1 со смешанной структурой или H1 ниже EMA60",
+                cleaned,
+            )
+            d["why_asset"] = cleaned
+
+
+def _compose_overview_sections(
+    overview_lines: list[str],
+    *,
+    analysis_profile: str,
+    flow_derivatives_section: str = "",
+) -> list[str]:
+    clean_lines = [str(line).strip() for line in overview_lines if str(line).strip()]
+    flow_section = str(flow_derivatives_section or "").strip()
+    if analysis_profile != "mid" or not flow_section or not clean_lines:
+        return ["\n\n".join(clean_lines)] if clean_lines else ([flow_section] if flow_section else [])
+    first = clean_lines[0]
+    rest = clean_lines[1:]
+    sections = [first, flow_section]
+    if rest:
+        sections.append("\n\n".join(rest))
+    return sections
 
 
 def apply_direction_guard(d: dict) -> None:
@@ -4852,6 +5261,426 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
     return d
 
 
+def _entry_anchor_for_tp1_guard(d: dict, mode: str) -> tuple[float | None, str]:
+    symbol = d.get("symbol")
+
+    entry = _to_float(d.get(f"entry_price_{mode}"))
+    if entry is not None:
+        return float(entry), f"entry_price_{mode}"
+
+    entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+    bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
+
+    entry = _to_float(bucket.get("entry_price"))
+    if entry is not None:
+        return float(entry), f"entries.{mode}.entry_price"
+
+    mid = _mid_from_range(bucket.get("range"), symbol=symbol)
+    if mid is not None:
+        return float(mid), f"entries.{mode}.range_mid"
+
+    entry = _to_float(d.get("entry_price"))
+    if entry is not None:
+        return float(entry), "entry_price"
+
+    mid = _mid_from_range(d.get("entry_range"), symbol=symbol)
+    if mid is not None:
+        return float(mid), "entry_range_mid"
+
+    price = _to_float(d.get("price"))
+    if price is not None:
+        return float(price), "price_fallback"
+
+    return None, ""
+
+
+def _tp1_net_move_pct(entry: float, tp1: float, *, is_long: bool) -> float | None:
+    if entry <= 0:
+        return None
+    move = (tp1 - entry) / entry if is_long else (entry - tp1) / entry
+    return float(move)
+
+
+def _contract_target_price(entry: float, move_pct: float, *, is_long: bool, symbol=None) -> float:
+    raw = entry * (1.0 + move_pct if is_long else 1.0 - move_pct)
+    rounded = _round_price(raw, symbol=symbol)
+    return float(rounded if rounded is not None else raw)
+
+
+def _ensure_monotonic_targets(
+    entry: float,
+    a: float,
+    b: float | None,
+    c: float | None,
+    *,
+    is_long: bool,
+) -> tuple[float, float | None, float | None]:
+    min_step = max(abs(entry) * 0.001, abs(entry) * 0.0001)
+    if is_long:
+        if not (a > entry):
+            a = entry + min_step
+        if b is not None and not (b > a):
+            b = a + min_step
+        if c is not None:
+            prev = b if b is not None else a
+            if not (c > prev):
+                c = prev + min_step
+    else:
+        if not (a < entry):
+            a = entry - min_step
+        if b is not None and not (b < a):
+            b = a - min_step
+        if c is not None:
+            prev = b if b is not None else a
+            if not (c < prev):
+                c = prev - min_step
+    return a, b, c
+
+
+def _normalize_official_target(
+    entry: float,
+    candidate,
+    *,
+    move_pct: float,
+    is_long: bool,
+    symbol=None,
+) -> float:
+    contract = _contract_target_price(entry, move_pct, is_long=is_long, symbol=symbol)
+    value = _to_float(candidate)
+    if value is None:
+        return contract
+    if is_long and value <= entry:
+        return contract
+    if (not is_long) and value >= entry:
+        return contract
+    move = _tp1_net_move_pct(entry, value, is_long=is_long)
+    if move is None or move < move_pct:
+        return contract
+    return max(float(value), contract) if is_long else min(float(value), contract)
+
+
+def _rr_target_from_mode_bucket(mode: str, bucket: dict) -> float | None:
+    if not isinstance(bucket, dict):
+        return None
+    if mode == "aggressive":
+        return (
+            _to_float(bucket.get("tvh3"))
+            or _to_float(bucket.get("tp3"))
+            or _to_float(bucket.get("tvh2"))
+            or _to_float(bucket.get("tp2"))
+            or _to_float(bucket.get("tvh1"))
+            or _to_float(bucket.get("tp1"))
+        )
+    if mode == "neutral":
+        return (
+            _to_float(bucket.get("tvh2"))
+            or _to_float(bucket.get("tp2"))
+            or _to_float(bucket.get("tvh1"))
+            or _to_float(bucket.get("tp1"))
+        )
+    return (
+        _to_float(bucket.get("tvh2_or_trail"))
+        or _to_float(bucket.get("tp2"))
+        or _to_float(bucket.get("tvh1"))
+        or _to_float(bucket.get("tp1"))
+    )
+
+
+def restore_mode_target_ladder(d: dict) -> dict:
+    """
+    Restore the official mode target ladder before the final TP1 sanity check.
+    Nearby technical levels may remain useful as reaction context, but not as undersized official TP1.
+    """
+    if not isinstance(d, dict) or bool(d.get("no_trade")):
+        return d
+
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in {"long", "short"}:
+        return d
+    is_long = side == "long"
+    symbol = d.get("symbol")
+
+    tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+    if not isinstance(tp_by_mode, dict):
+        return d
+    sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+    rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else {}
+
+    changed_modes: list[str] = []
+
+    for mode in ("aggressive", "neutral", "conservative"):
+        entry, _ = _entry_anchor_for_tp1_guard(d, mode)
+        if entry is None:
+            continue
+
+        bucket_in = tp_by_mode.get(mode)
+        bucket = copy.deepcopy(bucket_in) if isinstance(bucket_in, dict) else {}
+        original_bucket = copy.deepcopy(bucket)
+
+        tp1_raw = bucket.get("tvh1", bucket.get("tp1"))
+        tp1_val = _normalize_official_target(
+            float(entry),
+            tp1_raw,
+            move_pct=TP1_MIN_NET_MOVE_PCT,
+            is_long=is_long,
+            symbol=symbol,
+        )
+
+        if mode == "aggressive":
+            tp2_raw = bucket.get("tvh2", bucket.get("tp2"))
+            tp2_val = _normalize_official_target(
+                float(entry),
+                tp2_raw,
+                move_pct=0.02,
+                is_long=is_long,
+                symbol=symbol,
+            )
+            tp3_raw = bucket.get("tvh3", bucket.get("tp3"))
+            tp3_val = _to_float(tp3_raw)
+            if tp3_val is not None:
+                tp3_val = _normalize_official_target(
+                    float(entry),
+                    tp3_val,
+                    move_pct=0.03,
+                    is_long=is_long,
+                    symbol=symbol,
+                )
+            tp1_val, tp2_val, tp3_val = _ensure_monotonic_targets(
+                float(entry),
+                float(tp1_val),
+                float(tp2_val),
+                float(tp3_val) if tp3_val is not None else None,
+                is_long=is_long,
+            )
+            bucket["tvh1"] = float(tp1_val)
+            bucket["tvh2"] = float(tp2_val)
+            bucket["tvh3"] = float(tp3_val) if tp3_val is not None else None
+            if "tp1" in bucket:
+                bucket["tp1"] = float(tp1_val)
+            if "tp2" in bucket:
+                bucket["tp2"] = float(tp2_val)
+            if "tp3" in bucket:
+                bucket["tp3"] = float(tp3_val) if tp3_val is not None else None
+        elif mode == "neutral":
+            tp2_raw = bucket.get("tvh2", bucket.get("tp2"))
+            tp2_val = _normalize_official_target(
+                float(entry),
+                tp2_raw,
+                move_pct=0.02,
+                is_long=is_long,
+                symbol=symbol,
+            )
+            tp1_val, tp2_val, _ = _ensure_monotonic_targets(
+                float(entry),
+                float(tp1_val),
+                float(tp2_val),
+                None,
+                is_long=is_long,
+            )
+            bucket["tvh1"] = float(tp1_val)
+            bucket["tvh2"] = float(tp2_val)
+            if "tp1" in bucket:
+                bucket["tp1"] = float(tp1_val)
+            if "tp2" in bucket:
+                bucket["tp2"] = float(tp2_val)
+        else:
+            bucket["tvh1"] = float(tp1_val)
+            if "tp1" in bucket:
+                bucket["tp1"] = float(tp1_val)
+            tp2_or_trail = bucket.get("tvh2_or_trail")
+            if isinstance(tp2_or_trail, str) and tp2_or_trail.strip().lower() == "trail":
+                bucket["tvh2_or_trail"] = "trail"
+            else:
+                tp2_raw = tp2_or_trail if tp2_or_trail is not None else bucket.get("tp2")
+                tp2_val = _normalize_official_target(
+                    float(entry),
+                    tp2_raw,
+                    move_pct=0.02,
+                    is_long=is_long,
+                    symbol=symbol,
+                )
+                tp1_val, tp2_val, _ = _ensure_monotonic_targets(
+                    float(entry),
+                    float(tp1_val),
+                    float(tp2_val),
+                    None,
+                    is_long=is_long,
+                )
+                bucket["tvh1"] = float(tp1_val)
+                bucket["tvh2_or_trail"] = float(tp2_val)
+                if "tp2" in bucket:
+                    bucket["tp2"] = float(tp2_val)
+
+        if bucket != original_bucket:
+            changed_modes.append(mode)
+        tp_by_mode[mode] = bucket
+
+        sl_val = _to_float(sl_by_mode.get(mode))
+        rr_target = _rr_target_from_mode_bucket(mode, bucket)
+        if sl_val is not None and rr_target is not None:
+            risk = abs(float(entry) - float(sl_val))
+            if risk > 0:
+                rr_by_mode[mode] = float(round(abs(float(rr_target) - float(entry)) / risk, 3))
+
+    if changed_modes:
+        d.setdefault("warnings", [])
+        for mode in changed_modes:
+            _append_unique_str(d, "warnings", f"mode_target_ladder_restored:{mode}")
+    d["tp_by_mode"] = tp_by_mode
+    if rr_by_mode:
+        d["rr_by_mode"] = rr_by_mode
+    return d
+
+
+def _sync_top_level_trade_levels_for_mode(d: dict) -> None:
+    try:
+        symbol = d.get("symbol")
+        final_mode = normalize_mode(d.get("mode"))
+        entry_val = _to_float(d.get(f"entry_price_{final_mode}"))
+        if entry_val is None:
+            entry_val, _ = _entry_anchor_for_tp1_guard(d, final_mode)
+        if entry_val is not None and entry_val:
+            rounded = _round_price(entry_val, symbol=symbol)
+            entry_out = float(rounded if rounded is not None else entry_val)
+            d["entry_price"] = entry_out
+            d["entry"] = entry_out
+
+        entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
+        mode_bucket = entries.get(final_mode) if isinstance(entries.get(final_mode), dict) else {}
+        mode_range = mode_bucket.get("range") if isinstance(mode_bucket.get("range"), dict) else None
+        if isinstance(mode_range, dict) and ("min" in mode_range or "max" in mode_range):
+            d["entry_range"] = mode_range
+
+        rr_by_mode = d.get("rr_by_mode") if isinstance(d.get("rr_by_mode"), dict) else {}
+        rr_val = _to_float(rr_by_mode.get(final_mode))
+        if rr_val is not None and rr_val > 0:
+            d["rr"] = float(rr_val)
+
+        sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
+        sl_val = _to_float(sl_by_mode.get(final_mode))
+        if sl_val is not None and sl_val:
+            rounded = _round_price(sl_val, symbol=symbol)
+            d["sl"] = float(rounded if rounded is not None else sl_val)
+
+        tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+        tp_bucket = tp_by_mode.get(final_mode) if isinstance(tp_by_mode.get(final_mode), dict) else {}
+
+        tp1_val = _to_float(tp_bucket.get("tvh1"))
+        if tp1_val is None:
+            tp1_val = _to_float(tp_bucket.get("tp1"))
+        if tp1_val is not None and tp1_val:
+            rounded = _round_price(tp1_val, symbol=symbol)
+            d["tp1"] = float(rounded if rounded is not None else tp1_val)
+
+        tp2_val = _to_float(tp_bucket.get("tvh2"))
+        if tp2_val is None:
+            tp2_val = _to_float(tp_bucket.get("tp2"))
+        if tp2_val is None:
+            tp2_val = _to_float(tp_bucket.get("tvh2_or_trail"))
+        if tp2_val is not None and tp2_val:
+            rounded = _round_price(tp2_val, symbol=symbol)
+            d["tp2"] = float(rounded if rounded is not None else tp2_val)
+
+        tp3_val = _to_float(tp_bucket.get("tvh3"))
+        if tp3_val is None:
+            tp3_val = _to_float(tp_bucket.get("tp3"))
+        if tp3_val is not None and tp3_val:
+            rounded = _round_price(tp3_val, symbol=symbol)
+            d["tp3"] = float(rounded if rounded is not None else tp3_val)
+        tp_out = {"tp1": d.get("tp1"), "tp2": d.get("tp2")}
+        if d.get("tp3") is not None:
+            tp_out["tp3"] = d.get("tp3")
+        d["tp"] = tp_out
+    except Exception:
+        pass
+
+
+def apply_tp1_min_move_guard(d: dict) -> dict:
+    """
+    Final publish guard: TP1 must provide at least 1% clean movement from entry.
+    Uses the explicit entry anchor when present; falls back to the active range midpoint.
+    Does not invent new targets: only promotes an existing next target when available.
+    """
+    if not isinstance(d, dict) or bool(d.get("no_trade")):
+        return d
+
+    restore_mode_target_ladder(d)
+
+    mode = normalize_mode(d.get("mode"))
+    side = (d.get("side") or d.get("direction") or "").strip().lower()
+    if mode not in VALID_MODES or side not in {"long", "short"}:
+        return d
+
+    tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
+    tp_bucket = tp_by_mode.get(mode) if isinstance(tp_by_mode.get(mode), dict) else None
+    if not isinstance(tp_bucket, dict):
+        return d
+
+    entry, entry_source = _entry_anchor_for_tp1_guard(d, mode)
+    if entry is None:
+        return d
+
+    tp1 = _to_float(tp_bucket.get("tvh1"))
+    if tp1 is None:
+        tp1 = _to_float(tp_bucket.get("tp1"))
+    if tp1 is None:
+        return d
+
+    is_long = side == "long"
+    move_pct = _tp1_net_move_pct(float(entry), float(tp1), is_long=is_long)
+    if move_pct is None or move_pct >= TP1_MIN_NET_MOVE_PCT:
+        _sync_top_level_trade_levels_for_mode(d)
+        return d
+
+    next_key = "tvh2_or_trail" if mode == "conservative" else "tvh2"
+    next_tp = _to_float(tp_bucket.get(next_key))
+    if next_tp is None and next_key != "tp2":
+        next_tp = _to_float(tp_bucket.get("tp2"))
+    next_move_pct = _tp1_net_move_pct(float(entry), float(next_tp), is_long=is_long) if next_tp is not None else None
+
+    if next_tp is not None and next_move_pct is not None and next_move_pct >= TP1_MIN_NET_MOVE_PCT:
+        symbol = d.get("symbol")
+        rounded = _round_price(next_tp, symbol=symbol)
+        promoted = float(rounded if rounded is not None else next_tp)
+        tp_bucket["tvh1"] = promoted
+        if "tp1" in tp_bucket:
+            tp_bucket["tp1"] = promoted
+        if mode == "aggressive":
+            far_tp = _to_float(tp_bucket.get("tvh3"))
+            if far_tp is None:
+                far_tp = _to_float(tp_bucket.get("tp3"))
+            if far_tp is not None:
+                far_rounded = _round_price(far_tp, symbol=symbol)
+                shifted = float(far_rounded if far_rounded is not None else far_tp)
+                tp_bucket["tvh2"] = shifted
+                if "tp2" in tp_bucket:
+                    tp_bucket["tp2"] = shifted
+        elif mode == "conservative" and next_key == "tvh2_or_trail":
+            tp_bucket["tvh2_or_trail"] = tp_bucket.get("tvh2_or_trail", "trail")
+
+        tp_by_mode[mode] = tp_bucket
+        d["tp_by_mode"] = tp_by_mode
+        d.setdefault("warnings", [])
+        _append_unique_str(d, "warnings", f"tp1_min_move_guard_adjusted:{mode}:{entry_source}")
+        _sync_top_level_trade_levels_for_mode(d)
+        return d
+
+    reason_code = "tp1_below_min_move"
+    hint = "TP1 меньше минимального движения 1% от entry; ближайший валидный уровень не найден без выдумывания."
+
+    d["no_trade"] = True
+    reasons = d.get("no_trade_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    reasons = [r for r in reasons if str(r or "").strip() and str(r).strip() != "waiting_confirmation"]
+    reasons = [reason_code] + [r for r in reasons if r != reason_code]
+    d["no_trade_reasons"] = reasons
+    d["no_trade_hint"] = hint
+    d.setdefault("warnings", [])
+    _append_unique_str(d, "warnings", f"tp1_min_move_guard_failed:{mode}:{entry_source}")
+    return d
+
+
 def validate_active_mode_setup(d: dict) -> dict:
     """
     Mode-specific validation (render contract):
@@ -4859,6 +5688,8 @@ def validate_active_mode_setup(d: dict) -> dict:
     - НЕ меняет торговую логику и НЕ пересчитывает уровни;
     - при невалидности помечает no_trade с понятным комментарием.
     """
+    _sanitize_signal_horizon_wording(d)
+
     # Runtime safety: LLM (or other callers) can emit `warnings` with an invalid type (e.g. str/null).
     # Many downstream gates rely on `warnings` being a list for append semantics.
     w0 = d.get("warnings")
@@ -4908,6 +5739,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                 "Разворот после импульса (phase flip) без закрепления выше EMA20(M15): "
                 "neutral запрещён; допустимо только в aggressive (лучше wait_confirm)."
             )
+            _sanitize_signal_horizon_wording(d)
             return d
 
         # ---- Neutral (STRICT): hard block EMA-direction conflicts ----
@@ -4931,12 +5763,14 @@ def validate_active_mode_setup(d: dict) -> dict:
                 )
             except Exception:
                 pass
+            _sanitize_signal_horizon_wording(d)
             return d
 
     if bool(d.get("no_trade")):
         # Even when blocked upstream, conservative keeps a fixed horizon contract.
         if normalize_mode(d.get("mode")) == "conservative":
             d["intended_horizon_hours"] = {"min": 24, "max": 72}
+        _sanitize_signal_horizon_wording(d)
         return d
 
     mode = normalize_mode(d.get("mode"))
@@ -5000,6 +5834,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                 if tags:
                     hint = f"{hint} disabled_by={tags}"
             d["no_trade_hint"] = hint
+            _sanitize_signal_horizon_wording(d)
             return d
 
     # Finalize mode + keep top-level entry_range consistent with it.
@@ -5022,6 +5857,33 @@ def validate_active_mode_setup(d: dict) -> dict:
     if final_range is not None:
         d["entry_range"] = final_range
 
+    # ---- DAY/MID dual-neutral long penalty (soft) ----
+    # When both higher-timeframe biases are neutral, avoid default long drift unless
+    # local structure is explicitly bullish enough. Keep the setup alive, but require confirmation.
+    if final_mode in {"aggressive", "neutral"} and not bool(d.get("no_trade")):
+        ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+        day_bias = str(ctx.get("day_bias") or "").strip().lower()
+        mid_bias = str(ctx.get("mid_bias") or "").strip().lower()
+        side = (d.get("side") or d.get("direction") or "").strip().lower()
+        if side == "long" and day_bias == "neutral" and mid_bias == "neutral":
+            warnings = d.setdefault("warnings", [])
+            vs_m15 = str(d.get("price_vs_ema20_m15") or "").strip().lower()
+            vs_h1 = str(d.get("price_vs_ema20_h1") or "").strip().lower()
+            fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+            fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+
+            strong_bull_structure = bool(
+                (vs_m15 == "above" and fan_m15 == "bull")
+                or (vs_h1 == "above" and fan_h1 == "bull")
+                or (vs_m15 == "above" and vs_h1 == "above" and fan_h1 != "bear")
+            )
+            ema_conflict = isinstance(warnings, list) and "dir_guard_forced_short_by_ema" in warnings
+            if ema_conflict or not strong_bull_structure:
+                if isinstance(warnings, list) and "dual_neutral_long_requires_confirmation" not in warnings:
+                    warnings.append("dual_neutral_long_requires_confirmation")
+                if (d.get("entry_mode") or "").strip().lower() != "wait_confirm":
+                    d["entry_mode"] = "wait_confirm"
+
     # ---- Aggressive extreme blockers + disciplined countertrend handling ----
     if final_mode == "aggressive" and not bool(d.get("no_trade")):
         if bool(d.get("risk_off")):
@@ -5031,6 +5893,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                 reasons.append("risk_off")
             if not (d.get("no_trade_hint") or "").strip():
                 d["no_trade_hint"] = "risk_off"
+            _sanitize_signal_horizon_wording(d)
             return d
 
         side = (d.get("side") or d.get("direction") or "").strip().lower()
@@ -5068,6 +5931,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                 reasons.append("flush_knife_aggressive_extreme")
             if not (d.get("no_trade_hint") or "").strip():
                 d["no_trade_hint"] = "flush_knife_aggressive_extreme"
+            _sanitize_signal_horizon_wording(d)
             return d
 
         strong_h1_up = (vs_h1 == "above") and (fan_h1 == "bull")
@@ -5201,6 +6065,7 @@ def validate_active_mode_setup(d: dict) -> dict:
             if not (d.get("no_trade_hint") or "").strip():
                 d["no_trade_hint"] = "counter_trend_neutral_forbidden"
             _ensure_aggressive_option_from_existing_idea("Контртрендовая идея — допустима только в aggressive.")
+            _sanitize_signal_horizon_wording(d)
             return d
 
     # ---- Neutral (STRICT): require stabilization (avoid reversals / knife catches) ----
@@ -5257,6 +6122,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                             "entry_price": float(entry),
                             "note": "Контртрендовая идея — допустима только в aggressive.",
                         }
+                _sanitize_signal_horizon_wording(d)
                 return d
 
     # ---- Neutral flush-reversal gate (knife-catch forbidden) ----
@@ -5288,6 +6154,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                 existing.setdefault("entry_price", entry_idea)
                 existing["note"] = "Разворот после импульсного пролива — допустимо только в aggressive."
                 d["aggressive_option"] = existing
+            _sanitize_signal_horizon_wording(d)
             return d
 
     # ---- Variant B+2: neutral entry must not be too close to current price ----
@@ -5813,6 +6680,7 @@ def validate_active_mode_setup(d: dict) -> dict:
                 reasons.append(reason)
             if not (d.get("no_trade_hint") or "").strip():
                 d["no_trade_hint"] = reason if reason else hint
+            _sanitize_signal_horizon_wording(d)
             return d
 
         ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
@@ -6224,39 +7092,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     apply_ema_exhale_filter(d)
 
     validate_or_fallback_tvh_by_mode(d)
+    restore_mode_target_ladder(d)
+    apply_tp1_min_move_guard(d)
     _debug_trace_set_entry_range("entry_range_post_tvh", d)
-    try:
-        symbol = d.get("symbol")
-        final_mode = normalize_mode(d.get("mode"))
-
-        sl_by_mode = d.get("sl_by_mode") if isinstance(d.get("sl_by_mode"), dict) else {}
-        sl_val = _to_float(sl_by_mode.get(final_mode))
-        if sl_val is not None and sl_val:
-            rounded = _round_price(sl_val, symbol=symbol)
-            d["sl"] = float(rounded if rounded is not None else sl_val)
-
-        tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
-        tp_bucket = tp_by_mode.get(final_mode) if isinstance(tp_by_mode.get(final_mode), dict) else {}
-
-        tp1_val = _to_float(tp_bucket.get("tvh1"))
-        if tp1_val is not None and tp1_val:
-            rounded = _round_price(tp1_val, symbol=symbol)
-            d["tp1"] = float(rounded if rounded is not None else tp1_val)
-
-        tp2_val = _to_float(tp_bucket.get("tvh2"))
-        if tp2_val is None:
-            tvh2_or_trail = tp_bucket.get("tvh2_or_trail")
-            tp2_val = _to_float(tvh2_or_trail)
-        if tp2_val is not None and tp2_val:
-            rounded = _round_price(tp2_val, symbol=symbol)
-            d["tp2"] = float(rounded if rounded is not None else tp2_val)
-
-        tp3_val = _to_float(tp_bucket.get("tvh3"))
-        if tp3_val is not None and tp3_val:
-            rounded = _round_price(tp3_val, symbol=symbol)
-            d["tp3"] = float(rounded if rounded is not None else tp3_val)
-    except Exception:
-        pass
+    _sync_top_level_trade_levels_for_mode(d)
 
     # Phase-flip modifier (micro-phase change): can pause neutral or force aggressive wait_confirm.
     try:
@@ -6286,6 +7125,7 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         apply_signal_asset_flow_overlay(d)
     except Exception:
         pass
+    _sanitize_signal_horizon_wording(d)
     return normalize_no_trade(d)
 
 
@@ -6526,6 +7366,8 @@ def _sanitize_flow_market_context(value) -> dict:
     if not isinstance(value, dict):
         return {}
     drivers = value.get("drivers") if isinstance(value.get("drivers"), list) else []
+    modifiers = value.get("flow_derivatives_modifiers") if isinstance(value.get("flow_derivatives_modifiers"), dict) else {}
+    reason_codes = modifiers.get("reason_codes") if isinstance(modifiers.get("reason_codes"), list) else []
     return {
         "bias": value.get("bias") if value.get("bias") in {"bullish", "bearish", "neutral", "mixed"} else "neutral",
         "confidence": max(0.0, min(float(value.get("confidence")), 1.0))
@@ -6535,17 +7377,103 @@ def _sanitize_flow_market_context(value) -> dict:
         if value.get("crowding_state") in {"long_crowded", "short_crowded", "neutral", "mixed"}
         else "neutral",
         "exchange_pressure": value.get("exchange_pressure")
-        if value.get("exchange_pressure") in {"high", "medium", "low"}
-        else "low",
+        if value.get("exchange_pressure") in {"high", "medium", "low", "unavailable"}
+        else "unavailable",
         "stablecoin_support": value.get("stablecoin_support")
-        if value.get("stablecoin_support") in {"high", "medium", "low"}
-        else "low",
+        if value.get("stablecoin_support") in {"high", "medium", "low", "unavailable"}
+        else "unavailable",
         "unlock_pressure": value.get("unlock_pressure")
-        if value.get("unlock_pressure") in {"high", "medium", "low"}
-        else "low",
+        if value.get("unlock_pressure") in {"high", "medium", "low", "unavailable"}
+        else "unavailable",
         "drivers": [str(item).strip() for item in drivers if isinstance(item, str) and str(item).strip()],
         "summary": str(value.get("summary") or "").strip(),
+        "flow_derivatives_modifiers": {
+            "directional_bias": modifiers.get("directional_bias")
+            if modifiers.get("directional_bias") in {"bullish", "bearish", "neutral"}
+            else "neutral",
+            "positioning_risk": modifiers.get("positioning_risk")
+            if modifiers.get("positioning_risk") in {"low", "medium", "high"}
+            else "low",
+            "squeeze_risk": modifiers.get("squeeze_risk")
+            if modifiers.get("squeeze_risk") in {"low", "medium", "high"}
+            else "low",
+            "chase_risk": modifiers.get("chase_risk")
+            if modifiers.get("chase_risk") in {"low", "medium", "high"}
+            else "low",
+            "confirmation_required": bool(modifiers.get("confirmation_required")),
+            "reason_codes": [str(item).strip() for item in reason_codes if str(item).strip()],
+        },
     }
+
+
+def _parse_flow_timestamp(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+    return parsed.astimezone(ZoneInfo("UTC"))
+
+
+def _flow_freshness_minutes(raw: dict) -> float | None:
+    if not isinstance(raw, dict):
+        return None
+    generated = _parse_flow_timestamp(raw.get("generated_at")) or _parse_flow_timestamp(raw.get("timestamp_utc"))
+    if generated is None:
+        return None
+    delta = datetime.now(ZoneInfo("UTC")) - generated
+    return round(max(delta.total_seconds(), 0.0) / 60.0, 1)
+
+
+def _flow_staleness_limit_minutes(profile: str) -> float:
+    profile_key = str(profile or "day").strip().lower()
+    return float(FLOW_STALENESS_LIMITS_MINUTES.get(profile_key, FLOW_STALENESS_LIMITS_MINUTES["day"]))
+
+
+def _build_stale_flow_snapshot(raw: dict, *, market_context: dict | None = None, profile: str = "day") -> dict:
+    snapshot = _sanitize_flow_snapshot_metadata(raw)
+    context = market_context if isinstance(market_context, dict) else {}
+    snapshot["status"] = "stale"
+    snapshot["ignored_for_decision"] = True
+    snapshot["staleness_limit_minutes"] = _flow_staleness_limit_minutes(profile)
+    snapshot["previous_bias"] = str(context.get("bias") or "neutral").strip() or "neutral"
+    return snapshot
+
+
+def _is_flow_snapshot_stale(raw: dict, *, profile: str) -> bool:
+    freshness = _flow_freshness_minutes(raw)
+    if freshness is None and isinstance(raw.get("freshness_minutes"), (int, float)):
+        freshness = float(raw.get("freshness_minutes"))
+    if freshness is None:
+        return False
+    return freshness > _flow_staleness_limit_minutes(profile)
+
+
+def _sanitize_flow_snapshot_metadata(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in ("timestamp_utc", "generated_at"):
+        text = str(raw.get(key) or "").strip()
+        if text:
+            out[key] = text
+    if raw.get("data_source") in {"live", "fallback", "mixed"}:
+        out["data_source"] = raw.get("data_source")
+    freshness = _flow_freshness_minutes(raw)
+    if freshness is None and isinstance(raw.get("freshness_minutes"), (int, float)):
+        freshness = float(raw.get("freshness_minutes"))
+    if freshness is not None:
+        out["freshness_minutes"] = freshness
+    if isinstance(raw.get("input_coverage"), dict):
+        out["input_coverage"] = copy.deepcopy(raw.get("input_coverage"))
+    if isinstance(raw.get("coverage"), dict):
+        out["coverage"] = copy.deepcopy(raw.get("coverage"))
+    if isinstance(raw.get("diagnostics"), dict):
+        out["diagnostics"] = copy.deepcopy(raw.get("diagnostics"))
+    return out
 
 
 def _normalize_external_context_asset(value) -> str | None:
@@ -6585,7 +7513,7 @@ def _sanitize_flow_asset_context(value, *, asset_hint: str | None = None) -> dic
     }
 
 
-def read_aia_flow_derivatives_context(flow_path: Path | None = None) -> dict:
+def read_aia_flow_derivatives_context(flow_path: Path | None = None, *, profile: str = "day") -> dict:
     try:
         path = flow_path or Path(
             os.getenv("AIA_FLOW_DERIVATIVES_CONTEXT_PATH") or "/root/llm-signal-ai-agent/logs/flow_derivatives_context_v2.json"
@@ -6599,9 +7527,13 @@ def read_aia_flow_derivatives_context(flow_path: Path | None = None) -> dict:
     market_context = _sanitize_flow_market_context(raw.get("market_context"))
     if not market_context:
         return {}
+    if _is_flow_snapshot_stale(raw, profile=profile):
+        return _build_stale_flow_snapshot(raw, market_context=market_context, profile=profile)
 
     return {
+        "status": "live",
         "market_context": market_context,
+        **_sanitize_flow_snapshot_metadata(raw),
     }
 
 
@@ -6619,19 +7551,24 @@ def _has_valid_flow_market_context_payload(value) -> bool:
         return True
     if value.get("crowding_state") in {"long_crowded", "short_crowded", "neutral", "mixed"}:
         return True
-    if value.get("exchange_pressure") in {"high", "medium", "low"}:
+    if value.get("exchange_pressure") in {"high", "medium", "low", "unavailable"}:
         return True
-    if value.get("stablecoin_support") in {"high", "medium", "low"}:
+    if value.get("stablecoin_support") in {"high", "medium", "low", "unavailable"}:
         return True
-    if value.get("unlock_pressure") in {"high", "medium", "low"}:
+    if value.get("unlock_pressure") in {"high", "medium", "low", "unavailable"}:
+        return True
+    modifiers = value.get("flow_derivatives_modifiers")
+    if isinstance(modifiers, dict) and isinstance(modifiers.get("reason_codes"), list) and modifiers.get("reason_codes"):
         return True
     return False
 
 
 def read_mid_aia_flow_derivatives_context(flow_path: Path | None = None) -> dict:
-    snapshot = read_aia_flow_derivatives_context(flow_path)
+    snapshot = read_aia_flow_derivatives_context(flow_path, profile="mid")
     if not snapshot:
         return {}
+    if snapshot.get("status") == "stale":
+        return snapshot
     raw_market_context = {}
     try:
         path = flow_path or Path(
@@ -6660,6 +7597,8 @@ def read_signal_asset_flow_context(symbol: str | None, flow_path: Path | None = 
             return {}
     except Exception:
         return {}
+    if _is_flow_snapshot_stale(raw, profile="signal"):
+        return {}
 
     asset_contexts = raw.get("asset_contexts")
     if not isinstance(asset_contexts, dict) or not asset_contexts:
@@ -6682,9 +7621,31 @@ def read_signal_asset_flow_context(symbol: str | None, flow_path: Path | None = 
 def build_flow_derivatives_prompt_block(snapshot: dict | None, *, analysis_profile: str = "day") -> str:
     if not isinstance(snapshot, dict) or not snapshot:
         return ""
+    if snapshot.get("status") == "stale":
+        previous_bias = str(snapshot.get("previous_bias") or "neutral").strip() or "neutral"
+        payload = {
+            "status": "stale",
+            "ignored_for_current_decision": True,
+            "generated_at": snapshot.get("generated_at") or snapshot.get("timestamp_utc"),
+            "freshness_minutes": snapshot.get("freshness_minutes"),
+            "staleness_limit_minutes": snapshot.get("staleness_limit_minutes"),
+            "previous_bias": previous_bias,
+            "data_source": snapshot.get("data_source"),
+        }
+        return (
+            "\n=== FLOW / DERIVATIVES CONTEXT (EXTERNAL, ADVISORY ONLY) ===\n"
+            "Snapshot is stale and must be ignored for the current decision. Do NOT treat the previous flow bias "
+            "as active support or resistance for DAY/MID framing.\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
+            + "\n"
+        )
     market_context = snapshot.get("market_context") if isinstance(snapshot.get("market_context"), dict) else {}
     if not market_context:
         return ""
+    payload = {"market_context": market_context}
+    for key in ("timestamp_utc", "generated_at", "data_source", "freshness_minutes", "input_coverage", "coverage", "diagnostics"):
+        if key in snapshot:
+            payload[key] = snapshot[key]
     if analysis_profile == "mid":
         return (
             "\n=== FLOW / DERIVATIVES CONTEXT (EXTERNAL, ADVISORY ONLY) ===\n"
@@ -6693,10 +7654,13 @@ def build_flow_derivatives_prompt_block(snapshot: dict | None, *, analysis_profi
             "и как дополнительную regime nuance.\n"
             "Он НЕ заменяет собственную оценку MID по price action, market structure, macro/news context и НЕ "
             "должен сам по себе переворачивать weekly bias или direction.\n"
+            "Если coverage показывает только derivatives, а exchange/stablecoin/tokenomics unavailable, это нужно "
+            "назвать прямо: derivatives-only signal, NOT full liquidity-flow confirmation.\n"
             "Если flow bias совпадает с текущим MID view — упомяни подтверждение. Если расходится — опиши это как "
             "underlying support/fragility, less clean downside или squeeze risk, но оставь MID reading первичной. "
-            "Если flow mixed/neutral — подчеркни нестабильность и two-sided regime.\n"
-            + json.dumps({"market_context": market_context}, ensure_ascii=False, indent=2)
+            "Если flow mixed/neutral — подчеркни нестабильность и two-sided regime. "
+            "При high/severe geopolitical regime flow остаётся вторичным и не должен смягчать downside-shock framing.\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
             + "\n"
         )
     return (
@@ -6706,10 +7670,13 @@ def build_flow_derivatives_prompt_block(snapshot: dict | None, *, analysis_profi
         "regime nuance.\n"
         "Он НЕ заменяет собственную оценку DAY по price action, market structure, macro/news context и НЕ "
         "должен сам по себе переворачивать direction.\n"
+        "Если coverage показывает только derivatives, а exchange/stablecoin/tokenomics unavailable, это нужно "
+        "назвать прямо: derivatives-only signal, NOT full liquidity-flow confirmation.\n"
         "Если flow bias совпадает с текущим DAY view — упомяни подтверждение. Если расходится — опиши это как "
         "underlying support/fragility, но оставь DAY reading первичной. Если flow mixed/neutral — подчеркни "
-        "нестабильность и two-sided risk.\n"
-        + json.dumps({"market_context": market_context}, ensure_ascii=False, indent=2)
+        "нестабильность и two-sided risk. При high/severe geopolitical regime flow остаётся вторичным и не "
+        "должен оправдывать relaxed buy-the-dip framing.\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
         + "\n"
     )
 
@@ -6718,27 +7685,191 @@ def render_flow_derivatives_context_section(
     snapshot: dict | None,
     *,
     signal_payload: dict | None = None,
-    title: str = "Flow / Derivatives Context",
+    title: str = "Flow / Derivatives",
+    detail_level: str = "normal",
 ) -> str:
     if not isinstance(snapshot, dict) or not snapshot:
         return ""
     context = snapshot.get("market_context") if isinstance(snapshot.get("market_context"), dict) else {}
-    if not context:
+    if snapshot.get("status") != "stale" and not context:
         return ""
-    lines = [title]
-    if isinstance(context.get("confidence"), (int, float)):
-        lines.append(
-            f"- Market bias: {context.get('bias') or 'neutral'} (confidence {float(context.get('confidence')):.2f})"
+    detail = str(detail_level or "normal").strip().lower()
+    if detail not in {"compact", "day_compact", "normal", "debug"}:
+        detail = "normal"
+
+    def _fmt_confidence(value: object) -> str:
+        if isinstance(value, (int, float)):
+            return f"{float(value):.2f}"
+        return "0.00"
+
+    def _fmt_ratio(live: object, total: object) -> str:
+        if isinstance(live, int) and isinstance(total, int):
+            return f"{live}/{total}"
+        if isinstance(live, (int, float)) and isinstance(total, (int, float)):
+            return f"{int(live)}/{int(total)}"
+        return "?/?"
+
+    def _fmt_source_summary() -> str:
+        parts: list[str] = []
+        data_source = str(snapshot.get("data_source") or "").strip()
+        if data_source:
+            parts.append(f"source={data_source}")
+        if isinstance(snapshot.get("freshness_minutes"), (int, float)):
+            parts.append(f"freshness={float(snapshot.get('freshness_minutes')):.1f}m")
+        return ", ".join(parts)
+
+    grouped_coverage = snapshot.get("coverage") if isinstance(snapshot.get("coverage"), dict) else {}
+
+    def _get_group_source(group_name: str) -> str:
+        group = grouped_coverage.get(group_name) if isinstance(grouped_coverage.get(group_name), dict) else {}
+        return str(group.get("source") or "").strip().lower() if group else ""
+
+    def _compact_coverage_line() -> str:
+        derivatives = grouped_coverage.get("derivatives") if isinstance(grouped_coverage.get("derivatives"), dict) else {}
+        derivatives_source = str(derivatives.get("source") or "unavailable").strip()
+        assets_live = derivatives.get("assets_live")
+        assets_total = derivatives.get("assets_total")
+        extra_labels = []
+        for group_name, label in (
+            ("exchange_flows", "exchange"),
+            ("stablecoin_flows", "stablecoin"),
+            ("tokenomics", "tokenomics"),
+        ):
+            source = _get_group_source(group_name)
+            if source in {"", "unavailable"}:
+                extra_labels.append(f"{label} unavailable")
+            elif source == "stale":
+                extra_labels.append(f"{label} stale")
+        line = f"- Покрытие: derivatives {derivatives_source} {_fmt_ratio(assets_live, assets_total)}"
+        if extra_labels:
+            line += "; " + ", ".join(extra_labels)
+        return line
+
+    def _compact_modifiers_line() -> str:
+        modifiers = context.get("flow_derivatives_modifiers") if isinstance(context.get("flow_derivatives_modifiers"), dict) else {}
+        return (
+            "- Вывод: "
+            f"positioning={modifiers.get('directional_bias') or 'neutral'}, "
+            f"squeeze_risk={modifiers.get('squeeze_risk') or 'low'}, "
+            f"chase_risk={modifiers.get('chase_risk') or 'low'}, "
+            f"confirmation_required={'yes' if modifiers.get('confirmation_required') else 'no'}"
         )
-    else:
-        lines.append(f"- Market bias: {context.get('bias') or 'neutral'} (confidence 0.00)")
+
+    def _day_compact_modifiers_line() -> str:
+        modifiers = context.get("flow_derivatives_modifiers") if isinstance(context.get("flow_derivatives_modifiers"), dict) else {}
+        return (
+            "- Вывод: "
+            f"positioning={modifiers.get('directional_bias') or 'neutral'}, "
+            f"chase_risk={modifiers.get('chase_risk') or 'low'}, "
+            f"confirmation_required={'yes' if modifiers.get('confirmation_required') else 'no'}"
+        )
+
+    def _derivatives_only_note() -> str:
+        if _get_group_source("derivatives") in {"", "unavailable"}:
+            return ""
+        unavailable = all(
+            _get_group_source(group_name) in {"", "unavailable"}
+            for group_name in ("exchange_flows", "stablecoin_flows", "tokenomics")
+        )
+        if not unavailable:
+            return ""
+        return (
+            "Доступен только derivatives-сигнал; exchange/stablecoin/tokenomics недоступны, "
+            "поэтому это не полное подтверждение liquidity-flow."
+        )
+
+    if snapshot.get("status") == "stale":
+        previous_bias = str(snapshot.get("previous_bias") or "neutral").strip() or "neutral"
+        generated_at = str(snapshot.get("generated_at") or snapshot.get("timestamp_utc") or "").strip()
+        freshness = snapshot.get("freshness_minutes")
+        freshness_text = f", freshness={float(freshness):.1f}m" if isinstance(freshness, (int, float)) else ""
+        lines = [title]
+        lines.append("- Статус: stale, не используется в текущем решении")
+        if generated_at:
+            lines.append(f"- Последнее обновление: {generated_at}{freshness_text}")
+        lines.append(f"- Последний bias: {previous_bias}; snapshot не учитывается, потому что он устарел.")
+        return "\n".join(lines)
+
+    signal_line = f"- Сигнал: {context.get('bias') or 'neutral'}, confidence {_fmt_confidence(context.get('confidence'))}"
+    source_summary = _fmt_source_summary()
+    if source_summary:
+        signal_line += f", {source_summary}"
+
+    if detail == "day_compact":
+        return "\n".join([title, signal_line, _compact_coverage_line(), _day_compact_modifiers_line()])
+
+    if detail == "compact":
+        lines = [title]
+        lines.append(signal_line)
+        lines.append(_compact_coverage_line())
+        lines.append(_compact_modifiers_line())
+        note = _derivatives_only_note()
+        if note:
+            lines.append(f"- Примечание: {note}")
+        return "\n".join(lines)
+
+    lines = [title]
+    lines.append(f"- Рыночный bias: {context.get('bias') or 'neutral'} (confidence {_fmt_confidence(context.get('confidence'))})")
+    source_parts = []
+    data_source = str(snapshot.get("data_source") or "").strip()
+    if data_source:
+        source_parts.append(f"data_source: {data_source}")
+    generated_at = str(snapshot.get("generated_at") or snapshot.get("timestamp_utc") or "").strip()
+    if generated_at:
+        source_parts.append(f"generated_at: {generated_at}")
+    if isinstance(snapshot.get("freshness_minutes"), (int, float)):
+        source_parts.append(f"freshness: {float(snapshot.get('freshness_minutes')):.1f}m")
+    if source_parts:
+        lines.append("- Источник: " + " | ".join(source_parts))
+    coverage = snapshot.get("input_coverage") if isinstance(snapshot.get("input_coverage"), dict) else {}
+    if coverage:
+        total = coverage.get("assets_total")
+        live = coverage.get("assets_with_live_data")
+        fallback = coverage.get("assets_with_fallback_data")
+        lines.append(f"- Покрытие входов: total={total} live={live} fallback={fallback}")
+    derivatives = grouped_coverage.get("derivatives") if isinstance(grouped_coverage.get("derivatives"), dict) else {}
+    if derivatives:
+        derivatives_source = str(derivatives.get("source") or "unavailable")
+        assets_live = derivatives.get("assets_live")
+        assets_total = derivatives.get("assets_total")
+        lines.append(f"- Деривативы: {derivatives_source}, {_fmt_ratio(assets_live, assets_total)} активов")
+    exchange_flows = grouped_coverage.get("exchange_flows") if isinstance(grouped_coverage.get("exchange_flows"), dict) else {}
+    stablecoin_flows = grouped_coverage.get("stablecoin_flows") if isinstance(grouped_coverage.get("stablecoin_flows"), dict) else {}
+    tokenomics = grouped_coverage.get("tokenomics") if isinstance(grouped_coverage.get("tokenomics"), dict) else {}
+    if exchange_flows:
+        lines.append(f"- Биржевые потоки: {exchange_flows.get('source') or 'unavailable'}")
+    if stablecoin_flows:
+        lines.append(f"- Стейблкоин-потоки: {stablecoin_flows.get('source') or 'unavailable'}")
+    if tokenomics:
+        lines.append(f"- Токеномика: {tokenomics.get('source') or 'unavailable'}")
+    note = _derivatives_only_note()
+    if note:
+        lines.append("- Примечание: " + note)
+    diagnostics = snapshot.get("diagnostics") if isinstance(snapshot.get("diagnostics"), dict) else {}
+    reason = str(diagnostics.get("reason") or "").strip()
+    if reason:
+        lines.append("- Диагностика: " + reason)
     lines.append(f"- Crowding: {context.get('crowding_state') or 'neutral'}")
-    lines.append(f"- Exchange pressure: {context.get('exchange_pressure') or 'low'}")
-    lines.append(f"- Stablecoin support: {context.get('stablecoin_support') or 'low'}")
-    lines.append(f"- Unlock pressure: {context.get('unlock_pressure') or 'low'}")
+    lines.append(f"- Давление на биржи: {context.get('exchange_pressure') or 'unavailable'}")
+    lines.append(f"- Поддержка стейблкоинов: {context.get('stablecoin_support') or 'unavailable'}")
+    lines.append(f"- Давление unlock: {context.get('unlock_pressure') or 'unavailable'}")
+    modifiers = context.get("flow_derivatives_modifiers") if isinstance(context.get("flow_derivatives_modifiers"), dict) else {}
+    if modifiers:
+        lines.append(
+            f"- Позиционирование: {modifiers.get('directional_bias') or 'neutral'}"
+            f" | squeeze_risk: {modifiers.get('squeeze_risk') or 'low'}"
+            f" | chase_risk: {modifiers.get('chase_risk') or 'low'}"
+        )
+        lines.append(
+            f"- Требуется подтверждение: {'yes' if modifiers.get('confirmation_required') else 'no'}"
+            f" | positioning_risk: {modifiers.get('positioning_risk') or 'low'}"
+        )
+        reason_codes = modifiers.get("reason_codes") if isinstance(modifiers.get("reason_codes"), list) else []
+        if reason_codes:
+            lines.append("- Коды причин: " + ", ".join(str(item) for item in reason_codes[:8] if str(item).strip()))
     summary = str(context.get("summary") or "").strip()
     if summary:
-        lines.append("- Summary: " + summary)
+        lines.append("- Вывод: " + summary)
     return "\n".join(lines)
 
 
@@ -6839,6 +7970,11 @@ def _derive_signal_asset_flow_overlay_summary(d: dict, snapshot: dict) -> dict:
         asset_bias=asset_bias,
         crowding_state=crowding_state,
     )
+    event_risk_regime = d.get("event_risk_regime") if isinstance(d.get("event_risk_regime"), dict) else {}
+    severe_geopolitical_regime = (
+        _normalize_optional_text(event_risk_regime.get("driver")).lower() == "geopolitics"
+        and _normalize_optional_text(event_risk_regime.get("severity")).lower() == "severe"
+    )
     continuation_setup = _signal_has_clean_continuation_structure(d)
     adverse_crowding = (side == "long" and crowding_state == "long_crowded") or (
         side == "short" and crowding_state == "short_crowded"
@@ -6925,6 +8061,17 @@ def _derive_signal_asset_flow_overlay_summary(d: dict, snapshot: dict) -> dict:
         warnings.append("flow_continuation_stricter")
     if execution_caution == "medium" and flow_support == "mixed" and flow_confidence >= 0.65:
         confidence_down_steps = max(confidence_down_steps, 1)
+    if severe_geopolitical_regime:
+        if confidence_up_steps > 0:
+            confidence_up_steps = 0
+        if flow_support == "supportive":
+            warnings.append("flow_secondary_to_geopolitical_regime")
+            display_lines = [
+                "ℹ️ Supportive flow remains secondary while severe geopolitical risk keeps continuation tactical-only.",
+                *display_lines,
+            ]
+        prefer_wait_confirm = True
+        continuation_stricter = True
 
     summary = {
         "asset_bias": asset_bias,
@@ -6933,6 +8080,8 @@ def _derive_signal_asset_flow_overlay_summary(d: dict, snapshot: dict) -> dict:
         "flow_support_for_direction": flow_support,
         "execution_caution": execution_caution if execution_caution in {"high", "medium", "low"} else "low",
     }
+    if severe_geopolitical_regime:
+        summary["secondary_to_geopolitical_regime"] = True
     return {
         "summary": summary,
         "warnings": warnings,
@@ -6995,6 +8144,7 @@ client = OpenAI(api_key=api_key)
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL))
 ap.add_argument("--params", default="params.json")
+ap.add_argument("--analysis-prompt", default="prompt_analysis.txt")
 ap.add_argument("--symbol", default=None, help="Например: ETH/USDT (single-режим)")
 ap.add_argument(
     "--multi", action="store_true", help="Мульти-анализ по пулу (анализ + JSON в конце)"
@@ -7003,7 +8153,7 @@ args = ap.parse_args()
 
 # ================= MULTI MODE =================
 if args.multi:
-    system_prompt = read_file("prompt_analysis.txt")
+    system_prompt = read_file(args.analysis_prompt)
     time_str = current_msk()
     analysis_profile = resolve_event_calendar_profile(system_prompt=system_prompt)
 
@@ -7113,11 +8263,13 @@ if args.multi:
     )
 
     pool_symbols = sorted(pool_snapshot.keys())
+    pool_technical_context = build_pool_prompt_technical_context(pool_snapshot)
     pool_payload = {
         "time_msk_hint": time_msk,
         "snapshot_text": snapshot,
         "pool_symbols": pool_symbols,
         "pool_quotes": pool_snapshot,
+        "pool_technical_context": pool_technical_context,
         "btc_eth_change": {
             "btc_change_pct": btc_info.get("change"),
             "eth_change_pct": eth_info.get("change"),
@@ -7133,15 +8285,41 @@ if args.multi:
     if requested_mode is not None:
         pool_payload["requested_mode"] = requested_mode
 
+    if analysis_profile == "mid":
+        overview_contract = (
+            "overview: 5–6 коротких strategic paragraphs, каждый отдельной строкой массива, в таком порядке: "
+            "1) `📰 MID • <time>` + `1️⃣ Среднесрочный режим 3–7 дней`; "
+            "2) `2️⃣ Главные драйверы`; "
+            "3) `3️⃣ Flow / Derivatives` (compact, explicitly state when it is derivatives-only and not full flow confirmation); "
+            "4) `4️⃣ Карта активов`; "
+            "5) `5️⃣ Сценарии 3–7 дней`; "
+            "6) `6️⃣ Практический вывод`.\n"
+            "MID = strategic 3–7 day view, не intraday execution brief. Не дублируй одни и те же risk phrases в каждом абзаце: "
+            "`no chase`, `confirmation required`, `headline risk` и macro windows упоминай один раз в regime/practical section, "
+            "а не повторяй у каждого актива.\n"
+        )
+    else:
+        overview_contract = (
+            "overview: 5 коротких tactical paragraphs, каждый отдельной строкой массива, в таком порядке: "
+            "1) `🗓 DAY • <time>` + `1️⃣ Режим дня`; "
+            "2) `2️⃣ Кандидаты на сегодня`; "
+            "3) `3️⃣ Execution plan`; "
+            "4) `4️⃣ Что НЕ делать сегодня`; "
+            "5) `5️⃣ События / риски сегодня`.\n"
+            "DAY = tactical current-day view, не full 3–7 day strategic essay. PREV_MID используй как background, "
+            "но не повторяй весь недельный план. Повторяющиеся risk phrases держи в regime/execution summary, "
+            "а не размазывай по каждому кандидату.\n"
+        )
+
     schema_hint = (
         risk_mode_hint
         + "\n=== JSON OUTPUT FORMAT (STRICT) ===\n"
-        "Верни ОДИН JSON c двумя ключами: overview (list of paragraphs) и signal (объект).\n"
-        "overview: 4–6 абзацев обзора по пулу, каждый абзац отдельной строкой массива.\n"
-        "signal: объект с полями time_msk, symbol, price, direction, entry_range, sl, tp1, tp2, rr, "
+        + "Верни ОДИН JSON c двумя ключами: overview (list of paragraphs) и signal (объект).\n"
+        + overview_contract
+        + "signal: объект с полями time_msk, symbol, price, direction, entry_range, sl, tp1, tp2, rr, "
         "take_profit_rules, break_even_rule, multi_tf_view, why_asset, news_context, upcoming_events, "
         "macro_risk_summary, event_risk_context, event_risk_context_timestamp_utc, market_context, "
-        "validity_minutes, cancel_condition, technical_rationale, disclaimer, entry_mode, confidence, "
+        "validity_minutes, cancel_condition, technical_rationale, disclaimer, entry_mode, confidence, holding_horizon, "
         "confirmation_rules, alt_entry_range, entries, no_trade, no_trade_reasons, no_trade_hint, "
         "max_valid_minutes, ema20_m15, ema20_h1, ema_guard, day_mid_context, adx_guard, "
         "tp_by_mode, rr_by_mode, exit_plan_by_mode.\n"
@@ -7154,6 +8332,15 @@ if args.multi:
         "сохраняя префикс времени вида \"[YYYY-MM-DD HH:MM МСК]\" и тег [impact:…]. Нельзя удалять/менять "
         "timestamp/impact или переписывать заголовок. Допускается добавить пояснение только в конце через "
         "\" — ...\" после исходной строки.\n"
+        "Для entry_range / SL / TP / R:R используй только уровни, которые уже есть в snapshot_text, pool_quotes "
+        "или pool_technical_context. Если используешь EMA/structure anchors, бери их из pool_technical_context, "
+        "а не требуй их повторно у пользователя.\n"
+        "holding_horizon: один из `intraday`, `intraday_to_1_2d`, `short_swing`, `multi_day`.\n"
+        "Для aggressive / wait_confirm не пиши в why_asset или technical_rationale фразы про горизонт `3–7 дней`; "
+        "используй wording уровня `тактический сетап intraday / 1–2 дня` или `short swing`.\n"
+        "В why_asset не используй отрицательные сравнения против активов с H1 выше EMA60: "
+        "это признак силы, а не слабости. Для негативного сравнения используй формулировки типа "
+        "\"смешанная H1-структура\", \"ниже EMA60\" или \"хуже формализуется риск\".\n"
         f"symbol выбирай ТОЛЬКО из списка: {', '.join(pool_symbols)}.\n"
         f"time_msk установи ровно в это значение: {time_msk}.\n"
         "market_context ссылайся на проценты из блока [BTC_ETH_24H] как есть.\n"
@@ -7181,6 +8368,10 @@ if args.multi:
         "  - tvh1: ближе\n"
         "  - tvh2_or_trail: всегда строка \"trail\" (дальше только трейлинг)\n"
         "Все tvh* должны быть ЧИСЛАМИ (не формулы вида \"entry+2%\"), строго в сторону direction.\n"
+        "Сначала восстанови официальный mode target ladder: TP1 около 1% чистого движения от entry, "
+        "TP2 около 2%, TP3 optional/extended. Ближайший micro-level/recent high-low можно упомянуть как "
+        "reaction level, но не делай его официальным TP1, если он слишком близко. "
+        "Только если после восстановления mode ladder невозможно собрать валидный контракт — верни no_trade=true.\n"
         "\nТРЕБОВАНИЕ (VARIANT A) для exit_plan_by_mode:\n"
         "- сделай реально разным для режимов; кратко (1–2 короткие строки на режим, можно одной строкой)\n"
         "- обязательно словами (БЕЗ чисел EMA и БЕЗ процентов) упомяни логику:\n"
@@ -7246,7 +8437,8 @@ if args.multi:
     user_prompt += (
         "\n=== EVENT-RISK CONTEXT (LOCAL, SEPARATE FROM SCHEDULED CALENDAR) ===\n"
         "Это локальный structured layer по unscheduled / developing catalysts из headline inputs. "
-        "Scheduled calendar_events НЕ смешивай с этим блоком.\n"
+        "Scheduled calendar_events НЕ смешивай с этим блоком. Если regime_layer по geopolitics = high/severe, "
+        "считай его сильнее пустого calendar и сильнее supportive flow overlay для regime framing.\n"
         + json.dumps(local_event_risk_snapshot, ensure_ascii=False, indent=2)
         + "\n"
     )
@@ -7350,14 +8542,39 @@ if args.multi:
     _debug_trace_write()
 
     if overview_lines:
+        flow_derivatives_section = ""
+        if analysis_profile == "day":
+            flow_derivatives_section = render_flow_derivatives_context_section(
+                read_aia_flow_derivatives_context(),
+                signal_payload=signal,
+                detail_level="day_compact",
+            )
+        elif analysis_profile == "mid":
+            flow_derivatives_section = render_flow_derivatives_context_section(
+                flow_derivatives_context,
+                signal_payload=signal,
+                detail_level="compact",
+            )
+
         print("\n=== [POOL OVERVIEW] ===\n")
-        print("\n\n".join(overview_lines))
+        for idx, section in enumerate(
+            _compose_overview_sections(
+                overview_lines,
+                analysis_profile=analysis_profile,
+                flow_derivatives_section=flow_derivatives_section,
+            )
+        ):
+            if idx:
+                print()
+                print()
+            print(section)
+
         if analysis_profile in {"day", "mid"}:
             print()
             print(
                 render_calendar_section(
                     calendar_context.get("calendar_events") or [],
-                    empty_message="Календарь пуст: подтвержденных scheduled events сейчас нет.",
+                    empty_message=_calendar_empty_message_for_event_risk(local_event_risk_snapshot),
                 )
             )
             event_risk_section = render_event_risk_context_section(
@@ -7367,22 +8584,9 @@ if args.multi:
             if event_risk_section:
                 print()
                 print(event_risk_section)
-            if analysis_profile == "day":
-                flow_derivatives_section = render_flow_derivatives_context_section(
-                    read_aia_flow_derivatives_context(),
-                    signal_payload=signal,
-                )
-                if flow_derivatives_section:
-                    print()
-                    print(flow_derivatives_section)
-            elif analysis_profile == "mid":
-                flow_derivatives_section = render_flow_derivatives_context_section(
-                    flow_derivatives_context,
-                    signal_payload=signal,
-                )
-                if flow_derivatives_section:
-                    print()
-                    print(flow_derivatives_section)
+            if analysis_profile == "day" and flow_derivatives_section:
+                print()
+                print(flow_derivatives_section)
         print("\n==========================\n")
 
     print(json.dumps(signal, ensure_ascii=False))
@@ -7499,6 +8703,8 @@ schema_single = (
     "- break_even_rule: строка с правилом перевода в безубыток\n"
     "- multi_tf_view: объект с ключами m5, m15, h1, h4, d1 — каждое значение короткая строка-описание структуры\n"
     "- why_asset: строка — почему выбран актив\n"
+    "  Не называй активы с H1 выше EMA60 причиной, почему они хуже; негативное сравнение допустимо только для "
+    "mixed H1 / ниже EMA60 / хуже формализуемого риска.\n"
     "- news_context: массив строк из блока [NEWS]/NEWS_FOCUS (уже с префиксом даты и impact), без изменения текста\n"
     "- upcoming_events: массив объектов ближайших событий; если событий нет — []\n"
     "- macro_risk_summary: строка с ближайшими risk windows; если их нет — пустая строка\n"
@@ -7509,6 +8715,7 @@ schema_single = (
     "- disclaimer: строка с дисклеймером\n"
     "- entry_mode: 'limit', 'now' или 'wait_confirm'\n"
     "- confidence: 'High' | 'Medium' | 'Low'\n"
+    "- holding_horizon: 'intraday' | 'intraday_to_1_2d' | 'short_swing' | 'multi_day'\n"
     "- confirmation_rules: строка или массив строк с чек-листом подтверждения\n"
     "- alt_entry_range: {\"min\": number, \"max\": number} — альтернативная зона входа\n"
     "- entries: объект с тремя профилями входа (aggressive/neutral/conservative), как уже описано в коде\n"
@@ -7522,6 +8729,8 @@ schema_single = (
     "- day_mid_context: объект с полями day_bias, mid_bias, notes\n"
     "- adx_guard: объект для силы тренда (может быть заглушкой)\n"
     "- hints.event_risk_context: soft bias от AIA; используй его для более осторожного выбора entry_type / aggressiveness / execution around event windows, но не делай из него hard-block\n"
+    "Для aggressive / wait_confirm не используй фразы вроде `горизонт 3–7 дней` в why_asset или technical_rationale; "
+    "это wording для MID view, а не для тактического сигнала.\n"
     "\n=== EMA → TVH (TP) GUIDANCE (SOFT, FOR EXIT ONLY) ===\n"
     "EMA — не жёсткое правило и не повод блокировать сигнал. Используй EMA ТОЛЬКО как ориентир глубины целей "
     "и логики выхода (tp_by_mode + exit_plan_by_mode). Direction/side не меняй из-за EMA.\n"
@@ -7541,6 +8750,10 @@ schema_single = (
     "  - tvh1: ближе\n"
     "  - tvh2_or_trail: всегда строка \"trail\" (дальше только трейлинг)\n"
     "Все tvh* должны быть ЧИСЛАМИ (не формулы вида \"entry+2%\"), строго в сторону direction.\n"
+    "Сначала восстанови официальный mode target ladder: TP1 около 1% чистого движения от entry, "
+    "TP2 около 2%, TP3 optional/extended. Ближайший micro-level/recent high-low можно описать как "
+    "reaction level, но не делай его официальным TP1, если он слишком близко. "
+    "Только если после восстановления mode ladder нельзя получить валидный контракт — верни no_trade=true.\n"
     "\nТРЕБОВАНИЕ (VARIANT A) для exit_plan_by_mode:\n"
     "- сделай реально разным для режимов; кратко (1–2 короткие строки на режим, можно одной строкой)\n"
     "- обязательно словами (БЕЗ чисел EMA и БЕЗ процентов) упомяни логику:\n"

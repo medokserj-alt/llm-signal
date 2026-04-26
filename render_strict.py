@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import sys
 import json
 import re
@@ -200,6 +201,34 @@ def _sanitize_trend_narrative(
     return ", ".join(parts)
 
 
+def _holding_horizon_label(data: dict) -> str:
+    try:
+        explicit = getattr(get_signal_json, "_normalize_holding_horizon")(data.get("holding_horizon"))  # type: ignore[attr-defined]
+        if explicit:
+            return getattr(get_signal_json, "_holding_horizon_label")(explicit)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    mode = normalize_mode(data.get("mode"))
+    entry_mode = str(data.get("entry_mode") or "").strip().lower()
+    if mode == "aggressive":
+        return "intraday" if entry_mode == "now" else "intraday / 1–2 дня"
+    if mode == "conservative":
+        return "1–3 дня / multi-day"
+    return "1–3 дня / short swing"
+
+
+def _sanitize_signal_horizon_text(text: str, data: dict) -> str:
+    try:
+        return getattr(get_signal_json, "_rewrite_signal_horizon_wording")(  # type: ignore[attr-defined]
+            text,
+            horizon_label=_holding_horizon_label(data),
+            mode=normalize_mode(data.get("mode")),
+        )
+    except Exception:
+        return text
+
+
 def _format_news_item(item) -> str:
     if isinstance(item, str):
         return _one_line(item)
@@ -368,7 +397,13 @@ def main():
 
     take_profit_rules = (data.get("take_profit_rules") or "").strip()
     break_even_rule = (data.get("break_even_rule") or "").strip()
-    raw_mtf = data.get("multi_tf_view")
+    mtf_data = copy.deepcopy(data) if isinstance(data, dict) else {}
+    try:
+        get_signal_json.enforce_ema_narrative_consistency(mtf_data)
+    except Exception:
+        mtf_data = data
+
+    raw_mtf = mtf_data.get("multi_tf_view")
     if isinstance(raw_mtf, dict):
         mtf = raw_mtf
         mtf_fallback = ""
@@ -378,7 +413,7 @@ def main():
     else:
         mtf = {}
         mtf_fallback = ""
-    why_asset = (data.get("why_asset") or "").strip()
+    why_asset = _sanitize_signal_horizon_text((mtf_data.get("why_asset") or data.get("why_asset") or "").strip(), data)
     news_ctx = data.get("news_context", []) or []
     raw_market_ctx = data.get("market_context")
     if isinstance(raw_market_ctx, dict):
@@ -389,11 +424,11 @@ def main():
         market_ctx = str(raw_market_ctx).strip() if raw_market_ctx is not None else ""
     raw_tr = data.get("technical_rationale") or ""
     if isinstance(raw_tr, dict):
-        rationale = (raw_tr.get("summary") or "").strip()
+        rationale = _sanitize_signal_horizon_text((raw_tr.get("summary") or "").strip(), data)
     elif isinstance(raw_tr, str):
-        rationale = raw_tr.strip()
+        rationale = _sanitize_signal_horizon_text(raw_tr.strip(), data)
     else:
-        rationale = str(raw_tr).strip()
+        rationale = _sanitize_signal_horizon_text(str(raw_tr).strip(), data)
     disclaimer = (
         (data.get("disclaimer") or "").strip()
         or "Не является инвестиционной рекомендацией. DYOR."
@@ -685,11 +720,13 @@ def main():
             lines.append(entry_line)
             lines.append(f"SL: {format_price(symbol if isinstance(symbol, str) else None, sl_val)}")
             if mode == "aggressive":
+                lines.append(f"Горизонт: {_holding_horizon_label(data)}")
                 lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")
                 lines.append(f"TP2: {format_price(symbol if isinstance(symbol, str) else None, tp2_val)}")
                 if tp3_val is not None:
                     lines.append(f"TP3: {format_price(symbol if isinstance(symbol, str) else None, tp3_val)}")
             elif mode == "neutral":
+                lines.append(f"Горизонт: {_holding_horizon_label(data)}")
                 lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")
                 lines.append(f"TP2: {format_price(symbol if isinstance(symbol, str) else None, tp2_val)}")
             else:
@@ -700,7 +737,7 @@ def main():
                     lines.append(
                         f"TP2_or_trail: {format_price(symbol if isinstance(symbol, str) else None, tp2_or_trail)}"
                     )
-                lines.append("Горизонт: 1–3 дня (conservative)")
+                lines.append(f"Горизонт: {_holding_horizon_label(data)} (conservative)")
             lines.append(f"RR: 1:{fmt(rr_val)}")
             lines.append(f"План выхода: {exit_plan}")
             lines.append("")

@@ -108,6 +108,26 @@ class TestEventCalendarIntegration(unittest.TestCase):
         self.assertIn("US CPI", rendered)
         self.assertIn("impact: high", rendered)
 
+    def test_calendar_empty_message_mentions_scheduled_adjacent_geopolitical_trigger(self) -> None:
+        snapshot = {
+            "event_risk_context": [
+                {
+                    "event": "Israel-Lebanon talks are still ahead",
+                    "source_title": "Israel-Lebanon talks begin at White House",
+                    "category": "geopolitics",
+                    "phase": "pre_event",
+                    "impact": "high",
+                    "directional_risk": "uncertain",
+                    "anticipated_consequences": ["Israel-Lebanon talks are still ahead"],
+                }
+            ]
+        }
+
+        message = get_signal_json._calendar_empty_message_for_event_risk(snapshot)
+
+        self.assertIn("scheduled-adjacent geopolitical headline risk", message)
+        self.assertIn("Israel-Lebanon talks are still ahead", message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -177,6 +177,8 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "режим risk-off (повышенный риск рынка)"
     if low == "low_rr":
         return "недостаточный R:R для режима"
+    if low == "tp1_below_min_move":
+        return "TP1 не даёт минимального чистого движения 1% от entry"
     if low == "invalid_mode_setup":
         return "неполные/некорректные уровни для режима"
     if low == "mode_disabled":
@@ -328,6 +330,8 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "активно окно high-impact события; в conservative новые сделки не открываем до завершения event window."
     if low == "low_rr":
         return "недостаточный R:R при текущем входе/SL/целях."
+    if low == "tp1_below_min_move":
+        return "TP1 даёт меньше 1% чистого движения от entry; без следующего подтверждённого уровня такой сетап не публикуем."
     if low == "invalid_mode_setup":
         return "некорректные/неполные уровни для выбранного режима (SL/TP/RR)."
     if low == "mode_disabled":
@@ -381,6 +385,8 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Дождаться завершения окна high-impact события; для conservative вход возможен только после него.")
         if low == "low_rr":
             add("– Улучшить R:R: более выгодный вход (глубже откат) или более понятная цель без роста риска.")
+        if low == "tp1_below_min_move":
+            add("– Нужен следующий подтверждённый уровень, который даёт минимум 1% движения от entry; без выдумывания цели.")
         if low == "ema_guard_below_both_long":
             add("– Для LONG: цена должна закрепиться выше EMA20(M15) и EMA20(H1).")
         if low == "ema_guard_above_both_short":

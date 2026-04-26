@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -232,6 +233,47 @@ class TestTgPersonalBotPublishBehavior(unittest.TestCase):
 
     def test_personal_bot_pool_is_fixed_to_agreed_five_assets(self) -> None:
         self.assertEqual(self.bot.SYMBOLS, ["BTC", "ETH", "BNB", "SOL", "XRP"])
+
+    def test_short_mid_report_is_sent_as_single_message(self) -> None:
+        context = _FakeContext()
+        self.bot.make_header = lambda title: f"{title} • 25.04.2026 14:51"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            (report_dir / "analysis_20260425_145100.md").write_text(
+                "1️⃣ Среднесрочный режим 3–7 дней\n\n2️⃣ Главные драйверы",
+                encoding="utf-8",
+            )
+            asyncio.run(self.bot._post_report("mid", "📰", context, -1001, report_dir))
+
+        self.assertEqual(len(context.bot.calls), 2)
+        self.assertIn("📰 MID • 25.04.2026 14:51", context.bot.calls[1]["text"])
+        self.assertNotIn("appendix", context.bot.calls[1]["text"])
+
+    def test_long_day_report_is_split_into_appendix_messages(self) -> None:
+        context = _FakeContext()
+        self.bot.make_header = lambda title: f"{title} • 25.04.2026 14:51"
+        self.bot.REPORT_TELEGRAM_MAX_LEN = 120
+        long_body = "\n\n".join(
+            [
+                "1️⃣ Режим дня " + ("A" * 45),
+                "2️⃣ Кандидаты на сегодня " + ("B" * 45),
+                "🗓 Events\n- Event one\n- Event two",
+                "Flow / Derivatives Context\n- derivatives-only\n- exchange/stablecoin/tokenomics unavailable",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            (report_dir / "analysis_20260425_145100.md").write_text(long_body, encoding="utf-8")
+            asyncio.run(self.bot._post_report("day", "🗓", context, -1001, report_dir))
+
+        self.assertGreaterEqual(len(context.bot.calls), 3)
+        report_calls = context.bot.calls[1:]
+        self.assertIn("part 1/", report_calls[0]["text"])
+        self.assertIn("appendix", report_calls[-1]["text"])
+        joined = "\n".join(call["text"] for call in report_calls)
+        self.assertIn("Flow / Derivatives Context", joined)
 
 
 if __name__ == "__main__":

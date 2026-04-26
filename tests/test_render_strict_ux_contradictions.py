@@ -12,6 +12,7 @@ def _render_text(data: dict) -> str:
     buf_out = io.StringIO()
     with (
         patch("sys.stdin", io.StringIO(json.dumps(data, ensure_ascii=False))),
+        patch("sys.argv", ["render_strict.py"]),
         patch("render_strict.pathlib.Path.write_text", return_value=None),
         contextlib.redirect_stdout(buf_out),
     ):
@@ -98,7 +99,37 @@ class TestRenderStrictUXContradictions(unittest.TestCase):
         out = _render_text(d)
         self.assertIn("RR: 1:1.7", out)
 
+    def test_event_risk_lines_render_in_russian_without_long_english_prose(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "BTC/USDT",
+            "price": 100.0,
+            "mode": "neutral",
+            "side": "long",
+            "why_asset": "test",
+            "multi_tf_view": {"m5": "—", "m15": "—", "h1": "—", "h4": "—", "d1": "—"},
+            "news_context": [],
+            "entries": {"neutral": {"enabled": True}},
+            "entry_price_neutral": 99.0,
+            "sl_by_mode": {"neutral": 98.0},
+            "tp_by_mode": {"neutral": {"tvh1": 102.0, "tvh2": 104.0}},
+            "rr_by_mode": {"neutral": 1.7},
+            "exit_plan_by_mode": {"neutral": "plan"},
+            "event_risk": {
+                "display_lines": [
+                    "⚠️ Макро/геориск: геополитический режим остаётся нестабильным; сохраняется риск резких downside-движений на заголовках.",
+                    "⚠️ Риск исполнения: продолжение допустимо только тактически; нужен ретест/подтверждение, без покупки первого импульса.",
+                ]
+            },
+        }
+
+        out = _render_text(d)
+        self.assertIn("⚠️ Макро/геориск:", out)
+        self.assertIn("⚠️ Риск исполнения:", out)
+        self.assertNotIn("Macro risk:", out)
+        self.assertNotIn("Execution risk:", out)
+        self.assertNotIn("severe geopolitical regime remains unresolved", out)
+
 
 if __name__ == "__main__":
     unittest.main()
-

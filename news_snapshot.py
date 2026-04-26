@@ -5,6 +5,7 @@ import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import feedparser
+from market_relevance import is_market_relevant_news_item
 
 # ---------------------------
 #  Конфигурация RSS-источников
@@ -34,6 +35,9 @@ MACRO_FEEDS = [
     "https://www.marketwatch.com/feeds/marketpulse",
     # Financial Times (часть материалов может быть платной, но заголовки есть)
     "https://www.ft.com/?format=rss",
+    # General world / geopolitics fallback
+    "https://www.theguardian.com/world/rss",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
 
 # Ключевые слова для выделения макро-тем
@@ -42,6 +46,14 @@ MACRO_KEYWORDS = [
     "rates", "rate hike", "rate cut", "treasury", "yields",
     "jobs", "nonfarm", "nfp", "unemployment",
     "stimulus", "congress", "debt ceiling", "government shutdown",
+]
+
+GEOPOLITICS_KEYWORDS = [
+    "white house", "oval office", "press conference", "briefing", "remarks",
+    "talks", "meeting", "summit", "diplomatic", "delegation",
+    "ceasefire", "truce", "deadline", "extension possible",
+    "israel", "lebanon", "hezbollah", "iran", "hormuz",
+    "blockade", "sanctions", "tariff", "shipping",
 ]
 
 # Максимум выводимых строк
@@ -69,10 +81,13 @@ def _is_macro_item(title: str, summary: str, link: str, from_macro_feed: bool) -
     Грубый классификатор: если новость из MACRO_FEEDS — считаем макро.
     Иначе смотрим, есть ли ключевые слова в заголовке/описании/ссылке.
     """
-    if from_macro_feed:
-        return True
     blob = " ".join([title or "", summary or "", link or ""]).lower()
-    return any(k in blob for k in MACRO_KEYWORDS)
+    keyword_match = any(k in blob for k in MACRO_KEYWORDS) or any(k in blob for k in GEOPOLITICS_KEYWORDS)
+    if keyword_match:
+        return True
+    if from_macro_feed:
+        return is_market_relevant_news_item(title, summary=summary, link=link)
+    return False
 
 
 def fetch_items(hours: int) -> list[dict]:

@@ -17,6 +17,9 @@ from get_signal_json import (
     merge_day_mid_report_context,
     normalize_no_trade,
     read_latest_report_payload,
+    restore_mode_target_ladder,
+    apply_tp1_min_move_guard,
+    _sync_top_level_trade_levels_for_mode,
     validate_or_fallback_tvh_by_mode,
     validate_active_mode_setup,
     _round_price,
@@ -257,6 +260,9 @@ def main(argv=None):
         pass
     normalize_no_trade(data)
     _ensure_by_mode_levels(data)
+    restore_mode_target_ladder(data)
+    apply_tp1_min_move_guard(data)
+    _sync_top_level_trade_levels_for_mode(data)
     validate_active_mode_setup(data)
     normalize_no_trade(data)
     ensure_decision_path(data)

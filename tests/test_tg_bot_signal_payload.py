@@ -217,6 +217,39 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertIn({"type": "retest_entry_zone", "required": True}, out["meta"]["confirm_rule_v1"]["rules"])
         self.assertIn({"type": "deadline_minutes", "value": 180}, out["meta"]["confirm_rule_v1"]["rules"])
 
+    def test_wait_confirm_payload_extends_deadline_for_h1_reclaim_setup(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "XRP/USDT",
+            "direction": "long",
+            "entry_range": [1.4310, 1.4340],
+            "sl": 1.4200,
+            "tp1": 1.4407,
+            "tp2": 1.4474,
+            "mode": "aggressive",
+            "entry_mode": "wait_confirm",
+            "entry_price_aggressive": 1.4340,
+            "sl_by_mode": {"aggressive": 1.4200},
+            "tp_by_mode": {"aggressive": {"tvh1": 1.4407, "tvh2": 1.4474}},
+            "max_valid_minutes": 1440,
+            "validity_minutes": 720,
+            "confirmation_rules": "H1 reclaim / retest зоны entry_range; вход только после возврата внутрь базы и удержания без быстрого срыва.",
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="sig-wait-cap-2",
+            published_at="2026-04-15T09:52:00Z",
+            channel_id=-1001234567890,
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out["meta"]["entry_type"], "wait_confirm")
+        self.assertEqual(out["meta"]["max_wait_minutes"], 360)
+        self.assertEqual(out["meta"]["confirm_timeout_minutes"], 360)
+        self.assertIn({"type": "reclaim_entry_zone", "side": "long"}, out["meta"]["confirm_rule_v1"]["rules"])
+        self.assertIn({"type": "deadline_minutes", "value": 360}, out["meta"]["confirm_rule_v1"]["rules"])
+
     def test_wait_confirm_parser_supports_hold_retest_session_and_event_window_patterns(self) -> None:
         tg_bot = _load_tg_bot_module()
 

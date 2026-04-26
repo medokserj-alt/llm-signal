@@ -4,6 +4,7 @@ import copy
 import re
 
 from event_calendar import utc_now_iso
+from market_relevance import classify_market_relevance
 
 _VALID_CATEGORIES = {
     "geopolitics",
@@ -75,6 +76,16 @@ _PRE_EVENT_MARKERS = (
     "next round",
     "tomorrow",
     "this weekend",
+    "to resume",
+    "to meet",
+    "to speak",
+    "remarks later",
+    "press conference later",
+    "briefing later",
+    "deadline nears",
+    "deadline near",
+    "due to expire",
+    "set to expire",
 )
 _ONGOING_MARKERS = (
     "ongoing",
@@ -238,6 +249,12 @@ _RISK_ON_NEEDLES = (
     "agreement reached",
     "deal reached",
     "ceasefire reached",
+    "ceasefire extended",
+    "truce extended",
+    "ceasefire extension",
+    "truce extension",
+    "extended by three weeks",
+    "extended by 3 weeks",
     "de-escalation",
     "sanctions relief",
     "reopened",
@@ -275,6 +292,7 @@ _TALKS_ONGOING_MARKERS = (
     "meeting under way",
     "resumes talks",
     "resume talks",
+    "talks begin at white house",
 )
 _TALKS_UPCOMING_MARKERS = _PRE_EVENT_MARKERS
 _MIXED_TRANSITION_MARKERS = (
@@ -316,6 +334,91 @@ _ESCALATION_RISK_MARKERS = (
     "could follow",
     "looms",
     "possible",
+)
+
+_GEO_CEASEFIRE_RISK_MARKERS = (
+    "ceasefire may collapse",
+    "ceasefire could collapse",
+    "ceasefire at risk",
+    "fragile ceasefire",
+    "truce may collapse",
+    "truce at risk",
+    "ceasefire collapse risk",
+    "truce collapse risk",
+    "ceasefire violation",
+    "truce violation",
+)
+_GEO_DIPLOMATIC_BREAKDOWN_MARKERS = (
+    "talks failed",
+    "talks ended",
+    "without agreement",
+    "no agreement",
+    "negotiations failed",
+    "negotiations ended",
+    "diplomatic breakdown",
+    "diplomatic path collapsed",
+    "diplomatic path failed",
+)
+_GEO_MILITARY_THREAT_MARKERS = (
+    "military action",
+    "military response",
+    "military strike",
+    "military threat",
+    "attack risk",
+    "strike risk",
+    "retaliation risk",
+    "retaliation was confirmed",
+    "retaliation was launched",
+    "attack confirmed",
+    "strike confirmed",
+    "strike launched",
+    "missile strike",
+    "attack launched",
+    "renewed military",
+)
+_GEO_NEGOTIATION_MARKERS = (
+    "talks",
+    "negotiation",
+    "negotiations",
+    "ceasefire",
+    "truce",
+    "diplomatic",
+    "summit",
+    "meeting",
+    "delegation",
+)
+_GEO_ESCALATION_SIGNAL_MARKERS = (
+    "warned",
+    "warning",
+    "threat",
+    "threatened",
+    "threatens",
+    "vowed",
+    "vows",
+    "pledged",
+    "signaled",
+    "signals",
+    "ultimatum",
+    "deadline",
+    "all options",
+    "response remains on the table",
+    "public statement",
+)
+_GEO_DOWNSIDE_SHOCK_MARKERS = (
+    "shipping",
+    "energy",
+    "oil",
+    "blockade",
+    "sanctions",
+    "tariff",
+    "attack",
+    "strike",
+    "military",
+    "retaliation",
+    "disruption",
+    "downside shock",
+    "tail risk",
+    "risk premium",
 )
 
 
@@ -548,6 +651,21 @@ def _impact_rank(value: str) -> int:
     return {"high": 3, "medium": 2, "low": 1}.get(_text(value).lower(), 0)
 
 
+def _regime_severity_rank(value: str) -> int:
+    return {"": 0, "low": 1, "medium": 2, "high": 3, "severe": 4}.get(_text(value).lower(), 0)
+
+
+def _stronger_regime_severity(*values) -> str:
+    best = ""
+    best_rank = -1
+    for value in values:
+        rank = _regime_severity_rank(_text(value))
+        if rank > best_rank:
+            best = _text(value).lower()
+            best_rank = rank
+    return best if best in {"low", "medium", "high", "severe"} else ""
+
+
 def _stronger_impact(*values: str) -> str:
     strongest = ""
     for value in values:
@@ -565,6 +683,10 @@ def _geopolitics_actor_tokens(value) -> tuple[str, ...]:
         actors.append("iran")
     if "israel" in low:
         actors.append("israel")
+    if "lebanon" in low:
+        actors.append("lebanon")
+    if "hezbollah" in low:
+        actors.append("hezbollah")
     if "hamas" in low:
         actors.append("hamas")
     if "houthi" in low or "houthis" in low:
@@ -582,6 +704,10 @@ def _geopolitics_location_tokens(value) -> tuple[str, ...]:
         ("oman", "oman"),
         ("red sea", "red_sea"),
         ("gaza", "gaza"),
+        ("lebanon", "lebanon"),
+        ("israel", "israel"),
+        ("white house", "washington"),
+        ("oval office", "washington"),
     )
     for needle, label in locations:
         if needle in low and label not in out:
@@ -616,6 +742,8 @@ def _geopolitics_region_key(locations: tuple[str, ...]) -> str:
         return "gulf"
     if "red_sea" in locations:
         return "red_sea"
+    if any(location in {"lebanon", "israel", "gaza"} for location in locations):
+        return "levant"
     if locations:
         return locations[0]
     return ""
@@ -691,10 +819,29 @@ def _add_unique_text(target: list[str], value: str) -> None:
 
 
 def _has_talks_context(low: str) -> bool:
-    return any(marker in low for marker in ("talks", "peace talks", "negotiation", "negotiations", "meeting", "ceasefire"))
+    return any(
+        marker in low
+        for marker in (
+            "talks",
+            "peace talks",
+            "negotiation",
+            "negotiations",
+            "meeting",
+            "summit",
+            "ceasefire",
+            "truce",
+            "press conference",
+            "briefing",
+            "remarks",
+            "white house",
+            "oval office",
+        )
+    )
 
 
 def _geopolitics_topic_prefix(low: str) -> str:
+    if "israel" in low and ("lebanon" in low or "hezbollah" in low):
+        return "Israel-Lebanon"
     if "u.s.-iran" in low or "us-iran" in low or (("iran" in low) and ("u.s." in low or "us " in low or "trump" in low)):
         return "US-Iran"
     if "iran" in low:
@@ -726,6 +873,27 @@ def _interpret_geopolitics_title(title: str) -> dict:
 
     if _contains_any(low, _TALKS_UPCOMING_MARKERS) and _has_talks_context(low):
         _add_unique_text(anticipated_consequences, f"{talks_label} are still ahead")
+
+    if any(marker in low for marker in ("ceasefire", "truce")) and any(
+        marker in low
+        for marker in (
+            "ceasefire extended",
+            "truce extended",
+            "ceasefire extension",
+            "truce extension",
+            "extended by three weeks",
+            "extended by 3 weeks",
+        )
+    ):
+        phrase = f"{topic_prefix} ceasefire was extended".strip() if topic_prefix else "Ceasefire was extended"
+        _add_unique_text(confirmed_facts, phrase)
+        _add_unique_text(realized_market_events, phrase)
+
+    if any(marker in low for marker in ("ceasefire", "truce")) and any(
+        marker in low for marker in ("deadline", "due to expire", "set to expire", "extension possible")
+    ):
+        phrase = f"{topic_prefix} ceasefire deadline is near".strip() if topic_prefix else "Ceasefire deadline is near"
+        _add_unique_text(anticipated_consequences, phrase)
 
     if "sanctions" in low and ("announc" in low or "imposed" in low):
         _add_unique_text(confirmed_facts, "Sanctions were announced")
@@ -829,15 +997,20 @@ def _is_scheduled_macro_title(title: str, calendar_events=None) -> bool:
 
 def _classify_category(title: str) -> str:
     low = _text(title).lower()
+    relevance = classify_market_relevance(title)
+    relevance_category = _text(relevance.get("category"))
     if any(needle in low for needle in _CRYPTO_MARKET_STRUCTURE_NEEDLES) and any(
         needle in low for needle in _CRYPTO_SHOCK_NEEDLES
-    ):
+    ) and relevance_category == "crypto":
         return "crypto_market_structure"
-    if any(needle in low for needle in _GEOPOLITICS_NEEDLES):
+    if any(needle in low for needle in _GEOPOLITICS_NEEDLES) and relevance_category in {
+        "geopolitics",
+        "energy_shipping",
+    }:
         return "geopolitics"
-    if any(needle in low for needle in _MACRO_POLICY_NEEDLES):
+    if any(needle in low for needle in _MACRO_POLICY_NEEDLES) and relevance_category in {"macro", "banking"}:
         return "macro_policy_shock"
-    if any(needle in low for needle in _CRYPTO_MARKET_STRUCTURE_NEEDLES):
+    if any(needle in low for needle in _CRYPTO_MARKET_STRUCTURE_NEEDLES) and relevance_category == "crypto":
         return "crypto_market_structure"
     return ""
 
@@ -873,25 +1046,34 @@ def _classify_phase(title: str, *, category: str, interpretation: dict | None = 
 
 def _classify_impact(title: str, *, category: str, phase: str) -> str:
     low = _text(title).lower()
-    high_needles = (
-        "hormuz",
-        "blockade",
-        "shipping",
-        "strike",
-        "missile",
-        "attack",
-        "sanctions",
-        "tariff",
-        "emergency",
-        "liquidation",
-        "outage",
-        "hack",
-        "exploit",
-        "etf",
-        "sec",
-        "lawsuit",
-    )
-    if any(needle in low for needle in high_needles):
+    if category == "geopolitics" and any(
+        needle in low
+        for needle in (
+            "hormuz",
+            "blockade",
+            "shipping",
+            "strike",
+            "missile",
+            "military",
+            "sanctions",
+            "tariff",
+            "terror",
+            "terrorism",
+        )
+    ):
+        return "high"
+    if category == "crypto_market_structure" and any(
+        needle in low
+        for needle in (
+            "liquidation",
+            "outage",
+            "hack",
+            "exploit",
+            "etf",
+            "sec",
+            "lawsuit",
+        )
+    ):
         return "high"
     if category == "geopolitics" and phase in {"pre_event", "ongoing"}:
         return "high"
@@ -950,31 +1132,31 @@ def _event_label(title: str) -> str:
 def _summary_unresolved_phrase(consequence: str) -> str:
     text = _text(consequence)
     if not text:
-        return "the next escalation step is not yet confirmed"
+        return "следующий шаг эскалации пока не подтверждён"
     if " risk " in f" {text.lower()} ":
         if text.lower().endswith("risk increased"):
-            return f"{text[:-len('risk increased')].strip()} is not yet confirmed".replace("  ", " ")
+            return f"{text[:-len('risk increased')].strip()} пока не подтверждён".replace("  ", " ")
         if text.lower().endswith("risk remains elevated"):
-            return f"{text[:-len('risk remains elevated')].strip()} is not yet confirmed".replace("  ", " ")
+            return f"{text[:-len('risk remains elevated')].strip()} пока не подтверждён".replace("  ", " ")
         if text.lower().endswith("risk remains"):
-            return f"{text[:-len('risk remains')].strip()} is not yet confirmed".replace("  ", " ")
+            return f"{text[:-len('risk remains')].strip()} пока не подтверждён".replace("  ", " ")
         if text.lower().endswith("risk stays"):
-            return f"{text[:-len('risk stays')].strip()} is not yet confirmed".replace("  ", " ")
+            return f"{text[:-len('risk stays')].strip()} пока не подтверждён".replace("  ", " ")
     if text.lower().endswith("are still ahead"):
-        return text
-    return f"{text} remains unresolved"
+        return text.replace("are still ahead", "ещё впереди")
+    return f"{text} остаётся нерешённым"
 
 
 def _execution_tail_text(category: str, *, phase: str, mixed_unresolved: bool) -> str:
     if category == "geopolitics":
         if mixed_unresolved:
-            return "Headline sensitivity and volatility remain elevated."
+            return "Чувствительность к заголовкам и волатильность остаются повышенными."
         if phase in {"pre_event", "ongoing"}:
-            return "Headline sensitivity remains elevated before clarity."
-        return "Risk premium stays elevated until follow-through is clearer."
+            return "До прояснения картины чувствительность к заголовкам остаётся повышенной."
+        return "Премия за риск остаётся высокой, пока follow-through не станет яснее."
     if category == "crypto_market_structure":
-        return "Execution risk remains elevated until forced flows clear."
-    return "Cross-asset volatility can stay elevated until follow-through is clearer."
+        return "Риск исполнения остаётся повышенным, пока не пройдут вынужденные потоки."
+    return "Кросс-активная волатильность может оставаться повышенной, пока follow-through не станет яснее."
 
 
 def _event_drivers(
@@ -1107,28 +1289,28 @@ def _event_summary(
                 f"{_execution_tail_text(category, phase=phase, mixed_unresolved=False)}"
             )
         return (
-            f"{label} is still ahead, and headline sensitivity remains elevated before the outcome is clear."
+            f"{label} ещё впереди, и до прояснения исхода чувствительность к заголовкам остаётся повышенной."
         )
     if phase == "ongoing":
         if confirmed_facts and any("ongoing" in fact.lower() or "resumed" in fact.lower() for fact in confirmed_facts):
-            return "Negotiations are ongoing and the market is still waiting for clarity; price action remains headline-driven."
+            return "Переговоры продолжаются, рынок всё ещё ждёт ясности, а price action остаётся зависимым от заголовков."
         return (
-            f"{label} remains unresolved, so markets stay headline-sensitive and confirmation matters more "
-            "than aggressive chasing."
+            f"{label} остаётся нерешённым, поэтому рынок сохраняет чувствительность к заголовкам, "
+            "а confirm важнее агрессивной погони."
         )
     if directional_risk == "risk_on":
         return (
-            f"{label} supports short-term relief, but follow-through remains headline-sensitive until the "
-            "move is confirmed."
+            f"{label} поддерживает краткосрочный relief, но до подтверждения движения follow-through "
+            "остаётся чувствительным к заголовкам."
         )
     if category == "crypto_market_structure":
         return (
-            f"{label} raises immediate execution risk and can keep price action disorderly until forced flows "
-            "clear out."
+            f"{label} повышает немедленный риск исполнения и может держать price action хаотичным, "
+            "пока не выйдут принудительные потоки."
         )
     return (
-        f"{label} keeps risk premium elevated and increases headline-driven volatility until the market gets "
-        "clearer follow-through."
+        f"{label} удерживает повышенную премию за риск и усиливает волатильность на заголовках, "
+        "пока рынок не получит более ясный follow-through."
     )
 
 
@@ -1157,6 +1339,195 @@ def _event_risk_sort_key(item: dict) -> tuple[int, int, int, int]:
     if any(needle in event_text for needle in ("sec", "lawsuit", "etf", "regulatory")):
         market_scope_score -= 10
     return (category_score + impact_score + phase_score + market_scope_score, category_score, impact_score, market_scope_score)
+
+
+def _geopolitical_regime_profile(item: dict | None) -> dict:
+    default = {
+        "regime_flags": [],
+        "regime_severity": "",
+        "regime_summary": "",
+        "risk_asymmetry": "",
+        "continuation_mode": "",
+        "strictness": "",
+    }
+    if not isinstance(item, dict) or _text(item.get("category")) != "geopolitics":
+        return copy.deepcopy(default)
+
+    phase = _text(item.get("phase")).lower()
+    impact = _text(item.get("impact")).lower()
+    directional_risk = _text(item.get("directional_risk")).lower()
+    blob = " ".join(
+        [
+            _text(item.get("source_title")),
+            _text(item.get("event")),
+            _text(item.get("summary")),
+            " ".join(item.get("drivers") or []),
+            " ".join(item.get("confirmed_facts") or []),
+            " ".join(item.get("anticipated_consequences") or []),
+            " ".join(item.get("realized_market_events") or []),
+            " ".join(item.get("recent_developments") or []),
+            " ".join(item.get("cluster_themes") or []),
+        ]
+    ).lower()
+    confirmed_facts = item.get("confirmed_facts") or []
+    anticipated_consequences = item.get("anticipated_consequences") or []
+    mixed_unresolved = bool(confirmed_facts and anticipated_consequences and not (item.get("realized_market_events") or []))
+
+    flags: list[str] = []
+    if _contains_any(blob, _GEO_CEASEFIRE_RISK_MARKERS):
+        flags.append("ceasefire_at_risk")
+    if _contains_any(blob, _GEO_DIPLOMATIC_BREAKDOWN_MARKERS):
+        flags.append("diplomatic_breakdown_risk")
+    if _contains_any(blob, _GEO_MILITARY_THREAT_MARKERS):
+        flags.append("renewed_military_action_threat")
+    if phase in {"pre_event", "ongoing"} and _contains_any(blob, _GEO_NEGOTIATION_MARKERS):
+        flags.append("unresolved_high_stakes_negotiation")
+    if _contains_any(blob, _GEO_ESCALATION_SIGNAL_MARKERS):
+        flags.append("public_escalation_signal")
+    downside_blob = directional_risk in {"risk_off", "uncertain"} and _contains_any(blob, _GEO_DOWNSIDE_SHOCK_MARKERS)
+    if downside_blob or "headline-driven volatility" in blob or "risk premium" in blob or "tail risk" in blob:
+        flags.append("downside_shock_elevated")
+    if mixed_unresolved or (
+        phase in {"pre_event", "ongoing"}
+        and (
+            "diplomatic_breakdown_risk" in flags
+            or "ceasefire_at_risk" in flags
+            or "renewed_military_action_threat" in flags
+        )
+    ):
+        flags.append("unresolved_geopolitical_breakpoint")
+    if (
+        len(flags) >= 2
+        or "unresolved_geopolitical_breakpoint" in flags
+        or "renewed_military_action_threat" in flags
+    ):
+        flags.append("escalation_sensitive")
+
+    flags = _unique_text_tokens(flags)
+
+    score = 0
+    if impact == "high":
+        score += 2
+    if phase in {"pre_event", "ongoing"}:
+        score += 2
+    if mixed_unresolved:
+        score += 2
+    if "ceasefire_at_risk" in flags:
+        score += 2
+    if "diplomatic_breakdown_risk" in flags:
+        score += 2
+    if "renewed_military_action_threat" in flags:
+        score += 2
+    if "unresolved_high_stakes_negotiation" in flags:
+        score += 1
+    if "public_escalation_signal" in flags:
+        score += 1
+    if "downside_shock_elevated" in flags:
+        score += 2
+    if "unresolved_geopolitical_breakpoint" in flags:
+        score += 2
+
+    core_bundle_count = sum(
+        1
+        for key in (
+            "ceasefire_at_risk",
+            "diplomatic_breakdown_risk",
+            "renewed_military_action_threat",
+            "unresolved_high_stakes_negotiation",
+            "public_escalation_signal",
+            "downside_shock_elevated",
+        )
+        if key in flags
+    )
+    severity = "low"
+    if (
+        score >= 11
+        and len(flags) >= 4
+        and (
+            core_bundle_count >= 4
+            or "ceasefire_at_risk" in flags
+            or "renewed_military_action_threat" in flags
+            or "public_escalation_signal" in flags
+        )
+    ):
+        severity = "severe"
+    elif score >= 7:
+        severity = "high"
+    elif score >= 4:
+        severity = "medium"
+
+    risk_asymmetry = "neutral"
+    if "downside_shock_elevated" in flags and severity in {"high", "severe"}:
+        risk_asymmetry = "asymmetric_downside" if severity == "severe" else "downside_elevated"
+
+    continuation_mode = "tactical_only" if severity == "severe" else "confirmation_first" if severity == "high" else "normal"
+    strictness = "strict" if severity == "severe" else "elevated" if severity == "high" else "normal"
+
+    if severity == "severe":
+        summary = (
+            "severe geopolitical regime: escalation-sensitive, two-sided with asymmetric downside shock risk; "
+            "continuation is tactical-only until the resolution path is cleaner."
+        )
+    elif severity == "high":
+        summary = (
+            "elevated geopolitical regime: downside shock sensitivity is above normal and confirmation matters "
+            "more than first-move continuation."
+        )
+    elif severity == "medium":
+        summary = "geopolitical backdrop remains escalation-sensitive and can destabilize continuation if headlines worsen."
+    else:
+        summary = "geopolitical risk remains a live but secondary contextual factor."
+
+    return {
+        "regime_flags": flags,
+        "regime_severity": severity,
+        "regime_summary": summary,
+        "risk_asymmetry": risk_asymmetry,
+        "continuation_mode": continuation_mode,
+        "strictness": strictness,
+    }
+
+
+def _build_event_risk_regime_layer(items: list[dict]) -> dict:
+    geo_items = [item for item in items if isinstance(item, dict) and _text(item.get("category")) == "geopolitics"]
+    if not geo_items:
+        return {}
+
+    dominant = geo_items[0]
+    severity = ""
+    flags: list[str] = []
+    for item in geo_items:
+        profile = _geopolitical_regime_profile(item)
+        severity = _stronger_regime_severity(severity, profile.get("regime_severity"))
+        flags = _unique_text_tokens([*flags, *(profile.get("regime_flags") or [])])
+
+    dominant_profile = _geopolitical_regime_profile(dominant)
+    if len(geo_items) >= 2 and severity == "high" and len(flags) >= 4:
+        severity = "severe"
+    if severity == "severe":
+        strictness = "strict"
+        continuation_mode = "tactical_only"
+        risk_asymmetry = "asymmetric_downside"
+        summary = (
+            "severe geopolitical regime: escalation-sensitive, two-sided with asymmetric downside shock risk; "
+            "continuation is tactical-only until there is a clean resolution path."
+        )
+    else:
+        strictness = _text(dominant_profile.get("strictness")) or "normal"
+        continuation_mode = _text(dominant_profile.get("continuation_mode")) or "normal"
+        risk_asymmetry = _text(dominant_profile.get("risk_asymmetry")) or "neutral"
+        summary = _text(dominant_profile.get("regime_summary"))
+
+    return {
+        "driver": "geopolitics",
+        "severity": severity or _text(dominant_profile.get("regime_severity")) or "low",
+        "flags": flags[:6],
+        "dominant_event": _text(dominant.get("event")),
+        "summary": summary,
+        "risk_asymmetry": risk_asymmetry,
+        "continuation_mode": continuation_mode,
+        "strictness": strictness,
+    }
 
 
 def _parse_news_lines(raw_news) -> list[dict]:
@@ -1208,6 +1579,7 @@ def _normalize_event_risk_item(item) -> dict | None:
             return None
         return {
             "event": event,
+            "source_title": "",
             "category": "",
             "phase": "",
             "impact": "",
@@ -1223,6 +1595,12 @@ def _normalize_event_risk_item(item) -> dict | None:
             "cluster_actors": [],
             "cluster_locations": [],
             "cluster_themes": [],
+            "regime_flags": [],
+            "regime_severity": "",
+            "regime_summary": "",
+            "risk_asymmetry": "",
+            "continuation_mode": "",
+            "strictness": "",
         }
 
     if not isinstance(item, dict):
@@ -1230,6 +1608,7 @@ def _normalize_event_risk_item(item) -> dict | None:
 
     out = {
         "event": _event_label(item.get("event")),
+        "source_title": _event_label(item.get("source_title")),
         "category": _normalize_category(item.get("category")),
         "phase": _normalize_phase(item.get("phase")),
         "impact": _normalize_impact(item.get("impact")),
@@ -1253,6 +1632,12 @@ def _normalize_event_risk_item(item) -> dict | None:
             item.get("cluster_locations") if isinstance(item.get("cluster_locations"), list) else []
         ),
         "cluster_themes": _unique_text_tokens(item.get("cluster_themes") if isinstance(item.get("cluster_themes"), list) else []),
+        "regime_flags": _unique_text_tokens(item.get("regime_flags") if isinstance(item.get("regime_flags"), list) else []),
+        "regime_severity": _stronger_regime_severity(item.get("regime_severity")),
+        "regime_summary": _merge_unique_texts(item.get("regime_summary"), max_items=2),
+        "risk_asymmetry": _text(item.get("risk_asymmetry")),
+        "continuation_mode": _text(item.get("continuation_mode")),
+        "strictness": _text(item.get("strictness")),
     }
 
     if not out["event"]:
@@ -1320,12 +1705,22 @@ def normalize_event_risk_snapshot(raw) -> dict:
         existing["cluster_themes"] = _unique_text_tokens(
             [*(existing.get("cluster_themes") or []), *(normalized.get("cluster_themes") or [])]
         )
+        existing["regime_flags"] = _unique_text_tokens([*(existing.get("regime_flags") or []), *(normalized.get("regime_flags") or [])])
+        existing["regime_severity"] = _stronger_regime_severity(existing.get("regime_severity"), normalized.get("regime_severity"))
+        existing["regime_summary"] = _merge_unique_texts(existing.get("regime_summary"), normalized.get("regime_summary"), max_items=2)
+        if normalized.get("risk_asymmetry") and not existing.get("risk_asymmetry"):
+            existing["risk_asymmetry"] = normalized.get("risk_asymmetry")
+        if normalized.get("continuation_mode") and not existing.get("continuation_mode"):
+            existing["continuation_mode"] = normalized.get("continuation_mode")
+        if normalized.get("strictness") and not existing.get("strictness"):
+            existing["strictness"] = normalized.get("strictness")
 
     out.sort(key=_event_risk_sort_key, reverse=True)
 
     return {
         "timestamp_utc": timestamp_utc,
         "event_risk_context": out,
+        "regime_layer": _build_event_risk_regime_layer(out),
     }
 
 
@@ -1372,7 +1767,28 @@ def _event_cluster_metadata(item: dict) -> dict:
     themes = _geopolitics_theme_tokens(cluster_text)
     actor_key = "+".join(actors) or _topic_identity(event)
     region_key = _geopolitics_region_key(locations) or "general"
-    if set(themes) & {"talks", "blockade", "shipping", "military", "escalation", "ceasefire", "sanctions", "tariffs"}:
+    low_cluster = cluster_text.lower()
+    if region_key == "general" and "israel" in actors and ({"lebanon", "hezbollah", "hamas"} & set(actors)):
+        region_key = "levant"
+    if "ceasefire" in themes and any(
+        marker in low_cluster
+        for marker in (
+            "ceasefire extended",
+            "truce extended",
+            "ceasefire extension",
+            "truce extension",
+            "extended by three weeks",
+            "extended by 3 weeks",
+            "ceasefire reached",
+            "truce reached",
+        )
+    ) and not (set(themes) & {"blockade", "shipping", "military", "escalation", "sanctions", "tariffs"}):
+        theme_key = "ceasefire_track"
+    elif "talks" in themes and any(
+        marker in low_cluster for marker in ("white house", "oval office", "press conference", "briefing", "remarks", "ambassador")
+    ) and not (set(themes) & {"blockade", "shipping", "military", "sanctions", "tariffs"}):
+        theme_key = "diplomatic_meeting"
+    elif set(themes) & {"talks", "blockade", "shipping", "military", "escalation", "ceasefire", "sanctions", "tariffs"}:
         theme_key = "escalation_chain"
     else:
         theme_key = "+".join(themes[:2]) or _topic_identity(event)
@@ -1480,9 +1896,27 @@ def _cluster_event_risk_items(items: list[dict]) -> list[dict]:
             directional_risk=directional_risk,
             interpretation=interpretation,
         )
+        regime_profile = _geopolitical_regime_profile(
+            {
+                "event": interpretation.get("event"),
+                "category": item.get("category"),
+                "phase": phase,
+                "impact": impact,
+                "directional_risk": directional_risk,
+                "summary": summary,
+                "drivers": drivers,
+                "confirmed_facts": interpretation.get("confirmed_facts") or [],
+                "anticipated_consequences": interpretation.get("anticipated_consequences") or [],
+                "realized_market_events": interpretation.get("realized_market_events") or [],
+                "recent_developments": interpretation.get("recent_developments") or [],
+                "cluster_themes": item.get("cluster_themes") or [],
+                "source_title": " ".join(item.get("_source_titles") or []),
+            }
+        )
         out.append(
             {
                 "event": interpretation.get("event"),
+                "source_title": " ".join(item.get("_source_titles") or []),
                 "category": item.get("category"),
                 "phase": phase,
                 "impact": impact,
@@ -1498,6 +1932,12 @@ def _cluster_event_risk_items(items: list[dict]) -> list[dict]:
                 "cluster_actors": item.get("cluster_actors") or [],
                 "cluster_locations": item.get("cluster_locations") or [],
                 "cluster_themes": item.get("cluster_themes") or [],
+                "regime_flags": regime_profile.get("regime_flags") or [],
+                "regime_severity": regime_profile.get("regime_severity") or "",
+                "regime_summary": regime_profile.get("regime_summary") or "",
+                "risk_asymmetry": regime_profile.get("risk_asymmetry") or "",
+                "continuation_mode": regime_profile.get("continuation_mode") or "",
+                "strictness": regime_profile.get("strictness") or "",
             }
         )
     return out
@@ -1563,21 +2003,32 @@ def _profile_implication(item: dict, *, profile: str) -> str:
     confirmed_facts = item.get("confirmed_facts") or []
     anticipated_consequences = item.get("anticipated_consequences") or []
     mixed_unresolved = bool(confirmed_facts and anticipated_consequences and phase in {"pre_event", "ongoing"})
+    regime_severity = _text(item.get("regime_severity")).lower()
+    if _text(item.get("category")) == "geopolitics" and regime_severity == "severe":
+        if profile == "day":
+            return (
+                "Риск исполнения: тяжёлый геополитический режим чувствителен к эскалации и несёт асимметричный downside-risk; "
+                "continuation допустим только тактически, нужен ретест/подтверждение, invalidation должен быть явным."
+            )
+        return (
+            "Режим: тяжёлый геополитический фон чувствителен к эскалации и несёт асимметричный downside-risk; "
+            "continuation допустим только тактически, пока не появится чистый путь к развязке."
+        )
     if profile == "day":
         if mixed_unresolved:
-            return "Execution: one component is confirmed, but the next escalation step is unresolved; avoid chasing first headlines."
+            return "Риск исполнения: один компонент уже подтверждён, но следующий шаг эскалации остаётся нерешённым; без погони за первыми заголовками."
         if phase in {"pre_event", "ongoing"}:
-            return "Execution: headline sensitivity is elevated; prefer confirmation over aggressive chasing."
+            return "Риск исполнения: чувствительность к заголовкам повышена; подтверждение важнее агрессивной погони."
         if directional_risk == "risk_on":
-            return "Execution: relief is possible, but confirmation still matters before chasing continuation."
-        return "Execution: volatility can stay elevated; react to confirmation instead of first-move momentum."
+            return "Риск исполнения: relief-сценарий возможен, но перед continuation всё равно нужен confirm."
+        return "Риск исполнения: волатильность может оставаться повышенной; лучше реагировать на confirm, а не на первый импульс."
     if mixed_unresolved:
-        return "Regime: confirmed deterioration keeps the backdrop fragile while the unresolved escalation path can still reshape the next 3-7 days."
+        return "Режим: подтверждённое ухудшение делает фон хрупким, а нерешённая траектория эскалации всё ещё может изменить ближайшие 3-7 дней."
     if phase in {"pre_event", "ongoing"}:
-        return "Regime: unresolved catalyst can destabilize the next 3–7 day risk regime."
+        return "Режим: нерешённый катализатор может дестабилизировать risk-regime на горизонте 3-7 дней."
     if directional_risk == "risk_on":
-        return "Regime: short-term relief can stabilize the backdrop, but follow-through still needs confirmation."
-    return "Regime: risk-on stability is weaker while the catalyst keeps a residual risk premium in the tape."
+        return "Режим: краткосрочный relief может стабилизировать фон, но follow-through всё ещё требует подтверждения."
+    return "Режим: устойчивость risk-on слабее, пока катализатор сохраняет в рынке остаточную премию за риск."
 
 
 def render_event_risk_context_section(snapshot, *, profile: str = "day") -> str:
@@ -1587,9 +2038,15 @@ def render_event_risk_context_section(snapshot, *, profile: str = "day") -> str:
         return ""
 
     profile_key = _text(profile).lower()
-    title = "⚡ Regime-changing catalysts" if profile_key == "mid" else "⚡ Event-risk catalysts"
+    title = "⚡ Катализаторы смены режима" if profile_key == "mid" else "⚡ Катализаторы событийного риска"
     max_items = 3 if profile_key == "mid" else 2
     lines = [title]
+    regime_layer = normalized.get("regime_layer") if isinstance(normalized.get("regime_layer"), dict) else {}
+    regime_summary = _text(regime_layer.get("summary"))
+    if regime_summary:
+        severity = _text(regime_layer.get("severity")) or "n/a"
+        driver = _text(regime_layer.get("driver")) or "n/a"
+        lines.append(f"- Слой режима [{severity} | {driver}]: {regime_summary}")
     for item in items[:max_items]:
         line = (
             f"- [{item.get('phase') or 'unknown'} | {item.get('impact') or 'n/a'} | "

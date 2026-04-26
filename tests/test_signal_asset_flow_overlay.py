@@ -2,12 +2,16 @@ import copy
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import get_signal_json
 
 
 class TestSignalAssetFlowOverlay(unittest.TestCase):
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
     def _base_signal(self, *, symbol: str = "ETH/USDT", side: str = "long", confidence: str = "Medium") -> dict:
         return {
             "time_msk": "12.04.2026, 12:00",
@@ -35,8 +39,10 @@ class TestSignalAssetFlowOverlay(unittest.TestCase):
         }
 
     def _v2_snapshot(self, *, asset_contexts: dict) -> dict:
+        now_iso = self._now_iso()
         return {
-            "timestamp_utc": "2026-04-12T09:00:00Z",
+            "timestamp_utc": now_iso,
+            "generated_at": now_iso,
             "mode": "observe_only",
             "market_context": {
                 "bias": "neutral",
@@ -238,6 +244,43 @@ class TestSignalAssetFlowOverlay(unittest.TestCase):
 
         self.assertEqual(d.get("entry_mode"), "wait_confirm")
         self.assertIn("squeeze_risk_short_crowded", d.get("warnings") or [])
+
+    def test_supportive_bullish_flow_remains_secondary_under_severe_geopolitical_regime(self) -> None:
+        d = self._base_signal(side="long", confidence="Medium")
+        d["event_risk_regime"] = {
+            "driver": "geopolitics",
+            "severity": "severe",
+            "summary": "Severe geopolitical regime remains unresolved.",
+        }
+        path = self._write_snapshot(
+            self._v2_snapshot(
+                asset_contexts={
+                    "ETH": {
+                        "asset": "ETH",
+                        "flow_derivatives_context": {
+                            "bias": "bullish",
+                            "confidence": 0.83,
+                            "crowding_state": "neutral",
+                            "exchange_pressure": "low",
+                            "stablecoin_support": "high",
+                            "unlock_pressure": "low",
+                            "drivers": ["stablecoin support is healthy"],
+                            "summary": "Supportive long flow.",
+                        },
+                    }
+                }
+            )
+        )
+
+        get_signal_json.apply_signal_asset_flow_overlay(d, path)
+
+        self.assertEqual(d.get("confidence"), "Medium")
+        self.assertEqual(d.get("entry_mode"), "wait_confirm")
+        self.assertTrue(bool((d.get("asset_flow_summary") or {}).get("secondary_to_geopolitical_regime")))
+        self.assertIn("flow_secondary_to_geopolitical_regime", d.get("warnings") or [])
+        display_lines = " ".join((d.get("flow_overlay") or {}).get("display_lines") or []).lower()
+        self.assertIn("secondary", display_lines)
+        self.assertIn("tactical-only", display_lines)
         self.assertFalse(bool(d.get("no_trade")))
 
     def test_mixed_or_neutral_flow_is_caution_only(self) -> None:
@@ -324,6 +367,34 @@ class TestSignalAssetFlowOverlay(unittest.TestCase):
         out = get_signal_json.read_signal_asset_flow_context("DOGE/USDT", path)
 
         self.assertEqual(out, {})
+
+    def test_stale_asset_flow_snapshot_is_ignored_for_signal_overlay(self) -> None:
+        d = self._base_signal(side="long", confidence="Medium")
+        before = copy.deepcopy(d)
+        payload = self._v2_snapshot(
+            asset_contexts={
+                "ETH": {
+                    "asset": "ETH",
+                    "flow_derivatives_context": {
+                        "bias": "bullish",
+                        "confidence": 0.82,
+                        "crowding_state": "neutral",
+                        "exchange_pressure": "low",
+                        "stablecoin_support": "high",
+                        "unlock_pressure": "low",
+                        "drivers": ["stablecoin support is healthy"],
+                        "summary": "Supportive long flow.",
+                    },
+                }
+            }
+        )
+        payload["generated_at"] = "2026-04-10T09:00:00Z"
+        payload["timestamp_utc"] = "2026-04-10T09:00:00Z"
+        path = self._write_snapshot(payload)
+
+        get_signal_json.apply_signal_asset_flow_overlay(d, path)
+
+        self.assertEqual(d, before)
 
 
 if __name__ == "__main__":

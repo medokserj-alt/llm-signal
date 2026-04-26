@@ -70,6 +70,29 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(item["directional_risk"], "risk_off")
         self.assertIn("Hormuz blockade was imposed", item["confirmed_facts"])
 
+    def test_local_hospital_assault_is_filtered_out_of_event_risk(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-04-26 09:15 МСК] [impact:−] Patient allegedly attacks several nurses, police and member of the public at Sydney hospital",
+            calendar_events=[],
+        )
+
+        self.assertEqual(snapshot.get("event_risk_context"), [])
+        self.assertEqual(render_event_risk_context_section(snapshot, profile="day"), "")
+
+    def test_crypto_etf_and_exchange_hack_headlines_remain_market_relevant(self) -> None:
+        news = "\n".join(
+            [
+                "- [2026-04-26 09:00 МСК] [impact:+] Spot Bitcoin ETF approval odds rise after SEC custody talks",
+                "- [2026-04-26 09:05 МСК] [impact:−] Major crypto exchange hack forces temporary withdrawal halt",
+            ]
+        )
+
+        snapshot = build_event_risk_context(news, calendar_events=[])
+        items = snapshot.get("event_risk_context") or []
+
+        self.assertEqual(len(items), 2)
+        self.assertTrue(all(item["category"] == "crypto_market_structure" for item in items))
+
     def test_day_renders_event_risk_block_when_context_exists(self) -> None:
         snapshot = build_event_risk_context(
             "- [2026-04-12 12:00 МСК] [impact:−] Exchange outage halts withdrawals as liquidation cascade accelerates",
@@ -93,6 +116,34 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertIn("⚡ Regime-changing catalysts", rendered)
         self.assertIn("geopolitics", rendered)
         self.assertIn("Regime:", rendered)
+
+    def test_white_house_ceasefire_talks_are_pre_event_and_not_merged_into_gulf_chain(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-04-23 18:13 МСК] [impact:neutral] Lebanon and Israel to resume rare direct talks in Washington to extend Israel-Hezbollah ceasefire",
+            calendar_events=[],
+        )
+        item = (snapshot.get("event_risk_context") or [])[0]
+
+        self.assertEqual(item["category"], "geopolitics")
+        self.assertEqual(item["phase"], "pre_event")
+        self.assertEqual(item["directional_risk"], "uncertain")
+        self.assertIn("Israel-Lebanon", item["event"])
+        self.assertNotIn("|gulf|", item.get("cluster_key") or "")
+        self.assertNotEqual(item.get("cluster_key"), "geopolitics|gulf|escalation_chain")
+
+    def test_ceasefire_extension_is_risk_on_and_stays_outside_hormuz_cluster(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-04-24 03:45 МСК] [impact:neutral] Lebanon-Israel ceasefire extended by 3 weeks after Oval Office meeting",
+            calendar_events=[],
+        )
+        item = (snapshot.get("event_risk_context") or [])[0]
+
+        self.assertEqual(item["category"], "geopolitics")
+        self.assertEqual(item["phase"], "post_event")
+        self.assertEqual(item["directional_risk"], "risk_on")
+        self.assertIn("ceasefire was extended", " ".join(item.get("confirmed_facts") or []).lower())
+        self.assertNotIn("|gulf|", item.get("cluster_key") or "")
+        self.assertNotEqual(item.get("cluster_key"), "geopolitics|gulf|escalation_chain")
 
     def test_no_fake_event_risk_block_when_no_relevant_event_exists(self) -> None:
         snapshot = build_event_risk_context(
@@ -282,6 +333,35 @@ class TestEventRiskContextLayer(unittest.TestCase):
         ctx = d.get("day_mid_context") or {}
         self.assertEqual([item["phase"] for item in ctx.get("event_risk_context") or []], ["pre_event", "post_event"])
         self.assertEqual(d.get("event_risk_context_timestamp_utc"), "2026-04-12T16:00:00Z")
+
+    def test_generic_severe_geopolitical_bundle_elevates_regime_layer_and_hardens_rendering(self) -> None:
+        news = "\n".join(
+            [
+                "- [2026-04-12 08:00 МСК] [impact:neutral] Border ceasefire remains fragile as diplomats warn the truce may collapse",
+                "- [2026-04-12 08:10 МСК] [impact:−] Negotiations continue without agreement while officials threaten renewed military action",
+                "- [2026-04-12 08:20 МСК] [impact:−] Public statements raise escalation risk and keep downside shock sensitivity elevated",
+            ]
+        )
+
+        snapshot = build_event_risk_context(news, calendar_events=[])
+        regime_layer = snapshot.get("regime_layer") or {}
+        item = (snapshot.get("event_risk_context") or [])[0]
+        rendered_day = render_event_risk_context_section(snapshot, profile="day")
+        rendered_mid = render_event_risk_context_section(snapshot, profile="mid")
+
+        self.assertEqual(regime_layer.get("driver"), "geopolitics")
+        self.assertEqual(regime_layer.get("severity"), "severe")
+        self.assertIn("ceasefire_at_risk", regime_layer.get("flags") or [])
+        self.assertIn("diplomatic_breakdown_risk", regime_layer.get("flags") or [])
+        self.assertIn("renewed_military_action_threat", regime_layer.get("flags") or [])
+        self.assertIn(item.get("regime_severity"), {"high", "severe"})
+        self.assertIn("asymmetric downside shock risk", regime_layer.get("summary") or "")
+        self.assertIn("Regime layer [severe | geopolitics]", rendered_day)
+        self.assertIn("asymmetric downside shock risk", rendered_day)
+        self.assertIn("tactical-only", rendered_day)
+        self.assertIn("tactical-only", rendered_mid)
+        self.assertNotIn("Iran", rendered_day)
+        self.assertNotIn("Hormuz", rendered_day)
 
 
 if __name__ == "__main__":

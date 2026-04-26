@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -575,6 +576,65 @@ class TestTgBotRouting(unittest.TestCase):
 
     def test_bot_pool_is_fixed_to_agreed_five_assets(self) -> None:
         self.assertEqual(self.tg_bot.SYMBOLS, ["BTC", "ETH", "BNB", "SOL", "XRP"])
+
+    def test_short_day_report_is_sent_as_single_message(self) -> None:
+        context = _FakeContext()
+        self.tg_bot.make_header = lambda title: f"{title} • 25.04.2026 14:51"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            (report_dir / "analysis_20260425_145100.md").write_text(
+                "1️⃣ Режим дня\n\n2️⃣ Кандидаты на сегодня",
+                encoding="utf-8",
+            )
+            asyncio.run(self.tg_bot._post_report("day", "🗓", context, -1001, report_dir))
+
+        self.assertEqual(len(context.bot.calls), 2)
+        self.assertIn("🗓 DAY • 25.04.2026 14:51", context.bot.calls[1]["text"])
+        self.assertNotIn("part 1/2", context.bot.calls[1]["text"])
+
+    def test_long_mid_report_is_split_into_appendix_messages(self) -> None:
+        context = _FakeContext()
+        self.tg_bot.make_header = lambda title: f"{title} • 25.04.2026 14:51"
+        self.tg_bot.REPORT_TELEGRAM_MAX_LEN = 120
+        long_body = "\n\n".join(
+            [
+                "1️⃣ Среднесрочный режим 3–7 дней " + ("A" * 40),
+                "2️⃣ Главные драйверы " + ("B" * 40),
+                "🗓 Events\n- Event one\n- Event two",
+                "⚡ Regime catalysts\n- Catalyst one\n- Catalyst two",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            (report_dir / "analysis_20260425_145100.md").write_text(long_body, encoding="utf-8")
+            asyncio.run(self.tg_bot._post_report("mid", "📰", context, -1001, report_dir))
+
+        self.assertGreaterEqual(len(context.bot.calls), 3)
+        report_calls = context.bot.calls[1:]
+        self.assertIn("part 1/", report_calls[0]["text"])
+        self.assertIn("appendix", report_calls[-1]["text"])
+        self.assertTrue(all(len(call["text"]) <= 160 for call in report_calls))
+        joined = "\n".join(call["text"] for call in report_calls)
+        self.assertIn("⚡ Regime catalysts", joined)
+
+    def test_report_splitter_uses_section_boundaries(self) -> None:
+        self.tg_bot.REPORT_TELEGRAM_MAX_LEN = 80
+        chunks = self.tg_bot._split_text_for_telegram_sections(
+            "\n\n".join(
+                [
+                    "Section Alpha " + ("A" * 20),
+                    "Section Beta " + ("B" * 20),
+                    "Section Gamma " + ("C" * 20),
+                ]
+            ),
+            max_len=80,
+        )
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk.startswith("Section ") for chunk in chunks))
+        self.assertTrue(all(not chunk.endswith(" ") for chunk in chunks))
 
 
 if __name__ == "__main__":
