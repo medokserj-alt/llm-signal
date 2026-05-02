@@ -163,13 +163,19 @@ class TestTgBotRouting(unittest.TestCase):
                 }
             },
             "672885732": {
-                "channels": {
-                    "main_chat_id": -1003493070625,
-                }
+                "route": "shared_v3_mixed",
             },
             "177651027": {
                 "route": "shared_v3_mixed",
             },
+            "8556231754": {
+                "channels": {
+                    "main_chat_id": -1003493070625,
+                }
+            },
+        }
+        self.tg_bot.GLOBAL_SETTINGS = {
+            "lock_timeout_sec": 120,
         }
         self.tg_bot.SUBSCRIBERS = {82052103, 177651027, 5278300959, 7879055214}
 
@@ -289,15 +295,15 @@ class TestTgBotRouting(unittest.TestCase):
             "aia_no_trade_calls": aia_no_trade_calls,
         }
 
-    def test_enzo_routes_only_to_dedicated_channel(self) -> None:
+    def test_enzo_routes_only_to_sergey_channel(self) -> None:
         self.assertEqual(
             self.tg_bot.get_main_publication_targets(6308066297),
             [-1003492385200],
         )
 
-    def test_dima_routes_only_to_dedicated_channel(self) -> None:
+    def test_dantist_routes_only_to_dima_channel(self) -> None:
         self.assertEqual(
-            self.tg_bot.get_main_publication_targets(672885732),
+            self.tg_bot.get_main_publication_targets(8556231754),
             [-1003493070625],
         )
 
@@ -307,13 +313,19 @@ class TestTgBotRouting(unittest.TestCase):
             [-1003530482991],
         )
 
+    def test_default_user_without_explicit_mapping_uses_shared_channel(self) -> None:
+        self.assertEqual(
+            self.tg_bot.get_main_publication_targets(999999999),
+            [-1003530482991],
+        )
+
     def test_subscribers_do_not_affect_main_signal_routing(self) -> None:
-        self.tg_bot._get_core_user_targets = lambda: [6308066297, 672885732, 177651027]
+        self.tg_bot._get_core_user_targets = lambda: [6308066297, 8556231754, 177651027]
         self.assertEqual(
             self.tg_bot.get_core_broadcast_targets(),
             [-1003530482991, -1003493070625, -1003492385200],
         )
-        self.tg_bot.SUBSCRIBERS.update({6308066297, 672885732, 999999999})
+        self.tg_bot.SUBSCRIBERS.update({6308066297, 8556231754, 999999999})
         self.assertEqual(
             self.tg_bot.get_core_broadcast_targets(),
             [-1003530482991, -1003493070625, -1003492385200],
@@ -337,22 +349,25 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertIn("Статус: paid", texts)
         self.assertIn("📋 Главное меню", texts)
 
-    def test_enzo_main_signal_publishes_once_to_dedicated_channel(self) -> None:
+    def test_enzo_main_signal_publishes_once_to_sergey_channel(self) -> None:
         result = self._run_symbol_publish(6308066297)
         self.assertEqual(
             [call["chat_id"] for call in result["context"].bot.calls],
             [-1003492385200],
         )
         self.assertEqual(
-            [event["event"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
-            ["telegram_publish"],
+            [event["target_chat_id"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
+            [-1003492385200],
         )
         self.assertEqual(len(result["aia_signal_calls"]), 1)
         self.assertEqual(result["aia_signal_calls"][0][1]["target_chat_id"], -1003492385200)
         self.assertEqual(result["aia_signal_calls"][0][1]["source"], "tg_bot.py:_run_symbol_core")
+        self.assertEqual(result["aia_signal_calls"][0][0]["origin_chat_id"], -1003492385200)
+        self.assertEqual(result["aia_signal_calls"][0][0]["origin_user_id"], 6308066297)
+        self.assertEqual(result["aia_signal_calls"][0][0]["publish_targets"], [-1003492385200])
 
-    def test_dima_main_signal_publishes_once_to_dedicated_channel(self) -> None:
-        result = self._run_symbol_publish(672885732, symbol="ETH/USDT")
+    def test_dantist_main_signal_publishes_once_to_dima_channel(self) -> None:
+        result = self._run_symbol_publish(8556231754, symbol="ETH/USDT")
         self.assertEqual(
             [call["chat_id"] for call in result["context"].bot.calls],
             [-1003493070625],
@@ -361,6 +376,13 @@ class TestTgBotRouting(unittest.TestCase):
             [event["target_chat_id"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
             [-1003493070625],
         )
+        self.assertEqual(len(result["aia_signal_calls"]), 1)
+        payload, meta = result["aia_signal_calls"][0]
+        self.assertEqual(meta["target_chat_id"], -1003493070625)
+        self.assertEqual(payload["channel_id"], -1003493070625)
+        self.assertEqual(payload["origin_chat_id"], -1003493070625)
+        self.assertEqual(payload["origin_user_id"], 8556231754)
+        self.assertEqual(payload["publish_targets"], [-1003493070625])
 
     def test_shared_route_user_publishes_once_to_shared_channel(self) -> None:
         result = self._run_symbol_publish(177651027, symbol="SOL/USDT")
@@ -372,6 +394,24 @@ class TestTgBotRouting(unittest.TestCase):
             [event["target_chat_id"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
             [-1003530482991],
         )
+
+    def test_default_route_user_publishes_once_to_shared_channel_and_marks_origin_user(self) -> None:
+        result = self._run_symbol_publish(672885732, symbol="SOL/USDT")
+        self.assertEqual(
+            [call["chat_id"] for call in result["context"].bot.calls],
+            [-1003530482991],
+        )
+        self.assertEqual(
+            [event["target_chat_id"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
+            [-1003530482991],
+        )
+        self.assertEqual(len(result["aia_signal_calls"]), 1)
+        payload, meta = result["aia_signal_calls"][0]
+        self.assertEqual(meta["target_chat_id"], -1003530482991)
+        self.assertEqual(payload["channel_id"], -1003530482991)
+        self.assertEqual(payload["origin_chat_id"], -1003530482991)
+        self.assertEqual(payload["origin_user_id"], 672885732)
+        self.assertEqual(payload["publish_targets"], [-1003530482991])
 
     def test_post_init_does_not_start_core_watcher_by_default(self) -> None:
         created = []
@@ -409,7 +449,10 @@ class TestTgBotRouting(unittest.TestCase):
         result = self._run_full_publish(6308066297, first_part="📌 Сигнал не выдан\n\nwait")
 
         self.assertEqual(len(result["context"].bot.calls), 1)
-        self.assertEqual(result["context"].bot.calls[0]["chat_id"], -1003492385200)
+        self.assertEqual(
+            [call["chat_id"] for call in result["context"].bot.calls],
+            [-1003492385200],
+        )
         self.assertIn("📌 Сигнал не выдан", result["context"].bot.calls[0]["text"])
         self.assertNotIn("LLM Full анализ", result["context"].bot.calls[0]["text"])
 
@@ -417,8 +460,8 @@ class TestTgBotRouting(unittest.TestCase):
         result = self._run_full_publish(6308066297, first_part="BTC/USDT signal body")
 
         self.assertEqual(
-            [event["event"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
-            ["telegram_publish"],
+            [event["target_chat_id"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
+            [-1003492385200],
         )
         self.assertEqual(len(result["aia_signal_calls"]), 1)
         payload, meta = result["aia_signal_calls"][0]
@@ -426,12 +469,18 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertEqual(meta["source"], "tg_bot.py:_run_full_core")
         self.assertEqual(payload["symbol"], "BTC/USDT")
         self.assertEqual(payload["channel_id"], -1003492385200)
+        self.assertEqual(payload["origin_chat_id"], -1003492385200)
+        self.assertEqual(payload["origin_user_id"], 6308066297)
+        self.assertEqual(payload["publish_targets"], [-1003492385200])
 
     def test_single_mode_skips_separate_analysis_header_publish(self) -> None:
         result = self._run_symbol_publish(6308066297, symbol="SOL/USDT")
 
         self.assertEqual(len(result["context"].bot.calls), 1)
-        self.assertEqual(result["context"].bot.calls[0]["chat_id"], -1003492385200)
+        self.assertEqual(
+            [call["chat_id"] for call in result["context"].bot.calls],
+            [-1003492385200],
+        )
         self.assertIn("SOL/USDT signal body", result["context"].bot.calls[0]["text"])
         self.assertNotIn("📝 Анализ SOL/USDT", result["context"].bot.calls[0]["text"])
 

@@ -173,6 +173,28 @@ class TestTp1MinMoveGuard(unittest.TestCase):
         self.assertIn("invalid_mode_setup", out.get("no_trade_reasons") or [])
         self.assertNotIn("tp1_below_min_move", out.get("no_trade_reasons") or [])
 
+    def test_tp1_min_move_guard_uses_trader_facing_hint_when_blocked(self) -> None:
+        d = {
+            "no_trade": False,
+            "mode": "neutral",
+            "symbol": "BTC/USDT",
+            "side": "long",
+            "entry_price_neutral": 100.0,
+            "sl_by_mode": {"neutral": 99.0},
+            "tp_by_mode": {"neutral": {"tvh1": 100.4}},
+            "no_trade_reasons": [],
+            "no_trade_hint": "",
+            "warnings": [],
+        }
+
+        with patch.object(get_signal_json, "restore_mode_target_ladder", side_effect=lambda payload: payload):
+            out = get_signal_json.apply_tp1_min_move_guard(d)
+
+        self.assertTrue(bool(out.get("no_trade")))
+        self.assertIn("слишком близко к ближайшим целям", out.get("no_trade_hint") or "")
+        self.assertIn("нужен либо откат", (out.get("no_trade_hint") or "").lower())
+        self.assertNotIn("snapshot", out.get("no_trade_hint") or "")
+
     def test_postprocess_full_last_restores_targets_on_final_payload(self) -> None:
         old_base = postprocess_full_last.BASE
         try:

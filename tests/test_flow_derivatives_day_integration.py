@@ -120,6 +120,23 @@ class TestFlowDerivativesDayIntegration(unittest.TestCase):
         self.assertNotIn("Примечание:", rendered)
         self.assertNotIn("Summary:", rendered)
 
+    def test_day_compact_render_includes_stablecoin_layer_and_support_when_live(self) -> None:
+        snapshot = self._snapshot()
+        snapshot["coverage"]["stablecoin_flows"] = {"source": "live"}
+        snapshot["market_context"]["stablecoin_support"] = "medium"
+
+        rendered = get_signal_json.render_flow_derivatives_context_section(
+            snapshot,
+            signal_payload={"symbol": "APT/USDT"},
+            detail_level="day_compact",
+        )
+
+        self.assertIn(
+            "Покрытие: derivatives live 5/5; stablecoin live; exchange/tokenomics unavailable",
+            rendered,
+        )
+        self.assertIn("stablecoin_support=medium", rendered)
+
     def test_debug_detail_level_keeps_detailed_day_render(self) -> None:
         rendered = get_signal_json.render_flow_derivatives_context_section(
             self._snapshot(),

@@ -93,6 +93,25 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(len(items), 2)
         self.assertTrue(all(item["category"] == "crypto_market_structure" for item in items))
 
+    def test_stablecoin_adoption_headline_is_not_high_macro_policy_shock(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-04-26 09:00 МСК] [impact:neutral] Central Bank of Brazil: Stablecoins Dominate Over $6.9 Billion Crypto Purchases Registered in Q1",
+            calendar_events=[],
+        )
+        item = (snapshot.get("event_risk_context") or [])[0]
+
+        self.assertEqual(item["category"], "crypto_market_structure")
+        self.assertEqual(item["impact"], "medium")
+        self.assertEqual(item["directional_risk"], "mixed")
+        self.assertIn("рост использования стейблкоинов", item["summary"])
+        self.assertIn("тему крипто-ликвидности", item["summary"])
+        self.assertNotIn("немедленный риск исполнения", item["summary"])
+        self.assertNotIn("принудительные потоки", item["summary"])
+
+        rendered = render_event_risk_context_section(snapshot, profile="day")
+        self.assertIn("рост использования стейблкоинов", rendered)
+        self.assertNotIn("принудительные потоки", rendered)
+
     def test_day_renders_event_risk_block_when_context_exists(self) -> None:
         snapshot = build_event_risk_context(
             "- [2026-04-12 12:00 МСК] [impact:−] Exchange outage halts withdrawals as liquidation cascade accelerates",

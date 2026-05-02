@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import tg_bot as _tg_bot_mod
 from tg_bot import (
     ALLOWED_UIDS,
     FALLBACK_CHANNEL,
@@ -23,6 +24,42 @@ from tg_bot import (
 )
 
 LAST_JSON_PATH = Path(__file__).resolve().parent / "logs" / "last.json"
+
+
+def _normalize_chat_id_list(raw) -> list[int]:
+    helper = getattr(_tg_bot_mod, "_normalize_chat_id_list", None)
+    if callable(helper):
+        return helper(raw)
+    if isinstance(raw, str):
+        items = raw.replace(";", ",").split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = [raw]
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        if isinstance(item, bool) or item is None:
+            continue
+        if isinstance(item, int):
+            value = int(item)
+        else:
+            s = str(item).strip()
+            if not s or not s.lstrip("-").isdigit():
+                continue
+            value = int(s)
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _get_main_fanout_targets(primary_chat_id: int | None) -> list[int]:
+    helper = getattr(_tg_bot_mod, "_get_main_fanout_targets", None)
+    if callable(helper):
+        return helper(primary_chat_id)
+    return []
 
 
 def _channel_sort_key(record: dict) -> int:
@@ -121,6 +158,15 @@ def _resolve_channel_id(last_payload: dict | None = None):
     return None
 
 
+def _resolve_publish_targets(channel_id: int | None, last_payload: dict | None) -> list[int]:
+    existing = _normalize_chat_id_list(last_payload.get("publish_targets")) if isinstance(last_payload, dict) else []
+    if existing:
+        return existing
+    if channel_id is None:
+        return []
+    return [channel_id]
+
+
 def _persist_final_signal_payload(signal_json_v1: dict, *, last_json_path: Path | None = None) -> None:
     if not isinstance(signal_json_v1, dict):
         return
@@ -190,6 +236,7 @@ def main() -> int:
         channel_id = _resolve_channel_id(last_payload)
     except TypeError:
         channel_id = _resolve_channel_id()
+    publish_targets = _resolve_publish_targets(channel_id, last_payload)
 
     if _is_no_trade_last_json(last_payload):
         print("send_signal_to_aia(full): SKIP (NO_TRADE)")
@@ -199,6 +246,8 @@ def main() -> int:
         signal_id=signal_id,
         published_at=published_at,
         channel_id=channel_id,
+        origin_chat_id=channel_id,
+        publish_targets=publish_targets,
         symbol_hint=None,
         last_payload=last_payload,
         last_json_path=last_json_path,

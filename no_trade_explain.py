@@ -121,6 +121,27 @@ def _infer_primary_no_trade_reason_key(d: dict) -> str:
     return "no_setup"
 
 
+def _effective_user_hint(d: dict) -> str:
+    hint = str(d.get("no_trade_hint") or "").strip()
+    if not hint:
+        return ""
+    low = hint.lower()
+    if low in {
+        "time_window",
+        "risk_off",
+        "invalid_mode_setup",
+        "mode_disabled",
+        "counter_trend_neutral_forbidden",
+        "neutral_continuation_unstable_forbidden",
+        "flush_reversal_neutral_forbidden",
+        "flush_knife_aggressive_extreme",
+        "us_open_block_non_aggressive",
+        "insufficient_ohlcv_for_ema_fan",
+    }:
+        return ""
+    return hint
+
+
 def _infer_mode_reject_reason_key(d: dict, mode: str) -> str:
     tags = _disabled_by_tags(d, mode)
     if tags:
@@ -176,9 +197,9 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
     if low == "risk_off":
         return "режим risk-off (повышенный риск рынка)"
     if low == "low_rr":
-        return "недостаточный R:R для режима"
+        return "цели слишком близко, поэтому вход не даёт нормального запаса по потенциалу и R:R"
     if low == "tp1_below_min_move":
-        return "TP1 не даёт минимального чистого движения 1% от entry"
+        return "рынок уже слишком близко к ближайшим целям, и первая цель не даёт нормального запаса хода"
     if low == "invalid_mode_setup":
         return "неполные/некорректные уровни для режима"
     if low == "mode_disabled":
@@ -329,9 +350,9 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
     if low == "upcoming_high_impact_event_conservative_block":
         return "активно окно high-impact события; в conservative новые сделки не открываем до завершения event window."
     if low == "low_rr":
-        return "недостаточный R:R при текущем входе/SL/целях."
+        return "рынок уже слишком близко к ближайшим целям, поэтому вход не даёт нормального запаса по потенциалу и R:R."
     if low == "tp1_below_min_move":
-        return "TP1 даёт меньше 1% чистого движения от entry; без следующего подтверждённого уровня такой сетап не публикуем."
+        return "цена уже подошла слишком близко к ближайшим целям/сопротивлениям, поэтому первая цель не даёт нормального запаса хода."
     if low == "invalid_mode_setup":
         return "некорректные/неполные уровни для выбранного режима (SL/TP/RR)."
     if low == "mode_disabled":
@@ -341,7 +362,7 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
     if low == "no_setup":
         return "недостаточно надёжного сетапа по текущей структуре."
     if low == "no_trade_hint":
-        return "условия входа сейчас не соответствуют требованиям стратегии."
+        return "условия входа сейчас не дают достаточно качественного и безопасного сетапа."
     if low == "conservative_requires_mid_bias":
         return "для conservative требуется явный MID bias (long/short); при нейтрали MID — сделку пропускаем."
     if low == "conservative_day_mid_conflict":
@@ -384,9 +405,9 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
         if low == "upcoming_high_impact_event_conservative_block":
             add("– Дождаться завершения окна high-impact события; для conservative вход возможен только после него.")
         if low == "low_rr":
-            add("– Улучшить R:R: более выгодный вход (глубже откат) или более понятная цель без роста риска.")
+            add("– Нужен либо откат к более выгодной зоне входа, либо расширение диапазона/подтверждённый пробой, чтобы снова появился нормальный запас до целей.")
         if low == "tp1_below_min_move":
-            add("– Нужен следующий подтверждённый уровень, который даёт минимум 1% движения от entry; без выдумывания цели.")
+            add("– Нужен либо откат к более выгодной зоне входа, либо расширение диапазона/подтверждённый пробой, чтобы снова появился нормальный запас до целей.")
         if low == "ema_guard_below_both_long":
             add("– Для LONG: цена должна закрепиться выше EMA20(M15) и EMA20(H1).")
         if low == "ema_guard_above_both_short":
@@ -439,8 +460,10 @@ def format_no_trade_message(d: dict) -> str:
         m0 = normalize_mode(first.get("mode"))
         r0 = str(first.get("reason") or "").strip()
         cat0 = classify_reason(r0)
+        user_hint = _effective_user_hint(d) if r0 == "no_trade_hint" else ""
+        detail0 = user_hint or _reason_to_user_text(r0, m0)
         lines.append(
-            f"• {MODE_LABELS_RU.get(m0,'Режим')} режим отклонён: {_reason_to_user_text(r0, m0)} ({cat0})."
+            f"• {MODE_LABELS_RU.get(m0,'Режим')} режим отклонён: {detail0} ({cat0})."
         )
         if r0 in {"upcoming_high_impact_event_neutral_block", "upcoming_high_impact_event_conservative_block"}:
             hint = str(d.get("no_trade_hint") or "").strip()

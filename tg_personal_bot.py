@@ -100,6 +100,7 @@ PERSONAL_SIGNAL_STATE_PATH = Path(
 )
 PARAMS_PATH = PROJECT_ROOT / "params.json"
 PINNED_STATE_PATH = PROJECT_ROOT / "pinned_state.json"
+SHARED_MAIN_ROUTE_KEY = "shared_v3_mixed"
 USER_CONFIG = {}
 GLOBAL_SETTINGS = {"lock_timeout_sec": 120}
 VALID_MODES = {"aggressive", "neutral", "conservative"}
@@ -304,8 +305,124 @@ load_subscriptions()
 def get_user_cfg(uid:int):
     return USER_CONFIG.get(str(uid))
 
+def _normalize_chat_id(raw) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s and s.lstrip("-").isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return None
+    return None
+
+def _normalize_chat_id_list(raw) -> list[int]:
+    if isinstance(raw, str):
+        items = raw.replace(";", ",").split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = [raw]
+    out: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        chat_id = _normalize_chat_id(item)
+        if chat_id is None or chat_id in seen:
+            continue
+        seen.add(chat_id)
+        out.append(chat_id)
+    return out
+
+def _global_setting_chat_ids(setting_key: str, *, env_key: str | None = None) -> list[int]:
+    values = _normalize_chat_id_list(GLOBAL_SETTINGS.get(setting_key))
+    if values:
+        return values
+    if env_key:
+        return _normalize_chat_id_list(os.getenv(env_key))
+    return []
+
+def _get_main_fanout_targets(primary_chat_id: int | None) -> list[int]:
+    if primary_chat_id is None:
+        return []
+    target_ids = _global_setting_chat_ids(
+        "main_fanout_chat_ids",
+        env_key="TELEGRAM_MAIN_FANOUT_CHAT_IDS",
+    )
+    if not target_ids:
+        return []
+    source_ids = _global_setting_chat_ids(
+        "main_fanout_source_chat_ids",
+        env_key="TELEGRAM_MAIN_FANOUT_SOURCE_CHAT_IDS",
+    )
+    if source_ids and primary_chat_id not in source_ids:
+        return []
+    return [chat_id for chat_id in target_ids if chat_id != primary_chat_id]
+
+def _get_user_channels(cfg: dict | None) -> dict:
+    if not isinstance(cfg, dict):
+        return {}
+    channels = cfg.get("channels")
+    return channels if isinstance(channels, dict) else {}
+
+def get_shared_main_chat_id() -> int | None:
+    return _normalize_chat_id(_get_user_channels(USER_CONFIG.get(SHARED_MAIN_ROUTE_KEY)).get("main_chat_id"))
+
+def _get_user_route_key(cfg: dict | None) -> str | None:
+    if not isinstance(cfg, dict):
+        return None
+    for key in ("route", "shared_route", "routing_key", "main_route"):
+        raw = cfg.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    routing = cfg.get("routing")
+    if isinstance(routing, dict):
+        for key in ("main", "route", "key"):
+            raw = routing.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+    return None
+
+def is_shared_main_route_uid(uid: int) -> bool:
+    cfg = USER_CONFIG.get(str(uid))
+    if not isinstance(cfg, dict):
+        return get_shared_main_chat_id() is not None
+    route_key = _get_user_route_key(cfg)
+    if route_key == SHARED_MAIN_ROUTE_KEY:
+        return True
+    shared_chat_id = get_shared_main_chat_id()
+    direct_chat_id = _normalize_chat_id(_get_user_channels(cfg).get("main_chat_id"))
+    return shared_chat_id is not None and direct_chat_id == shared_chat_id
+
+def get_main_publication_chat_id(uid: int) -> int | None:
+    cfg = USER_CONFIG.get(str(uid))
+    if not isinstance(cfg, dict):
+        shared_chat_id = get_shared_main_chat_id()
+        if shared_chat_id is not None:
+            return shared_chat_id
+        return _normalize_chat_id(FALLBACK_CHANNEL)
+    if is_shared_main_route_uid(uid):
+        shared_chat_id = get_shared_main_chat_id()
+        if shared_chat_id is not None:
+            return shared_chat_id
+    direct_chat_id = _normalize_chat_id(_get_user_channels(cfg).get("main_chat_id"))
+    if direct_chat_id is not None:
+        return direct_chat_id
+    shared_chat_id = get_shared_main_chat_id()
+    if shared_chat_id is not None:
+        return shared_chat_id
+    return _normalize_chat_id(FALLBACK_CHANNEL)
+
 def get_main_chat_id(uid:int):
     return uid
+
+def get_main_publication_targets(uid: int) -> list[int]:
+    primary = get_main_publication_chat_id(uid)
+    if primary is None:
+        return []
+    return [primary]
 
 def get_all_main_channels() -> list[int]:
     out: set[int] = set()
@@ -880,7 +997,15 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
     _append_unique_rule(rules, {"type": "deadline_minutes", "value": int(max_wait_minutes)})
     return {"version": 1, "rules": rules}
 
-def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symbol_hint: str | None = None) -> dict | None:
+def _build_signal_json_v1(
+    *,
+    signal_id: str,
+    published_at: str,
+    channel_id,
+    origin_chat_id=None,
+    publish_targets: list[int] | None = None,
+    symbol_hint: str | None = None,
+) -> dict | None:
     d = _read_last_signal_json()
     if not isinstance(d, dict):
         return None
@@ -909,6 +1034,14 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
             channel_id = int(channel_id.strip())
     except Exception:
         pass
+    origin_user_id = None
+    origin_chat_id = _normalize_chat_id(origin_chat_id)
+    if origin_chat_id is None:
+        origin_chat_id = _normalize_chat_id(channel_id)
+    publish_targets = _normalize_chat_id_list(publish_targets)
+    normalized_channel_id = _normalize_chat_id(channel_id)
+    if not publish_targets and normalized_channel_id is not None:
+        publish_targets = [normalized_channel_id]
 
     mode = "neutral"
     meta = None
@@ -926,6 +1059,7 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         if uid is None and isinstance(_AIA_UID_CONTEXT, int):
             uid = _AIA_UID_CONTEXT
 
+        origin_user_id = uid
         mode = get_user_mode(uid) if isinstance(uid, int) else "neutral"
 
         raw_entry_mode = d.get("entry_mode")
@@ -1072,6 +1206,12 @@ def _build_signal_json_v1(*, signal_id: str, published_at: str, channel_id, symb
         "published_at": str(published_at),
         "channel_id": channel_id,
     }
+    if origin_user_id is not None:
+        out["origin_user_id"] = origin_user_id
+    if origin_chat_id is not None:
+        out["origin_chat_id"] = origin_chat_id
+    if publish_targets:
+        out["publish_targets"] = publish_targets
     if entry_price is not None:
         out["entry_price"] = float(entry_price)
     if meta is not None:
@@ -1194,7 +1334,13 @@ def _extract_no_trade_reason_text(tg_text: str) -> str:
     return out
 
 def _build_no_trade_decision_payload(
-    uid: int, *, tg_text: str, symbol_hint: str | None, channel_id: int
+    uid: int,
+    *,
+    tg_text: str,
+    symbol_hint: str | None,
+    channel_id: int,
+    origin_chat_id: int | None = None,
+    publish_targets: list[int] | None = None,
 ) -> dict | None:
     last = _read_last_signal_json() or {}
     asset = (symbol_hint or last.get("symbol") or last.get("asset"))
@@ -1229,7 +1375,7 @@ def _build_no_trade_decision_payload(
     if not reason_text:
         reason_text = "NO_TRADE"
 
-    return {
+    payload = {
         "channel_id": channel_id,
         "signal_candidate": {"asset": str(asset), "direction": direction, "mode": mode},
         "reason_code": reason_code,
@@ -1238,6 +1384,14 @@ def _build_no_trade_decision_payload(
         "entry_type": entry_type,
         "evaluated_at": _utc_now_z(),
     }
+    payload["origin_user_id"] = uid
+    normalized_origin = _normalize_chat_id(origin_chat_id)
+    normalized_targets = _normalize_chat_id_list(publish_targets)
+    if normalized_origin is not None:
+        payload["origin_chat_id"] = normalized_origin
+    if normalized_targets:
+        payload["publish_targets"] = normalized_targets
+    return payload
 
 async def _is_chat_admin_or_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not update.effective_user:
@@ -1658,7 +1812,8 @@ async def handle_full(update,context):
 
     touch_request(uid)
     msg = await update.message.reply_text("Готовлю FULL… ⏳")
-    target = get_main_chat_id(uid)
+    target = get_main_publication_chat_id(uid)
+    main_targets = get_main_publication_targets(uid)
     targets = get_signal_targets(uid)
 
     if not acquire_gen_lock():
@@ -1684,7 +1839,12 @@ async def handle_full(update,context):
                 if "📌 Сигнал не выдан" in part0:
                     if target is not None:
                         payload = _build_no_trade_decision_payload(
-                            uid, tg_text=part0, symbol_hint=None, channel_id=target
+                            uid,
+                            tg_text=part0,
+                            symbol_hint=None,
+                            channel_id=target,
+                            origin_chat_id=target,
+                            publish_targets=main_targets,
                         )
                         if payload and _should_send_to_aia_for_target(target):
                             asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
@@ -1702,6 +1862,8 @@ async def handle_full(update,context):
                             signal_id=signal_id,
                             published_at=published_at,
                             channel_id=target,
+                            origin_chat_id=target,
+                            publish_targets=main_targets,
                             symbol_hint=None,
                         )
                         if sig_v1 and _should_send_to_aia_for_target(target):
@@ -1795,7 +1957,8 @@ async def handle_symbol(update,context):
 
     symbol = f"{sym}/USDT"
     msg = await update.message.reply_text(f"Готовлю сигнал по {symbol}… ⏳")
-    target = get_main_chat_id(uid)
+    target = get_main_publication_chat_id(uid)
+    main_targets = get_main_publication_targets(uid)
     targets = get_signal_targets(uid)
 
     if is_gen_locked():
@@ -1828,7 +1991,12 @@ async def handle_symbol(update,context):
                 if "📌 Сигнал не выдан" in part0:
                     if target is not None:
                         payload = _build_no_trade_decision_payload(
-                            uid, tg_text=part0, symbol_hint=symbol, channel_id=target
+                            uid,
+                            tg_text=part0,
+                            symbol_hint=symbol,
+                            channel_id=target,
+                            origin_chat_id=target,
+                            publish_targets=main_targets,
                         )
                         if payload and _should_send_to_aia_for_target(target):
                             asyncio.create_task(_send_no_trade_decision_to_aia_background(payload))
@@ -1846,6 +2014,8 @@ async def handle_symbol(update,context):
                             signal_id=signal_id,
                             published_at=published_at,
                             channel_id=target,
+                            origin_chat_id=target,
+                            publish_targets=main_targets,
                             symbol_hint=symbol,
                         )
                         if sig_v1 and _should_send_to_aia_for_target(target):

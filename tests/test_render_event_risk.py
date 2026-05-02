@@ -11,6 +11,7 @@ def _render_text(data: dict) -> str:
     buf_out = io.StringIO()
     with (
         patch("sys.stdin", io.StringIO(json.dumps(data, ensure_ascii=False))),
+        patch("sys.argv", ["render_strict.py"]),
         patch("render_strict.pathlib.Path.write_text", return_value=None),
         contextlib.redirect_stdout(buf_out),
     ):

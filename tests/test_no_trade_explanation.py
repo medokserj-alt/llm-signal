@@ -10,6 +10,7 @@ import render_strict
 def _render_text(data: dict) -> str:
     buf_out = io.StringIO()
     with (
+        patch("sys.argv", ["render_strict"]),
         patch("sys.stdin", io.StringIO(json.dumps(data, ensure_ascii=False))),
         patch("render_strict.pathlib.Path.write_text", return_value=None),
         contextlib.redirect_stdout(buf_out),
@@ -50,6 +51,40 @@ class TestNoTradeExplanation(unittest.TestCase):
         self.assertIn("Что должно измениться", out)
         self.assertRegex(out, r"–\s+")
         self.assertIn("EMA20", out)
+
+    def test_low_rr_explanation_uses_trader_facing_wording(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "BTC/USDT",
+            "price": 78950.0,
+            "mode": "aggressive",
+            "no_trade": True,
+            "no_trade_reasons": ["недостаточный RR для входа"],
+            "no_trade_hint": "недостаточный RR для входа",
+        }
+
+        out = _render_text(d)
+
+        self.assertIn("слишком близко к ближайшим целям", out)
+        self.assertIn("нужен либо откат к более выгодной зоне входа", out.lower())
+        self.assertNotIn("TP-лестниц", out)
+        self.assertNotIn("snapshot", out)
+
+    def test_custom_human_no_trade_hint_is_rendered_verbatim(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "BTC/USDT",
+            "price": 78950.0,
+            "mode": "aggressive",
+            "no_trade": True,
+            "no_trade_reasons": [],
+            "no_trade_hint": "цена уже подошла слишком близко к ближайшим сопротивлениям, поэтому первая и вторая цели не дают нормального запаса хода.",
+        }
+
+        out = _render_text(d)
+
+        self.assertIn("слишком близко к ближайшим сопротивлениям", out)
+        self.assertNotIn("условия входа сейчас не соответствуют требованиям стратегии", out)
 
     def test_neutral_no_trade_renders_explicit_aggressive_option_line(self) -> None:
         d = {

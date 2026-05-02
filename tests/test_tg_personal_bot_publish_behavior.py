@@ -234,6 +234,38 @@ class TestTgPersonalBotPublishBehavior(unittest.TestCase):
     def test_personal_bot_pool_is_fixed_to_agreed_five_assets(self) -> None:
         self.assertEqual(self.bot.SYMBOLS, ["BTC", "ETH", "BNB", "SOL", "XRP"])
 
+    def test_personal_bot_main_publication_targets_follow_channel_routing(self) -> None:
+        self.bot.USER_CONFIG = {
+            "shared_v3_mixed": {"channels": {"main_chat_id": -1003530482991}},
+            "6308066297": {"channels": {"main_chat_id": -1003492385200}},
+            "8556231754": {"channels": {"main_chat_id": -1003493070625}},
+        }
+
+        self.assertEqual(self.bot.get_main_publication_targets(6308066297), [-1003492385200])
+        self.assertEqual(self.bot.get_main_publication_targets(8556231754), [-1003493070625])
+        self.assertEqual(self.bot.get_main_publication_targets(999999999), [-1003530482991])
+
+    def test_no_trade_payload_includes_origin_routing_metadata(self) -> None:
+        self.bot._read_last_signal_json = lambda: {
+            "symbol": "BTCUSDT",
+            "direction": "long",
+        }
+
+        payload = self.bot._build_no_trade_decision_payload(
+            8556231754,
+            tg_text="NO_TRADE",
+            symbol_hint="BTCUSDT",
+            channel_id=-1003493070625,
+            origin_chat_id=-1003493070625,
+            publish_targets=[-1003493070625],
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["origin_user_id"], 8556231754)
+        self.assertEqual(payload["origin_chat_id"], -1003493070625)
+        self.assertEqual(payload["publish_targets"], [-1003493070625])
+
     def test_short_mid_report_is_sent_as_single_message(self) -> None:
         context = _FakeContext()
         self.bot.make_header = lambda title: f"{title} • 25.04.2026 14:51"

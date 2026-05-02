@@ -203,18 +203,17 @@ def _sanitize_trend_narrative(
 
 def _holding_horizon_label(data: dict) -> str:
     try:
-        explicit = getattr(get_signal_json, "_normalize_holding_horizon")(data.get("holding_horizon"))  # type: ignore[attr-defined]
-        if explicit:
-            return getattr(get_signal_json, "_holding_horizon_label")(explicit)  # type: ignore[attr-defined]
+        derived = getattr(get_signal_json, "_derive_holding_horizon")(data)  # type: ignore[attr-defined]
+        if derived:
+            return getattr(get_signal_json, "_holding_horizon_label")(derived)  # type: ignore[attr-defined]
     except Exception:
         pass
 
     mode = normalize_mode(data.get("mode"))
-    entry_mode = str(data.get("entry_mode") or "").strip().lower()
     if mode == "aggressive":
-        return "intraday" if entry_mode == "now" else "intraday / 1–2 дня"
+        return "intraday / 1–2 дня"
     if mode == "conservative":
-        return "1–3 дня / multi-day"
+        return "2–5 дней / multi-day"
     return "1–3 дня / short swing"
 
 
@@ -400,6 +399,7 @@ def main():
     mtf_data = copy.deepcopy(data) if isinstance(data, dict) else {}
     try:
         get_signal_json.enforce_ema_narrative_consistency(mtf_data)
+        getattr(get_signal_json, "_sanitize_signal_invalidation_wording")(mtf_data)  # type: ignore[attr-defined]
     except Exception:
         mtf_data = data
 
@@ -422,7 +422,7 @@ def main():
         market_ctx = raw_market_ctx.strip()
     else:
         market_ctx = str(raw_market_ctx).strip() if raw_market_ctx is not None else ""
-    raw_tr = data.get("technical_rationale") or ""
+    raw_tr = mtf_data.get("technical_rationale") or data.get("technical_rationale") or ""
     if isinstance(raw_tr, dict):
         rationale = _sanitize_signal_horizon_text((raw_tr.get("summary") or "").strip(), data)
     elif isinstance(raw_tr, str):
@@ -677,7 +677,7 @@ def main():
                 lines.append("⚠️ Контртренд против сильного H1 — вход только после подтверждения (wait_confirm).")
             if mode == "aggressive" and bool(data.get("is_us_open_block")):
                 lines.append(
-                    "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️"
+                    "⚠️⚠️ Открытие США (17:00–19:30 МСК): высокая волатильность / ложные движения — ждать подтверждения (wait_confirm). ⚠️⚠️"
                 )
             for w in _iter_warnings(data):
                 if "Низкая ликвидность (ночное окно)" in w:

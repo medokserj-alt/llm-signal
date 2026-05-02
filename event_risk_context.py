@@ -265,6 +265,65 @@ _RISK_ON_NEEDLES = (
     "support package",
 )
 
+_STABLECOIN_ADOPTION_NEEDLES = (
+    "stablecoin",
+    "stablecoins",
+    "usdt",
+    "usdc",
+)
+_STABLECOIN_ADOPTION_CONTEXT_NEEDLES = (
+    "adoption",
+    "adopt",
+    "dominates",
+    "dominate",
+    "dominant",
+    "purchases",
+    "purchase",
+    "payments",
+    "payment",
+    "settlement",
+    "settlements",
+    "transactions",
+    "transaction",
+    "usage",
+    "used",
+    "volume",
+)
+_STABLECOIN_POLICY_SHOCK_NEEDLES = (
+    "ban",
+    "bans",
+    "banned",
+    "prohibit",
+    "prohibits",
+    "prohibited",
+    "crackdown",
+    "emergency",
+    "depeg",
+    "bank run",
+    "banking stress",
+    "systemic risk",
+    "systemic bank",
+    "lawsuit",
+    "sanctions",
+)
+
+
+def _is_stablecoin_adoption_story(text: str) -> bool:
+    blob = _text(text).lower()
+    def _contains_phrase(needles) -> bool:
+        for needle in needles:
+            phrase = _text(needle).lower()
+            if not phrase:
+                continue
+            pattern = rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])"
+            if re.search(pattern, blob):
+                return True
+        return False
+
+    return _contains_phrase(_STABLECOIN_ADOPTION_NEEDLES) and _contains_phrase(
+        _STABLECOIN_ADOPTION_CONTEXT_NEEDLES
+    ) and not _contains_phrase(_STABLECOIN_POLICY_SHOCK_NEEDLES)
+
 _TALKS_FAILED_MARKERS = (
     "without agreement",
     "no agreement",
@@ -999,6 +1058,10 @@ def _classify_category(title: str) -> str:
     low = _text(title).lower()
     relevance = classify_market_relevance(title)
     relevance_category = _text(relevance.get("category"))
+
+    if _is_stablecoin_adoption_story(low):
+        return "crypto_market_structure"
+
     if any(needle in low for needle in _CRYPTO_MARKET_STRUCTURE_NEEDLES) and any(
         needle in low for needle in _CRYPTO_SHOCK_NEEDLES
     ) and relevance_category == "crypto":
@@ -1046,6 +1109,8 @@ def _classify_phase(title: str, *, category: str, interpretation: dict | None = 
 
 def _classify_impact(title: str, *, category: str, phase: str) -> str:
     low = _text(title).lower()
+    if category == "crypto_market_structure" and _is_stablecoin_adoption_story(low):
+        return "medium"
     if category == "geopolitics" and any(
         needle in low
         for needle in (
@@ -1087,6 +1152,9 @@ def _classify_directional_risk(title: str, *, phase: str, interpretation: dict |
     interpretation = interpretation or {}
     anticipated_consequences = interpretation.get("anticipated_consequences") or []
     realized_market_events = interpretation.get("realized_market_events") or []
+
+    if _is_stablecoin_adoption_story(low):
+        return "mixed"
 
     if phase in {"pre_event", "ongoing"} and anticipated_consequences:
         return "uncertain"
@@ -1147,6 +1215,13 @@ def _summary_unresolved_phrase(consequence: str) -> str:
     return f"{text} остаётся нерешённым"
 
 
+def _stablecoin_adoption_narrative() -> str:
+    return (
+        "отражает рост использования стейблкоинов и поддерживает тему крипто-ликвидности, "
+        "но не является самостоятельным шоковым драйвером рынка."
+    )
+
+
 def _execution_tail_text(category: str, *, phase: str, mixed_unresolved: bool) -> str:
     if category == "geopolitics":
         if mixed_unresolved:
@@ -1173,6 +1248,16 @@ def _event_drivers(
     anticipated_consequences = interpretation.get("anticipated_consequences") or []
     mixed_unresolved = bool(interpretation.get("mixed_unresolved"))
     drivers: list[str] = []
+
+    if category == "crypto_market_structure" and _is_stablecoin_adoption_story(low):
+        drivers.extend(
+            [
+                "headline reflects broader stablecoin usage rather than a market shock",
+                "it supports the crypto-liquidity theme in the background",
+                "price action still needs independent technical confirmation",
+            ]
+        )
+        return _merge_unique_drivers(drivers, max_items=4)
 
     if category == "geopolitics":
         if mixed_unresolved:
@@ -1276,6 +1361,9 @@ def _event_summary(
     anticipated_consequences = interpretation.get("anticipated_consequences") or []
     mixed_unresolved = bool(interpretation.get("mixed_unresolved"))
     label = interpretation.get("event") or _event_label(title) or "This catalyst"
+
+    if category == "crypto_market_structure" and _is_stablecoin_adoption_story(title):
+        return f"{label} {_stablecoin_adoption_narrative()}"
 
     if mixed_unresolved and confirmed_facts and anticipated_consequences:
         fact = _capitalize_text(confirmed_facts[0])
@@ -1998,6 +2086,17 @@ def build_event_risk_context(raw_news, *, calendar_events=None) -> dict:
 
 
 def _profile_implication(item: dict, *, profile: str) -> str:
+    source_title = _text(item.get("source_title")) or _text(item.get("event"))
+    if _text(item.get("category")) == "crypto_market_structure" and _is_stablecoin_adoption_story(source_title):
+        if profile == "day":
+            return (
+                "Риск исполнения: это фоновая liquidity-theme история, а не самостоятельный shock-driver; "
+                "решение по сделке всё ещё должно идти от структуры и confirm."
+            )
+        return (
+            "Режим: история поддерживает тему крипто-ликвидности, но сама по себе не задаёт новый стресс-режим."
+        )
+
     phase = _text(item.get("phase"))
     directional_risk = _text(item.get("directional_risk"))
     confirmed_facts = item.get("confirmed_facts") or []

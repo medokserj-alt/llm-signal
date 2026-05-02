@@ -13,6 +13,7 @@ def _aggressive_signal() -> dict:
     return {
         "no_trade": False,
         "mode": "aggressive",
+        "holding_horizon": "short_swing",
         "symbol": "ETH/USDT",
         "price": 2500.0,
         "side": "long",
@@ -36,6 +37,18 @@ def _aggressive_signal() -> dict:
         "ema_fan_m15_state": "bull",
         "warnings": [],
     }
+
+
+def _neutral_signal() -> dict:
+    data = _aggressive_signal()
+    data["mode"] = "neutral"
+    data["entry_mode"] = "wait_confirm"
+    data["entry_price_neutral"] = 2480.0
+    data["sl_by_mode"]["neutral"] = 2468.0
+    data["tp_by_mode"]["neutral"] = {"tvh1": 2515.0, "tvh2": 2540.0}
+    data["rr_by_mode"]["neutral"] = 1.5
+    data["exit_plan_by_mode"]["neutral"] = "TP1 partial; TP2 trail"
+    return data
 
 
 def _render_text(data: dict) -> str:
@@ -64,8 +77,22 @@ class TestSignalHoldingHorizon(unittest.TestCase):
         rendered = _render_text(get_signal_json.validate_active_mode_setup(_aggressive_signal()))
 
         self.assertIn("Горизонт: intraday / 1–2 дня", rendered)
-        self.assertNotIn("Горизонт: 3–7 дней", rendered)
+        self.assertNotIn("Горизонт: 1–3 дня / short swing", rendered)
         self.assertNotIn("RR для горизонта 3–7 дней", rendered)
+
+    def test_render_overrides_raw_aggressive_short_swing_horizon(self) -> None:
+        rendered = _render_text(_aggressive_signal())
+
+        self.assertIn("Горизонт: intraday / 1–2 дня", rendered)
+        self.assertNotIn("Горизонт: 1–3 дня / short swing", rendered)
+
+    def test_neutral_signal_uses_short_swing_horizon(self) -> None:
+        out = get_signal_json.validate_active_mode_setup(_neutral_signal())
+        rendered = _render_text(out)
+
+        self.assertEqual(out.get("holding_horizon"), "short_swing")
+        self.assertEqual(out.get("holding_horizon_label"), "1–3 дня / short swing")
+        self.assertIn("Горизонт: 1–3 дня / short swing", rendered)
 
     def test_mid_and_day_prompts_keep_their_view_horizon_contracts(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

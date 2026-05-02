@@ -120,23 +120,29 @@ def _holding_horizon_label(value) -> str:
         "intraday": "intraday",
         "intraday_to_1_2d": "intraday / 1–2 дня",
         "short_swing": "1–3 дня / short swing",
-        "multi_day": "1–3 дня / multi-day",
+        "multi_day": "2–5 дней / multi-day",
     }.get(horizon, "по структуре сетапа")
 
 
+def _mode_holding_horizon(mode_value, entry_mode_value=None) -> str | None:
+    mode = normalize_mode(mode_value)
+    if mode == "aggressive":
+        return "intraday_to_1_2d"
+    if mode == "neutral":
+        return "short_swing"
+    if mode == "conservative":
+        return "multi_day"
+    return None
+
+
 def _derive_holding_horizon(d: dict) -> str:
+    contracted = _mode_holding_horizon(d.get("mode"), d.get("entry_mode"))
+    if contracted:
+        return contracted
+
     explicit = _normalize_holding_horizon(d.get("holding_horizon"))
     if explicit:
         return explicit
-
-    mode = normalize_mode(d.get("mode"))
-    entry_mode = str(d.get("entry_mode") or "").strip().lower()
-    if mode == "aggressive":
-        if entry_mode in {"now"}:
-            return "intraday"
-        return "intraday_to_1_2d"
-    if mode == "conservative":
-        return "multi_day"
     return "short_swing"
 
 
@@ -146,6 +152,110 @@ def _apply_holding_horizon_contract(d: dict) -> None:
     horizon = _derive_holding_horizon(d)
     d["holding_horizon"] = horizon
     d["holding_horizon_label"] = _holding_horizon_label(horizon)
+
+
+def _canonical_invalidation_phrase(side: str) -> str:
+    if side == "short":
+        return "отмена сценария: уход выше EMA60(M15) / структурного high"
+    return "отмена сценария: уход ниже EMA60(M15) / структурного low"
+
+
+def _sanitize_invalidation_text(text, *, side: str) -> str:
+    if not isinstance(text, str):
+        return text
+    cleaned = text.strip()
+    if not cleaned or side not in {"long", "short"}:
+        return cleaned
+
+    low = cleaned.lower()
+    has_invalidation_context = any(
+        needle in low
+        for needle in (
+            "invalidate",
+            "invalidat",
+            "отмена сценария",
+            "сценарий отмен",
+        )
+    )
+    has_structural_anchor = any(
+        needle in low
+        for needle in (
+            "ema60",
+            "ema 60",
+            "m15",
+            "м15",
+            "structural",
+            "структур",
+            "support",
+            "resistance",
+            " low",
+            " high",
+            "лой",
+            "лоя",
+            "хай",
+            "хая",
+        )
+    )
+
+    if side == "long":
+        conflicting_direction = bool(
+            re.search(
+                r"(?i)уход\s+выше[^.;,\n]{0,120}(?:ema\s*60|support|low|лой|лоя|structural|структур)",
+                cleaned,
+            )
+        )
+    else:
+        conflicting_direction = bool(
+            re.search(
+                r"(?i)уход\s+ниже[^.;,\n]{0,120}(?:ema\s*60|resistance|high|хай|хая|structural|структур)",
+                cleaned,
+            )
+        )
+
+    if not ((has_invalidation_context and has_structural_anchor) or conflicting_direction):
+        return cleaned
+
+    canonical = _canonical_invalidation_phrase(side)
+    patterns = (
+        r"(?i)(?:ч[её]ткий\s+)?invalidate\s*\([^)]*\)",
+        r"(?i)(?:ч[её]ткий\s+)?invalidate\s*[:\-–—]?\s*[^.;,\n]{0,140}",
+        r"(?i)отмена\s+сценария\s*[:\-–—]?\s*[^.;,\n]{0,140}",
+        r"(?i)сценарий\s+отмен(?:яется|ится)\s*[:\-–—]?\s*[^.;,\n]{0,140}",
+    )
+
+    out = cleaned
+    replaced = False
+    for pattern in patterns:
+        new_text, count = re.subn(pattern, canonical, out, count=1)
+        if count:
+            out = new_text
+            replaced = True
+
+    if replaced:
+        return re.sub(r"\s+", " ", out).strip()
+    if conflicting_direction:
+        return canonical
+    return cleaned
+
+
+def _sanitize_signal_invalidation_wording(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+    side_raw = d.get("side")
+    side_val = side_raw if isinstance(side_raw, str) and side_raw.strip() else d.get("direction")
+    side = str(side_val or "").strip().lower()
+    if side not in {"long", "short"}:
+        return
+
+    for field in ("why_asset", "technical_rationale", "cancel_condition"):
+        value = d.get(field)
+        if isinstance(value, dict):
+            summary = value.get("summary")
+            if isinstance(summary, str):
+                value["summary"] = _sanitize_invalidation_text(summary, side=side)
+                d[field] = value
+        elif isinstance(value, str):
+            d[field] = _sanitize_invalidation_text(value, side=side)
 
 
 def _rewrite_signal_horizon_wording(text, *, horizon_label: str, mode: str) -> str:
@@ -202,6 +312,7 @@ def _sanitize_signal_horizon_wording(d: dict) -> None:
                 d[field] = value
         elif isinstance(value, str):
             d[field] = _rewrite_signal_horizon_wording(value, horizon_label=horizon_label, mode=mode)
+    _sanitize_signal_invalidation_wording(d)
 
 
 def _debug_trace_reset() -> None:
@@ -5666,7 +5777,10 @@ def apply_tp1_min_move_guard(d: dict) -> dict:
         return d
 
     reason_code = "tp1_below_min_move"
-    hint = "TP1 меньше минимального движения 1% от entry; ближайший валидный уровень не найден без выдумывания."
+    hint = (
+        "Рынок уже слишком близко к ближайшим целям, поэтому вход не даёт нормального запаса по потенциалу. "
+        "Нужен либо откат к более выгодной зоне входа, либо расширение диапазона/подтверждённый пробой."
+    )
 
     d["no_trade"] = True
     reasons = d.get("no_trade_reasons")
@@ -7729,20 +7843,34 @@ def render_flow_derivatives_context_section(
         derivatives_source = str(derivatives.get("source") or "unavailable").strip()
         assets_live = derivatives.get("assets_live")
         assets_total = derivatives.get("assets_total")
-        extra_labels = []
+        non_derivatives = []
         for group_name, label in (
             ("exchange_flows", "exchange"),
             ("stablecoin_flows", "stablecoin"),
             ("tokenomics", "tokenomics"),
         ):
             source = _get_group_source(group_name)
-            if source in {"", "unavailable"}:
-                extra_labels.append(f"{label} unavailable")
-            elif source == "stale":
-                extra_labels.append(f"{label} stale")
+            normalized_source = source or "unavailable"
+            non_derivatives.append((label, normalized_source))
         line = f"- Покрытие: derivatives {derivatives_source} {_fmt_ratio(assets_live, assets_total)}"
-        if extra_labels:
-            line += "; " + ", ".join(extra_labels)
+        if non_derivatives:
+            if all(source == "unavailable" for _, source in non_derivatives):
+                line += "; " + ", ".join(f"{label} unavailable" for label, _ in non_derivatives)
+            else:
+                ordered_sources = []
+                for source in ("live", "fallback", "stale", "unavailable"):
+                    if any(item_source == source for _, item_source in non_derivatives):
+                        ordered_sources.append(source)
+                for _, source in non_derivatives:
+                    if source not in ordered_sources:
+                        ordered_sources.append(source)
+                segments = []
+                for source in ordered_sources:
+                    labels = [label for label, item_source in non_derivatives if item_source == source]
+                    if labels:
+                        segments.append(f"{'/'.join(labels)} {source}")
+                if segments:
+                    line += "; " + "; ".join(segments)
         return line
 
     def _compact_modifiers_line() -> str:
@@ -7761,7 +7889,8 @@ def render_flow_derivatives_context_section(
             "- Вывод: "
             f"positioning={modifiers.get('directional_bias') or 'neutral'}, "
             f"chase_risk={modifiers.get('chase_risk') or 'low'}, "
-            f"confirmation_required={'yes' if modifiers.get('confirmation_required') else 'no'}"
+            f"confirmation_required={'yes' if modifiers.get('confirmation_required') else 'no'}, "
+            f"stablecoin_support={context.get('stablecoin_support') or 'unavailable'}"
         )
 
     def _derivatives_only_note() -> str:

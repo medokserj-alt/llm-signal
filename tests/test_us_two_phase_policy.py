@@ -12,6 +12,7 @@ def _render_text(data: dict) -> str:
     buf_out = io.StringIO()
     with (
         patch("sys.stdin", io.StringIO(json.dumps(data))),
+        patch("sys.argv", ["render_strict.py"]),
         patch("render_strict.pathlib.Path.write_text", return_value=None),
         contextlib.redirect_stdout(buf_out),
     ):
@@ -129,7 +130,7 @@ class TestUsTwoPhasePolicy(unittest.TestCase):
 
         rendered = _render_text(d)
         self.assertIn(
-            "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️",
+            "⚠️⚠️ Открытие США (17:00–19:30 МСК): высокая волатильность / ложные движения — ждать подтверждения (wait_confirm). ⚠️⚠️",
             rendered,
         )
 
@@ -157,7 +158,7 @@ class TestUsTwoPhasePolicy(unittest.TestCase):
         self.assertTrue(bool(d.get("is_us_session_late")))
         rendered = _render_text(d)
         self.assertNotIn(
-            "⚠️⚠️ USA OPEN (17:00–19:30 МСК): HIGH VOLATILITY / FAKE MOVES — WAIT CONFIRM ⚠️⚠️",
+            "⚠️⚠️ Открытие США (17:00–19:30 МСК): высокая волатильность / ложные движения — ждать подтверждения (wait_confirm). ⚠️⚠️",
             rendered,
         )
 

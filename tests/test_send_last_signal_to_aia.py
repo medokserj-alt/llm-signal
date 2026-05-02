@@ -49,6 +49,23 @@ def _load_module():
 
 
 class TestSendLastSignalToAia(unittest.TestCase):
+    def test_resolve_publish_targets_defaults_to_single_channel(self) -> None:
+        module = _load_module()
+        self.assertEqual(
+            module._resolve_publish_targets(-1003492385200, {"publish_targets": []}),
+            [-1003492385200],
+        )
+
+    def test_resolve_publish_targets_preserves_existing_targets(self) -> None:
+        module = _load_module()
+        self.assertEqual(
+            module._resolve_publish_targets(
+                -1003492385200,
+                {"publish_targets": [-1003493070625]},
+            ),
+            [-1003493070625],
+        )
+
     def test_persist_final_signal_payload_updates_last_json(self) -> None:
         module = _load_module()
         payload = {
