@@ -22,7 +22,7 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(items[0]["directional_risk"], "uncertain")
         self.assertEqual(items[0]["time_text"], "ongoing")
         self.assertEqual(items[0]["confirmed_facts"], ["US-Iran talks are ongoing"])
-        self.assertIn("Negotiations are ongoing", items[0]["summary"])
+        self.assertIn("Переговоры продолжаются", items[0]["summary"])
 
     def test_failed_talks_without_new_escalation_remain_post_event(self) -> None:
         news = (
@@ -37,7 +37,8 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(items[0]["impact"], "medium")
         self.assertEqual(items[0]["directional_risk"], "risk_off")
         self.assertEqual(items[0]["time_text"], "recent")
-        self.assertIn("risk premium elevated", items[0]["summary"])
+        self.assertIn("повышенную премию за риск", items[0]["summary"])
+        self.assertIn("волатильность на заголовках", items[0]["summary"])
         self.assertEqual(items[0]["confirmed_facts"], ["US-Iran talks failed"])
 
     def test_mixed_geopolitical_headline_keeps_unresolved_escalation_in_pre_event(self) -> None:
@@ -55,7 +56,8 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(item["confirmed_facts"], ["US-Iran talks failed"])
         self.assertEqual(item["anticipated_consequences"], ["Hormuz blockade risk increased"])
         self.assertIn("Hormuz blockade risk increased", item["event"])
-        self.assertIn("US-Iran talks failed, but Hormuz blockade is not yet confirmed.", item["summary"])
+        self.assertIn("US-Iran talks failed, but Hormuz blockade пока не подтверждён.", item["summary"])
+        self.assertIn("волатильность остаются повышенными", item["summary"])
         self.assertNotEqual(item["summary"], title)
 
     def test_confirmed_escalation_headline_becomes_post_event(self) -> None:
@@ -120,9 +122,9 @@ class TestEventRiskContextLayer(unittest.TestCase):
 
         rendered = render_event_risk_context_section(snapshot, profile="day")
 
-        self.assertIn("⚡ Event-risk catalysts", rendered)
+        self.assertIn("⚡ Катализаторы событийного риска", rendered)
         self.assertIn("crypto_market_structure", rendered)
-        self.assertIn("Execution:", rendered)
+        self.assertIn("Риск исполнения:", rendered)
 
     def test_mid_renders_event_risk_block_when_context_exists(self) -> None:
         snapshot = build_event_risk_context(
@@ -132,9 +134,9 @@ class TestEventRiskContextLayer(unittest.TestCase):
 
         rendered = render_event_risk_context_section(snapshot, profile="mid")
 
-        self.assertIn("⚡ Regime-changing catalysts", rendered)
+        self.assertIn("⚡ Катализаторы смены режима", rendered)
         self.assertIn("geopolitics", rendered)
-        self.assertIn("Regime:", rendered)
+        self.assertIn("Режим:", rendered)
 
     def test_white_house_ceasefire_talks_are_pre_event_and_not_merged_into_gulf_chain(self) -> None:
         snapshot = build_event_risk_context(
@@ -263,8 +265,9 @@ class TestEventRiskContextLayer(unittest.TestCase):
         rendered = render_event_risk_context_section(snapshot, profile="day")
 
         self.assertIn("US-Iran talks failed; Hormuz blockade risk increased", rendered)
-        self.assertIn("US-Iran talks failed, but Hormuz blockade is not yet confirmed.", rendered)
-        self.assertIn("Execution: one component is confirmed, but the next escalation step is unresolved", rendered)
+        self.assertIn("US-Iran talks failed, but Hormuz blockade пока не подтверждён.", rendered)
+        self.assertIn("Риск исполнения: один компонент уже подтверждён", rendered)
+        self.assertIn("следующий шаг эскалации остаётся нерешённым", rendered)
         self.assertNotIn("Market is in anticipation of Trump announces", rendered)
         self.assertEqual(rendered.count("Hormuz blockade risk increased"), 1)
 
@@ -394,11 +397,18 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(regime_layer.get("driver"), "geopolitics")
         self.assertEqual(regime_layer.get("severity"), "severe")
         self.assertIn("ceasefire_at_risk", regime_layer.get("flags") or [])
-        self.assertIn("diplomatic_breakdown_risk", regime_layer.get("flags") or [])
-        self.assertIn("renewed_military_action_threat", regime_layer.get("flags") or [])
+        self.assertIn("unresolved_high_stakes_negotiation", regime_layer.get("flags") or [])
+        self.assertIn("unresolved_geopolitical_breakpoint", regime_layer.get("flags") or [])
+        item_flags = {
+            flag
+            for event_item in snapshot.get("event_risk_context") or []
+            for flag in event_item.get("regime_flags") or []
+        }
+        self.assertIn("diplomatic_breakdown_risk", item_flags)
+        self.assertIn("renewed_military_action_threat", item_flags)
         self.assertIn(item.get("regime_severity"), {"high", "severe"})
         self.assertIn("asymmetric downside shock risk", regime_layer.get("summary") or "")
-        self.assertIn("Regime layer [severe | geopolitics]", rendered_day)
+        self.assertIn("Слой режима [severe | geopolitics]", rendered_day)
         self.assertIn("asymmetric downside shock risk", rendered_day)
         self.assertIn("tactical-only", rendered_day)
         self.assertIn("tactical-only", rendered_mid)

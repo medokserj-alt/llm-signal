@@ -101,7 +101,7 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         self.assertNotIn("upcoming_high_impact_event_neutral_block", d.get("no_trade_reasons") or [])
         self.assertIn("event_risk_geopolitical_execution_caution", d.get("warnings") or [])
         self.assertIn(
-            "secondary factor only",
+            "вторичен",
             " ".join((d.get("event_risk") or {}).get("display_lines") or []).lower(),
         )
 
@@ -134,7 +134,9 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         )
         self.assertEqual(d.get("entry_mode"), "wait_confirm")
         self.assertIn("event_risk_post_event_unstable_follow_through", d.get("warnings") or [])
-        self.assertIn("false breaks", " ".join((d.get("event_risk") or {}).get("display_lines") or []).lower())
+        display_lines = " ".join((d.get("event_risk") or {}).get("display_lines") or []).lower()
+        self.assertIn("послесобытийная волатильность", display_lines)
+        self.assertIn("ложные пробои", display_lines)
 
     def test_no_strong_event_risk_preserves_existing_signal_behavior(self) -> None:
         d = self._base_signal()
@@ -185,7 +187,7 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
 
         get_signal_json.apply_upcoming_event_risk(d)
 
-        self.assertIn("geopolitical escalation path remains unresolved", d.get("macro_risk_summary") or "")
+        self.assertIn("геополитическая траектория эскалации остаётся нерешённой", d.get("macro_risk_summary") or "")
         self.assertIn("US CPI", d.get("macro_risk_summary") or "")
 
     def test_macro_risk_summary_puts_structured_driver_first_and_calendar_second(self) -> None:
@@ -214,15 +216,18 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         ]
         d["day_mid_context"]["macro_risk_summary"] = (
             "US CPI can spike volatility into the close. "
-            "geopolitical escalation path remains unresolved; headline sensitivity is high."
+            "геополитическая траектория эскалации остаётся нерешённой; рынок по-прежнему живёт заголовками."
         )
 
         get_signal_json.apply_upcoming_event_risk(d)
 
         summary = d.get("macro_risk_summary") or ""
-        self.assertTrue(summary.startswith("geopolitical escalation path remains unresolved"))
+        structured_text = "геополитическая траектория эскалации остаётся нерешённой"
+        calendar_text = "04.04.2026, 18:00 — US CPI (high)"
+        self.assertTrue(summary.startswith(structured_text))
+        self.assertLess(summary.index(structured_text), summary.index(calendar_text))
         self.assertIn("04.04.2026, 18:00 — US CPI (high)", summary)
-        self.assertNotIn("headline sensitivity is high", summary)
+        self.assertEqual(summary.count(structured_text), 1)
         self.assertEqual(summary.count("US CPI"), 1)
 
     def test_structured_wait_confirm_warning_is_suppressed_when_calendar_wait_confirm_exists(self) -> None:
@@ -353,9 +358,12 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         self.assertEqual((d.get("event_risk_regime") or {}).get("driver"), "geopolitics")
         self.assertEqual(d.get("entry_mode"), "wait_confirm")
         self.assertEqual(d.get("confidence"), "Low")
-        self.assertIn("empty scheduled calendar does not reduce unscheduled headline fragility", (d.get("macro_risk_summary") or "").lower())
+        self.assertIn(
+            "пустой scheduled calendar не снижает уязвимость к внеплановым заголовкам",
+            (d.get("macro_risk_summary") or "").lower(),
+        )
         display_lines = " ".join((d.get("event_risk") or {}).get("display_lines") or []).lower()
-        self.assertIn("tactical-only", display_lines)
+        self.assertIn("только тактически", display_lines)
         self.assertIn("buy-the-dip", display_lines)
         warnings = d.get("warnings") or []
         self.assertIn("event_risk_geopolitical_regime_severe", warnings)
