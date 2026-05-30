@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import os
 import sys
 import tempfile
 import types
@@ -684,6 +685,27 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(chunk.startswith("Section ") for chunk in chunks))
         self.assertTrue(all(not chunk.endswith(" ") for chunk in chunks))
+
+
+class TestAiaForwardGate(unittest.TestCase):
+    def test_multi_chat_allowlist_overrides_single_test_target_gate(self) -> None:
+        old_env = {
+            "AIA_TEST_CHANNEL_ID": os.environ.get("AIA_TEST_CHANNEL_ID"),
+            "AIA_FORWARD_ALLOWED_CHAT_IDS": os.environ.get("AIA_FORWARD_ALLOWED_CHAT_IDS"),
+        }
+        try:
+            os.environ["AIA_TEST_CHANNEL_ID"] = "-1003492385200"
+            os.environ["AIA_FORWARD_ALLOWED_CHAT_IDS"] = "-1003492385200,-1003493070625"
+            tg_bot = _load_module(TG_BOT_PATH, "tg_bot_aia_forward_gate_test")
+            self.assertTrue(tg_bot._should_send_to_aia_for_target(-1003492385200))
+            self.assertTrue(tg_bot._should_send_to_aia_for_target(-1003493070625))
+            self.assertFalse(tg_bot._should_send_to_aia_for_target(-1003530482991))
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

@@ -164,6 +164,29 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertNotIn("|gulf|", item.get("cluster_key") or "")
         self.assertNotEqual(item.get("cluster_key"), "geopolitics|gulf|escalation_chain")
 
+    def test_ceasefire_life_support_and_rejected_response_raise_fragile_regime(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-05-11 22:14 МСК] [impact:neutral] Trump says ceasefire is on massive life support after rejecting Iran’s response to US peace proposal",
+            calendar_events=[],
+        )
+        item = (snapshot.get("event_risk_context") or [])[0]
+        regime_layer = snapshot.get("regime_layer") or {}
+
+        self.assertEqual(item["category"], "geopolitics")
+        self.assertEqual(item["phase"], "pre_event")
+        self.assertEqual(item["impact"], "high")
+        self.assertEqual(item["directional_risk"], "uncertain")
+        self.assertIn("Ceasefire collapse risk increased", item.get("anticipated_consequences") or [])
+        self.assertIn("ceasefire_at_risk", item.get("regime_flags") or [])
+        self.assertIn("diplomatic_breakdown_risk", item.get("regime_flags") or [])
+        self.assertIn(item.get("regime_severity"), {"high", "severe"})
+        self.assertIn(item.get("continuation_mode"), {"confirmation_first", "tactical_only"})
+        self.assertTrue(
+            {"fragile_regime", "continuation_unstable"} & set(item.get("regime_flags") or [])
+        )
+        self.assertEqual(regime_layer.get("driver"), "geopolitics")
+        self.assertIn(regime_layer.get("severity"), {"high", "severe"})
+
     def test_no_fake_event_risk_block_when_no_relevant_event_exists(self) -> None:
         snapshot = build_event_risk_context(
             "- [2026-04-12 12:00 МСК] [impact:+] Bitcoin trades in a quiet range while volumes stay mixed",

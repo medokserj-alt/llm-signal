@@ -130,6 +130,43 @@ class TestRenderStrictUXContradictions(unittest.TestCase):
         self.assertNotIn("Execution risk:", out)
         self.assertNotIn("severe geopolitical regime remains unresolved", out)
 
+    def test_urgent_soft_veto_stays_live_and_does_not_render_no_trade_output(self) -> None:
+        d = {
+            "time_msk": "01.01.2025, 00:00",
+            "symbol": "BTC/USDT",
+            "price": 100.0,
+            "mode": "aggressive",
+            "side": "long",
+            "entry_mode": "wait_confirm",
+            "why_asset": "test",
+            "multi_tf_view": {"m5": "—", "m15": "—", "h1": "—", "h4": "—", "d1": "—"},
+            "news_context": [],
+            "entries": {"aggressive": {"enabled": True}},
+            "entry_price_aggressive": 99.0,
+            "sl_by_mode": {"aggressive": 97.5},
+            "tp_by_mode": {"aggressive": {"tvh1": 102.0, "tvh2": 104.0}},
+            "rr_by_mode": {"aggressive": 1.7},
+            "exit_plan_by_mode": {"aggressive": "plan"},
+            "urgent_flag": True,
+            "urgent_message": (
+                "⚠️ URGENT: тяжёлый геополитический режим. Структура остаётся хрупкой. "
+                "Tactical-only continuation; вход допустим только после жёсткого подтверждения."
+            ),
+            "event_risk": {
+                "display_lines": [
+                    "⚠️ Макро/геориск: геополитический режим остаётся нестабильным; риск резких движений на заголовках повышен.",
+                    "⚠️ Риск исполнения: продолжение допустимо только тактически; нужен ретест/подтверждение.",
+                ]
+            },
+        }
+
+        out = _render_text(d)
+        self.assertIn("⚠️ URGENT:", out)
+        self.assertIn("⏳ Вход: wait_confirm", out)
+        self.assertIn("⚠️ Макро/геориск:", out)
+        self.assertNotIn("📌 Сигнал не выдан", out)
+        self.assertNotIn("Причина (No trade)", out)
+
 
 if __name__ == "__main__":
     unittest.main()

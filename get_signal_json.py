@@ -2746,6 +2746,131 @@ def _ensure_structured_event_confirmation_rules(
     d["confirmation_rules"] = text
 
 
+def _is_fragile_geopolitical_regime(regime_layer: dict | None) -> bool:
+    if not isinstance(regime_layer, dict):
+        return False
+    if _normalize_optional_text(regime_layer.get("driver")).lower() != "geopolitics":
+        return False
+    severity = _normalize_optional_text(regime_layer.get("severity")).lower()
+    flags = {
+        _normalize_optional_text(item).lower()
+        for item in (regime_layer.get("flags") or [])
+        if _normalize_optional_text(item)
+    }
+    continuation_mode = _normalize_optional_text(regime_layer.get("continuation_mode")).lower()
+    strictness = _normalize_optional_text(regime_layer.get("strictness")).lower()
+    return bool(
+        severity in {"high", "severe"}
+        or continuation_mode in {"confirmation_first", "tactical_only"}
+        or strictness in {"elevated", "strict"}
+        or flags
+        & {
+            "fragile_regime",
+            "continuation_unstable",
+            "risk_of_sharp_regime_flip",
+            "asymmetric_headline_risk",
+        }
+    )
+
+
+def _apply_fragile_geopolitical_regime_policy(
+    d: dict,
+    *,
+    mode: str,
+    event_risk: dict,
+    structured_state: dict,
+    baseline_signal: dict | None = None,
+) -> None:
+    regime_layer = structured_state.get("regime_layer") if isinstance(structured_state.get("regime_layer"), dict) else {}
+    if not _is_fragile_geopolitical_regime(regime_layer):
+        return
+
+    severity = _normalize_optional_text(regime_layer.get("severity")).lower()
+    continuation_mode = _normalize_optional_text(regime_layer.get("continuation_mode")).lower()
+    risk_asymmetry = _normalize_optional_text(regime_layer.get("risk_asymmetry")).lower()
+    strictness = _normalize_optional_text(regime_layer.get("strictness")).lower()
+    dominant_item = structured_state.get("dominant_item") if isinstance(structured_state.get("dominant_item"), dict) else {}
+    event_label = _normalize_optional_text(dominant_item.get("event")) or "headline catalyst"
+    baseline = baseline_signal if isinstance(baseline_signal, dict) else d
+    marginal_setup = _event_risk_setup_is_marginal(baseline, mode=mode)
+    clean_continuation = _signal_has_clean_continuation_structure(baseline)
+    aggressive_downgrade_setup = marginal_setup or not clean_continuation
+    severe_dirty_continuation = severity == "severe" and not clean_continuation
+
+    pressure_warning = "event_risk_fragile_geopolitical_regime"
+    _append_unique_str(d, "warnings", pressure_warning)
+    _append_unique_str(d, "warnings", "event_risk_continuation_stricter")
+
+    display_reason = (
+        "headline regime remains fragile: continuation can flip abruptly even if the first move looks clean."
+        if risk_asymmetry == "asymmetric_downside"
+        else "headline regime remains fragile: continuation can destabilize quickly if geopolitics worsens."
+    )
+    display_line = (
+        "⚠️ Режим исполнения: fragile geopolitical regime; "
+        f"{display_reason}"
+    )
+    existing_lines_low = " ".join(str(x or "").strip().lower() for x in (event_risk.get("display_lines") or []))
+    if display_line.lower() not in existing_lines_low:
+        event_risk["display_lines"] = [display_line, *(event_risk.get("display_lines") or [])]
+
+    extra_confidence_steps = 1 if severity == "severe" else 0
+    urgent_message = (
+        "⚠️ URGENT: тяжёлый геополитический режим. Структура остаётся хрупкой. "
+        "Tactical-only continuation; вход допустим только после жёсткого подтверждения."
+    )
+    soft_veto_reason = "fragile_geopolitics_aggressive_continuation_forbidden"
+
+    if mode == "aggressive":
+        _append_unique_str(d, "warnings", "event_risk_aggressive_continuation_downgrade_pressure")
+        d["entry_mode"] = "wait_confirm"
+        if event_risk.get("mode_action") in {"none", "confidence_down", "wait_confirm"}:
+            event_risk["mode_action"] = "wait_confirm"
+        _ensure_structured_event_confirmation_rules(
+            d,
+            event_label=event_label,
+            phase=_normalize_optional_text((structured_state.get("summary") or {}).get("dominant_phase")).lower(),
+            volatility_risk=_normalize_optional_text((structured_state.get("summary") or {}).get("volatility_risk")).lower(),
+        )
+        if aggressive_downgrade_setup:
+            _append_unique_str(d, "warnings", "event_risk_fragile_regime_prefer_neutral_aggressive")
+            extra_confidence_steps = max(extra_confidence_steps, 1)
+        if severe_dirty_continuation:
+            d["urgent_flag"] = True
+            d["urgent_message"] = urgent_message
+            d["soft_veto_reason"] = soft_veto_reason
+            d["soft_veto_origin"] = "converted_from_hard_veto"
+            event_risk["mode_action"] = "wait_confirm"
+            event_risk["urgent_flag"] = True
+            event_risk["urgent_message"] = urgent_message
+            event_risk["soft_veto_reason"] = soft_veto_reason
+            event_risk["soft_veto_origin"] = "converted_from_hard_veto"
+            _append_unique_str(d, "warnings", "event_risk_fragile_regime_reject_marginal_aggressive")
+            _append_unique_str(d, "warnings", "event_risk_fragile_regime_urgent_soft_veto_aggressive")
+        else:
+            event_risk["mode_action"] = "wait_confirm"
+            _append_unique_str(d, "warnings", "event_risk_fragile_regime_wait_confirm_aggressive")
+            if continuation_mode in {"confirmation_first", "tactical_only"} or strictness in {"elevated", "strict"}:
+                extra_confidence_steps = max(extra_confidence_steps, 1)
+
+    elif mode == "neutral":
+        _append_unique_str(d, "warnings", "event_risk_neutral_tactical_execution")
+        if event_risk.get("mode_action") in {"none", "confidence_down"}:
+            event_risk["mode_action"] = "wait_confirm"
+        d["entry_mode"] = "wait_confirm"
+        if severity == "severe" and marginal_setup and not clean_continuation:
+            d["no_trade"] = True
+            _append_unique_str(d, "no_trade_reasons", "fragile_geopolitics_neutral_marginal_rejected")
+            d["no_trade_hint"] = (
+                "Fragile geopolitical regime: neutral setup is too marginal for tactical continuation right now."
+            )
+            event_risk["mode_action"] = "no_trade"
+            extra_confidence_steps = max(extra_confidence_steps, 1)
+
+    if extra_confidence_steps:
+        _downgrade_confidence(d, extra_confidence_steps)
+
+
 def _event_risk_level_rank(value) -> int:
     text = _normalize_optional_text(value).lower()
     return {
@@ -3253,6 +3378,7 @@ def apply_upcoming_event_risk(d: dict) -> None:
         if event_risk["mode_action"] == "none":
             event_risk["mode_action"] = "confidence_down"
 
+    pre_structured_signal = copy.deepcopy(d)
     if structured_state.get("has_structured_risk"):
         dominant_item = structured_state.get("dominant_item") if isinstance(structured_state.get("dominant_item"), dict) else {}
         dominant_event_label = _normalize_optional_text(dominant_item.get("event")) or "headline catalyst"
@@ -3284,6 +3410,15 @@ def apply_upcoming_event_risk(d: dict) -> None:
             structured_lines.append(f"⚠️ Риск исполнения: {execution_line}")
         if structured_lines:
             event_risk["display_lines"] = [*structured_lines, *(event_risk.get("display_lines") or [])]
+
+        _apply_fragile_geopolitical_regime_policy(
+            d,
+            mode=mode,
+            event_risk=event_risk,
+            structured_state=structured_state,
+            baseline_signal=pre_structured_signal,
+        )
+        _harmonize_event_risk_warning_tokens(d)
 
     has_event_risk_factor = bool(
         active_high

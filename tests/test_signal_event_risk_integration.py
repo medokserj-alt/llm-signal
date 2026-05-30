@@ -2,6 +2,7 @@ import copy
 import unittest
 
 import get_signal_json
+from event_risk_context import build_event_risk_context
 
 
 class TestSignalEventRiskIntegration(unittest.TestCase):
@@ -362,6 +363,119 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         self.assertIn("event_risk_tactical_only_continuation", warnings)
         self.assertNotIn("Iran", d.get("macro_risk_summary") or "")
         self.assertNotIn("Hormuz", d.get("macro_risk_summary") or "")
+
+    def test_fragile_geopolitical_regime_converts_severe_dirty_aggressive_continuation_to_urgent_soft_veto(self) -> None:
+        d = self._base_signal()
+        d["mode"] = "aggressive"
+        d["entry_mode"] = "market"
+        d["confidence"] = "Medium"
+        d["rr_by_mode"] = {"aggressive": 1.7}
+        d["day_mid_context"]["event_risk_context"] = build_event_risk_context(
+            "\n".join(
+                [
+                    "- [2026-04-12 08:00 МСК] [impact:neutral] Border ceasefire remains fragile as diplomats warn the truce may collapse",
+                    "- [2026-04-12 08:10 МСК] [impact:−] Negotiations continue without agreement while officials threaten renewed military action",
+                    "- [2026-04-12 08:20 МСК] [impact:−] Public statements raise escalation risk and keep downside shock sensitivity elevated",
+                ]
+            ),
+            calendar_events=[],
+        ).get("event_risk_context") or []
+
+        get_signal_json.apply_upcoming_event_risk(d)
+
+        self.assertFalse(bool(d.get("no_trade")))
+        self.assertEqual(d.get("entry_mode"), "wait_confirm")
+        self.assertTrue(bool(d.get("urgent_flag")))
+        self.assertEqual(d.get("soft_veto_reason"), "fragile_geopolitics_aggressive_continuation_forbidden")
+        self.assertIn("жёсткого подтверждения", d.get("urgent_message") or "")
+        self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "wait_confirm")
+        self.assertTrue(bool((d.get("event_risk") or {}).get("urgent_flag")))
+        self.assertEqual(
+            (d.get("event_risk") or {}).get("soft_veto_reason"),
+            "fragile_geopolitics_aggressive_continuation_forbidden",
+        )
+        self.assertIn("event_risk_aggressive_continuation_downgrade_pressure", d.get("warnings") or [])
+        self.assertIn("event_risk_fragile_regime_reject_marginal_aggressive", d.get("warnings") or [])
+        self.assertIn("event_risk_fragile_regime_urgent_soft_veto_aggressive", d.get("warnings") or [])
+        self.assertEqual(d.get("no_trade_reasons"), [])
+
+    def test_fragile_geopolitical_regime_keeps_other_hard_veto_paths_for_neutral_marginal_setup(self) -> None:
+        d = self._base_signal()
+        d["mode"] = "neutral"
+        d["entry_mode"] = "market"
+        d["confidence"] = "Medium"
+        d["rr_by_mode"] = {"neutral": 1.7}
+        d["day_mid_context"]["event_risk_context"] = build_event_risk_context(
+            "\n".join(
+                [
+                    "- [2026-04-12 08:00 МСК] [impact:neutral] Border ceasefire remains fragile as diplomats warn the truce may collapse",
+                    "- [2026-04-12 08:10 МСК] [impact:−] Negotiations continue without agreement while officials threaten renewed military action",
+                    "- [2026-04-12 08:20 МСК] [impact:−] Public statements raise escalation risk and keep downside shock sensitivity elevated",
+                ]
+            ),
+            calendar_events=[],
+        ).get("event_risk_context") or []
+
+        get_signal_json.apply_upcoming_event_risk(d)
+
+        self.assertTrue(bool(d.get("no_trade")))
+        self.assertIn("fragile_geopolitics_neutral_marginal_rejected", d.get("no_trade_reasons") or [])
+        self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "no_trade")
+        self.assertFalse(bool(d.get("urgent_flag")))
+
+    def test_fragile_geopolitical_regime_keeps_clean_aggressive_setup_tactical_not_blanket_blocked(self) -> None:
+        d = self._base_signal()
+        d["mode"] = "aggressive"
+        d["entry_mode"] = "market"
+        d["confidence"] = "Medium"
+        d["rr_by_mode"] = {"aggressive": 2.2}
+        d["price_vs_ema20_h1"] = "above"
+        d["ema_fan_h1_state"] = "bull"
+        d["ema_fan_m15_state"] = "bull"
+        d["day_mid_context"]["event_risk_context"] = build_event_risk_context(
+            "\n".join(
+                [
+                    "- [2026-04-12 08:00 МСК] [impact:neutral] Border ceasefire remains fragile as diplomats warn the truce may collapse",
+                    "- [2026-04-12 08:10 МСК] [impact:−] Negotiations continue without agreement while officials threaten renewed military action",
+                    "- [2026-04-12 08:20 МСК] [impact:−] Public statements raise escalation risk and keep downside shock sensitivity elevated",
+                ]
+            ),
+            calendar_events=[],
+        ).get("event_risk_context") or []
+
+        get_signal_json.apply_upcoming_event_risk(d)
+
+        self.assertFalse(bool(d.get("no_trade")))
+        self.assertEqual(d.get("entry_mode"), "wait_confirm")
+        self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "wait_confirm")
+        self.assertIn("event_risk_aggressive_continuation_downgrade_pressure", d.get("warnings") or [])
+        self.assertIn("event_risk_fragile_regime_prefer_neutral_aggressive", d.get("warnings") or [])
+        self.assertNotIn("fragile_geopolitics_aggressive_continuation_forbidden", d.get("no_trade_reasons") or [])
+
+    def test_fragile_geopolitical_regime_keeps_non_severe_dirty_aggressive_continuation_on_downgrade_path(self) -> None:
+        d = self._base_signal()
+        d["mode"] = "aggressive"
+        d["entry_mode"] = "market"
+        d["confidence"] = "Medium"
+        d["rr_by_mode"] = {"aggressive": 1.7}
+        d["day_mid_context"]["event_risk_context"] = build_event_risk_context(
+            "\n".join(
+                [
+                    "- [2026-04-12 08:00 МСК] [impact:neutral] Border ceasefire remains fragile while diplomats keep emergency talks open",
+                    "- [2026-04-12 08:10 МСК] [impact:neutral] Officials say the truce still lacks durable guarantees and headline sensitivity remains elevated",
+                ]
+            ),
+            calendar_events=[],
+        ).get("event_risk_context") or []
+
+        get_signal_json.apply_upcoming_event_risk(d)
+
+        self.assertFalse(bool(d.get("no_trade")))
+        self.assertEqual(d.get("entry_mode"), "wait_confirm")
+        self.assertEqual((d.get("event_risk") or {}).get("mode_action"), "wait_confirm")
+        self.assertIn("event_risk_aggressive_continuation_downgrade_pressure", d.get("warnings") or [])
+        self.assertIn("event_risk_fragile_regime_prefer_neutral_aggressive", d.get("warnings") or [])
+        self.assertNotIn("fragile_geopolitics_aggressive_continuation_forbidden", d.get("no_trade_reasons") or [])
 
 
 if __name__ == "__main__":

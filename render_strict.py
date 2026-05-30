@@ -353,6 +353,26 @@ def _iter_flow_overlay_lines(d: dict) -> list[str]:
     return out
 
 
+def _iter_urgent_lines(d: dict) -> list[str]:
+    if not bool(d.get("urgent_flag")):
+        return []
+    candidates = [
+        d.get("urgent_message"),
+        (d.get("event_risk") or {}).get("urgent_message") if isinstance(d.get("event_risk"), dict) else None,
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if not isinstance(item, str):
+            continue
+        text = _one_line(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", default=None)
@@ -666,6 +686,8 @@ def main():
                         lines.append(note)
             except Exception:
                 pass
+            for urgent_line in _iter_urgent_lines(data)[:1]:
+                lines.append(urgent_line)
             for event_line in _iter_event_risk_lines(data)[:2]:
                 lines.append(event_line)
             for flow_line in _iter_flow_overlay_lines(data)[:2]:

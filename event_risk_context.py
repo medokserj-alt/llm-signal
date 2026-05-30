@@ -336,6 +336,14 @@ _TALKS_FAILED_MARKERS = (
     "peace talks fail",
     "peace talks failed",
     "negotiations failed",
+    "response was rejected",
+    "rejected the response",
+    "rejected iran's response",
+    "rejecting iran's response",
+    "rejected iran’s response",
+    "rejecting iran’s response",
+    "peace proposal rejected",
+    "rejected peace proposal",
 )
 _TALKS_ONGOING_MARKERS = (
     "ongoing",
@@ -400,6 +408,14 @@ _GEO_CEASEFIRE_RISK_MARKERS = (
     "ceasefire could collapse",
     "ceasefire at risk",
     "fragile ceasefire",
+    "ceasefire on life support",
+    "ceasefire is on life support",
+    "ceasefire on massive life support",
+    "ceasefire is on massive life support",
+    "massive life support",
+    "life support",
+    "ceasefire frays",
+    "ceasefire fraying",
     "truce may collapse",
     "truce at risk",
     "ceasefire collapse risk",
@@ -417,6 +433,14 @@ _GEO_DIPLOMATIC_BREAKDOWN_MARKERS = (
     "diplomatic breakdown",
     "diplomatic path collapsed",
     "diplomatic path failed",
+    "rejected the response",
+    "response was rejected",
+    "rejected iran's response",
+    "rejecting iran's response",
+    "rejected iran’s response",
+    "rejecting iran’s response",
+    "rejected peace proposal",
+    "peace proposal rejected",
 )
 _GEO_MILITARY_THREAT_MARKERS = (
     "military action",
@@ -996,6 +1020,11 @@ def _interpret_geopolitics_title(title: str) -> dict:
 
     if "ceasefire" in low and _contains_any(low, ("may collapse", "could collapse", "fragile", "at risk")):
         _add_unique_text(anticipated_consequences, "Ceasefire collapse risk increased")
+    if any(marker in low for marker in ("ceasefire", "truce")) and _contains_any(
+        low,
+        ("life support", "massive life support", "frays", "fraying"),
+    ):
+        _add_unique_text(anticipated_consequences, "Ceasefire collapse risk increased")
 
     if "escalation" in low and _contains_any(low, _ESCALATION_RISK_MARKERS):
         _add_unique_text(anticipated_consequences, "Escalation risk remains elevated")
@@ -1547,6 +1576,39 @@ def _geopolitical_regime_profile(item: dict | None) -> dict:
     risk_asymmetry = "neutral"
     if "downside_shock_elevated" in flags and severity in {"high", "severe"}:
         risk_asymmetry = "asymmetric_downside" if severity == "severe" else "downside_elevated"
+
+    if (
+        severity in {"high", "severe"}
+        or (
+            severity == "medium"
+            and (
+                "ceasefire_at_risk" in flags
+                or "diplomatic_breakdown_risk" in flags
+                or "unresolved_geopolitical_breakpoint" in flags
+            )
+        )
+    ):
+        flags.append("fragile_regime")
+    if severity in {"medium", "high", "severe"} and (
+        "escalation_sensitive" in flags
+        or "fragile_regime" in flags
+        or "unresolved_geopolitical_breakpoint" in flags
+    ):
+        flags.append("continuation_unstable")
+    if severity in {"high", "severe"} and (
+        "ceasefire_at_risk" in flags
+        or "public_escalation_signal" in flags
+        or "diplomatic_breakdown_risk" in flags
+    ):
+        flags.append("risk_of_sharp_regime_flip")
+    if severity in {"high", "severe"} and (
+        risk_asymmetry != "neutral"
+        or "ceasefire_at_risk" in flags
+        or "diplomatic_breakdown_risk" in flags
+    ):
+        flags.append("asymmetric_headline_risk")
+
+    flags = _unique_text_tokens(flags)
 
     continuation_mode = "tactical_only" if severity == "severe" else "confirmation_first" if severity == "high" else "normal"
     strictness = "strict" if severity == "severe" else "elevated" if severity == "high" else "normal"

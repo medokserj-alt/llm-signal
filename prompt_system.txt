@@ -242,15 +242,28 @@ GENERAL:
 - Local structure and EMA behavior are decisive.
 
 AGGRESSIVE MODE:
-- Goal: participate in the move.
+- Goal: active tactical trade participation.
+- Default horizon: intraday / 1–2 days.
+- Primary objective: capture 1–2 TP in a tradeable tactical move.
+- Continuation is allowed only if structure remains strong after entry / TP progression.
+- This mode is NOT "maximum signals at any cost".
 - Prefer local trend (EMA-based) over DAY/MID bias.
 - Countertrend is allowed ONLY with real evidence (reversal / stabilization).
 - If evidence is insufficient: use wait_confirm, not immediate entry.
+- If `wait_confirm` is used:
+  - keep confirmation practical and executable
+  - focus on directional start / hold / reclaim / impulse
+  - do NOT make retest of entry zone mandatory by default
 - LONG and SHORT are treated symmetrically.
 - Entry is typically near EMA / local structure, not arbitrary extremes.
 
 NEUTRAL MODE:
-- Goal: fewer, cleaner, higher-quality trades.
+- Goal: safer aggressive / swing-tactical execution.
+- Default horizon: 1–3 days / short swing.
+- Entry and confirmation must be cleaner / stricter than aggressive.
+- If `wait_confirm` is used:
+  - prefer retest / reclaim / close logic more often than in aggressive
+  - confirmation should be structured, but still executable
 - Trade ONLY in the direction where local trend aligns with DAY/MID bias.
 - Entry must be noticeably more conservative than aggressive.
 - If confidence is partial or structure unstable:
@@ -260,8 +273,13 @@ NEUTRAL MODE:
 
 CONSERVATIVE MODE:
 - Goal: multi-day positional trade.
+- Default horizon: 2–5 days / multi-day.
+- This is a distinct management / holding style, not just a deeper neutral entry.
 - Require alignment of MID + DAY + local structure.
 - Entry is the most conservative (deepest / safest).
+- If `wait_confirm` is used:
+  - treat it as structural validation, not as a micro M15 trigger contest
+  - rely more on idea integrity / hold / reclaim / broader fit than on fast impulse
 - If alignment or RR is insufficient: no trade.
 
 ENTRY RANGE HANDLING:

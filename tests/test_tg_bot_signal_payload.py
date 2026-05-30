@@ -122,6 +122,7 @@ class TestTgBotSignalPayload(unittest.TestCase):
 
         self.assertIsNotNone(out)
         self.assertEqual(out["signal_id"], "sig-full-1")
+        self.assertEqual(out["signal_origin"], "user")
         self.assertEqual(out["symbol"], "BNB/USDT")
         self.assertEqual(out["direction"], "long")
         self.assertEqual(out["entry_zone"], [586.0, 592.0])
@@ -155,6 +156,7 @@ class TestTgBotSignalPayload(unittest.TestCase):
         )
 
         self.assertIsNotNone(out)
+        self.assertEqual(out["signal_origin"], "user")
         self.assertEqual(out["entry_price"], 589.0)
         self.assertEqual(out["channel_id"], -1001234567890)
         self.assertEqual(out["meta"]["mode"], "aggressive")
@@ -213,8 +215,10 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(out["meta"]["entry_type"], "wait_confirm")
         self.assertEqual(out["meta"]["max_wait_minutes"], 180)
         self.assertEqual(out["meta"]["confirm_timeout_minutes"], 180)
+        self.assertEqual(out["meta"]["confirm_rule_v1"]["profile"], "wait_confirm_light")
         self.assertIn({"type": "close_in_entry_zone"}, out["meta"]["confirm_rule_v1"]["rules"])
-        self.assertIn({"type": "retest_entry_zone", "required": True}, out["meta"]["confirm_rule_v1"]["rules"])
+        self.assertIn({"type": "m15_impulse_in_direction", "side": "long"}, out["meta"]["confirm_rule_v1"]["rules"])
+        self.assertIn({"type": "retest_entry_zone", "required": False}, out["meta"]["confirm_rule_v1"]["rules"])
         self.assertIn({"type": "deadline_minutes", "value": 180}, out["meta"]["confirm_rule_v1"]["rules"])
 
     def test_wait_confirm_payload_extends_deadline_for_h1_reclaim_setup(self) -> None:
@@ -247,6 +251,8 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(out["meta"]["entry_type"], "wait_confirm")
         self.assertEqual(out["meta"]["max_wait_minutes"], 360)
         self.assertEqual(out["meta"]["confirm_timeout_minutes"], 360)
+        self.assertEqual(out["meta"]["confirm_rule_v1"]["profile"], "wait_confirm_light")
+        self.assertIn({"type": "close_in_entry_zone"}, out["meta"]["confirm_rule_v1"]["rules"])
         self.assertIn({"type": "reclaim_entry_zone", "side": "long"}, out["meta"]["confirm_rule_v1"]["rules"])
         self.assertIn({"type": "deadline_minutes", "value": 360}, out["meta"]["confirm_rule_v1"]["rules"])
 
@@ -266,8 +272,11 @@ class TestTgBotSignalPayload(unittest.TestCase):
         )
 
         self.assertEqual(rule["version"], 1)
+        self.assertEqual(rule["profile"], "wait_confirm_standard")
+        self.assertIn({"type": "wick_into_entry_zone", "required": True}, rule["rules"])
         self.assertIn({"type": "close_in_entry_zone"}, rule["rules"])
         self.assertIn({"type": "retest_entry_zone", "required": True}, rule["rules"])
+        self.assertIn({"type": "m15_impulse_in_direction", "side": "long"}, rule["rules"])
         self.assertIn({"type": "session_gate", "allowed_sessions": ["eu", "us"]}, rule["rules"])
         self.assertIn(
             {"type": "event_window_clear", "min_minutes": 60, "max_event_risk": "low"},
@@ -279,6 +288,7 @@ class TestTgBotSignalPayload(unittest.TestCase):
 
         rule = tg_bot._build_confirm_rule_v1(
             {
+                "mode": "aggressive",
                 "direction": "short",
                 "confirmation_rules": (
                     "После касания зоны нужен возврат под верхнюю границу диапазона и импульс вниз "
@@ -288,6 +298,8 @@ class TestTgBotSignalPayload(unittest.TestCase):
             max_wait_minutes=120,
         )
 
+        self.assertEqual(rule["profile"], "wait_confirm_light")
+        self.assertIn({"type": "close_in_entry_zone"}, rule["rules"])
         self.assertIn({"type": "reclaim_entry_zone", "side": "short"}, rule["rules"])
         self.assertIn({"type": "m15_impulse_in_direction", "side": "short"}, rule["rules"])
         self.assertIn({"type": "deadline_minutes", "value": 120}, rule["rules"])
@@ -310,6 +322,26 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertIn({"type": "volume_m15_vs_avg20", "op": ">="}, rule["rules"])
         self.assertIn({"type": "wick_into_entry_zone", "required": True}, rule["rules"])
         self.assertIn({"type": "deadline_minutes", "value": 90}, rule["rules"])
+
+    def test_wait_confirm_parser_builds_structural_profile_for_conservative_mode(self) -> None:
+        tg_bot = _load_tg_bot_module()
+
+        rule = tg_bot._build_confirm_rule_v1(
+            {
+                "mode": "conservative",
+                "direction": "long",
+                "confirmation_rules": "Нужен возврат внутрь зоны и удержание без быстрого срыва.",
+            },
+            max_wait_minutes=240,
+        )
+
+        self.assertEqual(rule["profile"], "wait_confirm_structural")
+        self.assertEqual(rule["policy"]["min_structural_hits"], 1)
+        self.assertIn({"type": "close_in_entry_zone"}, rule["rules"])
+        self.assertIn({"type": "reclaim_entry_zone", "side": "long"}, rule["rules"])
+        self.assertNotIn({"type": "wick_into_entry_zone", "required": True}, rule["rules"])
+        self.assertNotIn({"type": "m15_impulse_in_direction", "side": "long"}, rule["rules"])
+        self.assertIn({"type": "deadline_minutes", "value": 240}, rule["rules"])
 
 
 if __name__ == "__main__":

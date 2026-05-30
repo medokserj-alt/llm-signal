@@ -93,6 +93,7 @@ PANEL_SYMBOLS_MAX = int(os.getenv("TELEGRAM_PANEL_SYMBOLS_MAX", "18") or "18")
 AIA_BASE_URL = "http://127.0.0.1:8002"
 AIA_TIMEOUT_SEC = 2.5
 AIA_TEST_CHANNEL_ID = os.getenv("AIA_TEST_CHANNEL_ID")
+AIA_FORWARD_ALLOWED_CHAT_IDS = os.getenv("AIA_FORWARD_ALLOWED_CHAT_IDS")
 
 def _parse_env_int(raw: str | None) -> int | None:
     if raw is None:
@@ -105,10 +106,26 @@ def _parse_env_int(raw: str | None) -> int | None:
     except Exception:
         return None
 
+
+def _parse_env_int_set(raw: str | None) -> set[int]:
+    out: set[int] = set()
+    if raw is None:
+        return out
+    for chunk in str(raw).replace(";", ",").split(","):
+        value = _parse_env_int(chunk)
+        if value is not None:
+            out.add(value)
+    return out
+
 _AIA_TEST_CHANNEL_ID_INT = _parse_env_int(AIA_TEST_CHANNEL_ID)
+_AIA_FORWARD_ALLOWED_CHAT_ID_SET = _parse_env_int_set(AIA_FORWARD_ALLOWED_CHAT_IDS)
 _SUBSCRIPTION_LIMIT = _parse_env_int(os.getenv("TELEGRAM_SUBSCRIPTION_LIMIT"))
 
 def _should_send_to_aia_for_target(target) -> bool:
+    allowed_targets = _AIA_FORWARD_ALLOWED_CHAT_ID_SET
+    if allowed_targets:
+        target_id = _parse_env_int(str(target)) if not isinstance(target, int) else int(target)
+        return target_id in allowed_targets
     test_id = _AIA_TEST_CHANNEL_ID_INT
     if test_id is None:
         return True
@@ -1025,7 +1042,33 @@ def _resolve_signal_mode_from_last_json(d: dict, *, uid: int | None = None) -> s
 
     return "neutral"
 
-def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
+def _confirm_profile_for_mode(mode: str | None) -> str:
+    mode_key = str(mode or "").strip().lower()
+    if mode_key == "aggressive":
+        return "wait_confirm_light"
+    if mode_key == "conservative":
+        return "wait_confirm_structural"
+    return "wait_confirm_standard"
+
+
+def _append_mode_confirm_baseline_rules(rules: list[dict], *, profile: str, side: str) -> None:
+    if profile == "wait_confirm_light":
+        _append_unique_rule(rules, {"type": "close_in_entry_zone"})
+        if side in ("long", "short"):
+            _append_unique_rule(rules, {"type": "m15_impulse_in_direction", "side": side})
+        return
+
+    if profile == "wait_confirm_standard":
+        _append_unique_rule(rules, {"type": "wick_into_entry_zone", "required": True})
+        _append_unique_rule(rules, {"type": "close_in_entry_zone"})
+        if side in ("long", "short"):
+            _append_unique_rule(rules, {"type": "m15_impulse_in_direction", "side": side})
+        return
+
+    _append_unique_rule(rules, {"type": "close_in_entry_zone"})
+
+
+def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int, mode: str | None = None) -> dict:
     rules: list[dict] = []
     raw = d.get("confirmation_rules")
     text = raw if isinstance(raw, str) else ""
@@ -1043,6 +1086,8 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
     side = str(d.get("direction") or d.get("side") or "").strip().lower()
     is_long = side == "long"
     is_short = side == "short"
+    mode_key = str(mode or _resolve_signal_mode_from_last_json(d)).strip().lower()
+    profile = _confirm_profile_for_mode(mode_key)
     has_zone = any(token in norm for token in ("entry_range", "диапазон", "зон", "range", "границ"))
     has_hold = any(
         token in norm
@@ -1140,6 +1185,8 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
         )
     )
 
+    _append_mode_confirm_baseline_rules(rules, profile=profile, side=side)
+
     if "m15" in norm and "ema20" in norm:
         explicit_above = "не ниже" in norm
         explicit_below = "не выше" in norm
@@ -1160,7 +1207,7 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
         _append_unique_rule(rules, {"type": "close_in_entry_zone"})
 
     if has_zone and has_retest:
-        _append_unique_rule(rules, {"type": "retest_entry_zone", "required": True})
+        _append_unique_rule(rules, {"type": "retest_entry_zone", "required": profile != "wait_confirm_light"})
 
     if has_zone and has_reclaim and (is_long or is_short):
         _append_unique_rule(rules, {"type": "reclaim_entry_zone", "side": side})
@@ -1182,7 +1229,27 @@ def _build_confirm_rule_v1(d: dict, *, max_wait_minutes: int) -> dict:
         )
 
     _append_unique_rule(rules, {"type": "deadline_minutes", "value": int(max_wait_minutes)})
-    return {"version": 1, "rules": rules}
+    return {
+        "version": 1,
+        "profile": profile,
+        "mode": mode_key if mode_key in VALID_MODES else "neutral",
+        "policy": {
+            "wait_confirm_light": {
+                "zone_interaction": "optional",
+                "min_directional_hits": 1,
+            },
+            "wait_confirm_standard": {
+                "zone_interaction": "required",
+                "min_directional_hits": 1,
+                "min_structural_hits": 1,
+            },
+            "wait_confirm_structural": {
+                "zone_interaction": "optional",
+                "min_structural_hits": 1,
+            },
+        }.get(profile, {}),
+        "rules": rules,
+    }
 
 def _build_signal_json_v1(
     *,
@@ -1404,6 +1471,7 @@ def _build_signal_json_v1(
 
     out = {
         "signal_id": str(signal_id),
+        "signal_origin": "user",
         "symbol": str(symbol),
         "direction": str(direction),
         "entry_zone": entry_zone,
@@ -1426,7 +1494,7 @@ def _build_signal_json_v1(
             max_wait_minutes = _extract_max_wait_minutes(d, default=180)
             out["meta"]["max_wait_minutes"] = int(max_wait_minutes)
             out["meta"]["confirm_timeout_minutes"] = int(max_wait_minutes)
-            out["meta"]["confirm_rule_v1"] = _build_confirm_rule_v1(d, max_wait_minutes=max_wait_minutes)
+            out["meta"]["confirm_rule_v1"] = _build_confirm_rule_v1(d, max_wait_minutes=max_wait_minutes, mode=mode)
     return out
 
 def send_signal_to_aia(signal_json_v1: dict) -> bool:
@@ -1722,6 +1790,7 @@ def _build_no_trade_decision_payload(
 
     payload = {
         "channel_id": channel_id,
+        "signal_origin": "user",
         "signal_candidate": {"asset": str(asset), "direction": direction, "mode": mode},
         "reason_code": reason_code,
         "reason_text": reason_text,
@@ -1884,9 +1953,9 @@ MODE_LABELS = {
 }
 
 MODE_DESCRIPTIONS = {
-    "aggressive": "🟥 Агрессивный — максимум сигналов, мягкие фильтры риска.",
-    "neutral": "🟨 Нейтральный — баланс сигнальных фильтров и частоты входов.",
-    "conservative": "🟩 Консервативный — меньше сигналов, строгие фильтры.",
+    "aggressive": "🟥 Агрессивный — активный tactical режим: intraday / 1–2 дня, фокус на 1–2 TP.",
+    "neutral": "🟨 Нейтральный — более аккуратный swing-tactical режим: 1–3 дня / short swing.",
+    "conservative": "🟩 Консервативный — стратегический multi-day режим: 2–5 дней / отдельное удержание.",
 }
 
 # ============== RATE / LOCK =================
