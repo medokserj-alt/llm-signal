@@ -161,6 +161,42 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(out["channel_id"], -1001234567890)
         self.assertEqual(out["meta"]["mode"], "aggressive")
 
+    def test_build_signal_json_carries_overextended_leader_execution_diagnosis(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BNB/USDT",
+            "direction": "long",
+            "entry_range": [586.0, 592.0],
+            "sl": 583.11,
+            "tp1": 612.0,
+            "tp2": 635.0,
+            "mode": "aggressive",
+            "entry_mode": "wait_confirm",
+            "entry_price_aggressive": 589.0,
+            "execution_diagnosis": {
+                "items": ["overextended_leader_repeat_long"],
+                "requires_reset_reclaim": True,
+                "same_asset_direction_recent_no_confirm_count": 2,
+            },
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="sig-overextended-1",
+            published_at="2026-05-31T17:35:00Z",
+            channel_id=-1001234567890,
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(
+            out["meta"]["execution_diagnosis"],
+            {
+                "overextended_leader_repeat_long": True,
+                "requires_reset_reclaim": True,
+                "same_asset_direction_recent_no_confirm_count": 2,
+            },
+        )
+
     def test_build_signal_json_falls_back_to_entry_range_midpoint(self) -> None:
         tg_bot = _load_tg_bot_module()
         tg_bot._AIA_UID_CONTEXT = None

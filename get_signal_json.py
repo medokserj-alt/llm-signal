@@ -7188,6 +7188,12 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     d["mode"] = requested_mode
     # Persist the originally requested mode for transparency (may differ from final mode after fallback).
     d["requested_mode"] = requested_mode
+    had_pool_quotes = isinstance(d.get("pool_quotes"), dict)
+    had_pool_technical_context = isinstance(d.get("pool_technical_context"), dict)
+    if isinstance(hints.get("pool_quotes"), dict) and not had_pool_quotes:
+        d["pool_quotes"] = copy.deepcopy(hints["pool_quotes"])
+    if isinstance(hints.get("pool_technical_context"), dict) and not had_pool_technical_context:
+        d["pool_technical_context"] = copy.deepcopy(hints["pool_technical_context"])
 
     d.setdefault("warnings", [])
     if not d.get("time_msk"):
@@ -7374,6 +7380,14 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         apply_signal_asset_flow_overlay(d)
     except Exception:
         pass
+    try:
+        apply_overextended_leader_repeat_guard(d)
+    except Exception:
+        pass
+    if not had_pool_quotes and isinstance(hints.get("pool_quotes"), dict):
+        d.pop("pool_quotes", None)
+    if not had_pool_technical_context and isinstance(hints.get("pool_technical_context"), dict):
+        d.pop("pool_technical_context", None)
     _sanitize_signal_horizon_wording(d)
     return normalize_no_trade(d)
 
@@ -8395,6 +8409,342 @@ def apply_signal_asset_flow_overlay(d: dict, flow_path: Path | None = None) -> N
         d["entry_mode"] = "wait_confirm"
 
 
+NO_CONFIRM_REPEAT_STATUSES = {
+    "WAIT_CONFIRM",
+    "EXPIRED_NO_CONFIRM",
+    "INVALIDATED_NO_CONFIRM",
+}
+
+OVEREXTENDED_LEADER_NO_TRADE_REASON = "overextended_leader_repeat_long_requires_reset"
+OVEREXTENDED_LEADER_WARNING = "overextended_leader_repeat_long_requires_reset_reclaim"
+
+
+def _asset_label_from_symbol(symbol: str | None) -> str:
+    text = str(symbol or "").strip().upper()
+    if "/" in text:
+        text = text.split("/", 1)[0]
+    return text or "Актив"
+
+
+def _append_execution_diagnosis(d: dict, *, no_confirm_count: int) -> None:
+    diag = d.get("execution_diagnosis")
+    if not isinstance(diag, dict):
+        diag = {}
+    items = diag.get("items")
+    if not isinstance(items, list):
+        items = []
+    if "overextended_leader_repeat_long" not in items:
+        items.append("overextended_leader_repeat_long")
+    diag["items"] = items
+    diag["overextended_leader_repeat_long"] = True
+    diag["requires_reset_reclaim"] = True
+    diag["same_asset_direction_recent_no_confirm_count"] = int(no_confirm_count)
+    d["execution_diagnosis"] = diag
+
+
+def _recent_no_confirm_count_from_payload(d: dict, symbol: str, side: str) -> int:
+    def _norm_symbol(value) -> str:
+        return str(value or "").strip().upper()
+
+    def _norm_side(value) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"buy", "long"}:
+            return "long"
+        if text in {"sell", "short"}:
+            return "short"
+        return text
+
+    def _status(value) -> str:
+        return str(value or "").strip().upper()
+
+    def _within_24h(item: dict) -> bool:
+        raw = item.get("timestamp_utc") or item.get("published_at") or item.get("time_utc") or item.get("created_at")
+        if raw is None:
+            return True
+        try:
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                age = time.time() - float(raw)
+                return age <= 24 * 60 * 60
+            text = str(raw).strip()
+            if not text:
+                return True
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            ts = datetime.fromisoformat(text)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=ZoneInfo("UTC"))
+            age = datetime.now(ZoneInfo("UTC")) - ts.astimezone(ZoneInfo("UTC"))
+            return age.total_seconds() <= 24 * 60 * 60
+        except Exception:
+            return True
+
+    explicit = d.get("same_asset_direction_recent_no_confirm_count")
+    if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+        return max(0, int(explicit))
+
+    diag = d.get("execution_diagnosis")
+    if isinstance(diag, dict):
+        explicit = diag.get("same_asset_direction_recent_no_confirm_count")
+        if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+            return max(0, int(explicit))
+
+    count = 0
+    history_keys = (
+        "recent_signal_attempts",
+        "recent_attempts",
+        "signal_history",
+        "recent_signal_history",
+        "aia_recent_outcomes",
+    )
+    for key in history_keys:
+        items = d.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if not _within_24h(item):
+                continue
+            item_symbol = _norm_symbol(item.get("symbol") or item.get("asset"))
+            item_side = _norm_side(item.get("direction") or item.get("side"))
+            if item_symbol and item_symbol != _norm_symbol(symbol):
+                continue
+            if item_side and item_side != side:
+                continue
+            item_status = _status(item.get("status") or item.get("outcome") or item.get("state") or item.get("result"))
+            if item_status in NO_CONFIRM_REPEAT_STATUSES:
+                count += 1
+
+    diagnostics = d.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        if diagnostics.get("missed_directional_move") or diagnostics.get("repeated_missed_continuation"):
+            count = max(count, 2)
+    if isinstance(diag, dict):
+        if diag.get("missed_directional_move") or diag.get("repeated_missed_continuation"):
+            count = max(count, 2)
+
+    return count
+
+
+def _recent_no_confirm_count_from_logs(symbol: str, side: str) -> int:
+    try:
+        logs_dir = BASE / "logs"
+    except Exception:
+        return 0
+    if not symbol or side not in {"long", "short"} or not logs_dir.exists():
+        return 0
+
+    now = time.time()
+    cutoff = now - 24 * 60 * 60
+    try:
+        paths = sorted(logs_dir.glob("last_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:80]
+    except Exception:
+        return 0
+
+    target_symbol = symbol.strip().upper()
+    count = 0
+    for path in paths:
+        try:
+            if path.stat().st_mtime < cutoff:
+                break
+            if path.name.endswith(".raw.json") or path.name.endswith(".clean.json"):
+                continue
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        item_symbol = str(data.get("symbol") or "").strip().upper()
+        item_side = str(data.get("side") or data.get("direction") or "").strip().lower()
+        if item_side == "buy":
+            item_side = "long"
+        elif item_side == "sell":
+            item_side = "short"
+        if item_symbol != target_symbol or item_side != side:
+            continue
+        status = str(
+            data.get("aia_status")
+            or data.get("status")
+            or data.get("execution_status")
+            or data.get("confirm_status")
+            or ""
+        ).strip().upper()
+        entry_mode = str(data.get("entry_mode") or "").strip().lower()
+        reasons = data.get("no_trade_reasons") if isinstance(data.get("no_trade_reasons"), list) else []
+        reason_blob = " ".join(str(r or "").strip().upper() for r in reasons)
+        if status in NO_CONFIRM_REPEAT_STATUSES or entry_mode in {"wait_confirm", "confirm", "wait-confirm"}:
+            count += 1
+        elif "EXPIRED_NO_CONFIRM" in reason_blob or "INVALIDATED_NO_CONFIRM" in reason_blob:
+            count += 1
+    return count
+
+
+def _pool_change_values(d: dict) -> tuple[float | None, list[float]]:
+    symbol = str(d.get("symbol") or "").strip()
+    selected = None
+    values: list[float] = []
+
+    pools = []
+    for key in ("pool_quotes", "pool_snapshot"):
+        if isinstance(d.get(key), dict):
+            pools.append(d.get(key))
+    ctx = d.get("selection_context")
+    if isinstance(ctx, dict):
+        for key in ("pool_quotes", "pool_snapshot"):
+            if isinstance(ctx.get(key), dict):
+                pools.append(ctx.get(key))
+
+    for pool in pools:
+        for sym, quote in pool.items():
+            change = None
+            if isinstance(quote, dict):
+                change = quote.get("change")
+                if change is None:
+                    change = quote.get("change_24h")
+                if change is None:
+                    change = quote.get("change_pct")
+            elif isinstance(quote, (int, float)) and not isinstance(quote, bool):
+                change = quote
+            change_f = _to_float(change)
+            if change_f is None:
+                continue
+            values.append(float(change_f))
+            if str(sym or "").strip().upper() == symbol.upper():
+                selected = float(change_f)
+        if selected is not None:
+            break
+
+    if selected is None:
+        selected = _to_float(d.get("change_24h") or d.get("change_24h_pct") or d.get("change_pct_24h"))
+        if selected is not None:
+            selected = float(selected)
+    return selected, values
+
+
+def _is_top_relative_leader(d: dict, selected_change: float | None, pool_changes: list[float]) -> bool:
+    if bool(d.get("is_top_relative_performer") or d.get("strong_24h_leader") or d.get("relative_leader")):
+        return True
+    rank = d.get("relative_performance_rank") or d.get("pool_rank_24h")
+    if isinstance(rank, (int, float)) and not isinstance(rank, bool) and int(rank) <= 1:
+        return True
+    if selected_change is None or not pool_changes:
+        return False
+    return selected_change >= max(pool_changes)
+
+
+def _has_large_expansion(d: dict, selected_change: float | None, pool_changes: list[float]) -> bool:
+    if bool(d.get("large_intraday_expansion") or d.get("large_24h_expansion")):
+        return True
+    if selected_change is not None:
+        if selected_change >= 6.0:
+            return True
+        positives = sorted(v for v in pool_changes if v is not None)
+        if positives:
+            mid = positives[len(positives) // 2]
+            if selected_change >= 4.0 and selected_change >= mid + 2.0:
+                return True
+    for key in ("intraday_expansion_pct", "m15_range_pct", "vol_m15"):
+        val = _to_float(d.get(key))
+        if val is not None and float(val) >= 2.5:
+            return True
+    return False
+
+
+def _m15_no_longer_clean(d: dict) -> bool:
+    symbol = str(d.get("symbol") or "").strip()
+    tech = d.get("pool_technical_context")
+    selected_tech = tech.get(symbol) if isinstance(tech, dict) and isinstance(tech.get(symbol), dict) else {}
+    tfs = selected_tech.get("timeframes") if isinstance(selected_tech, dict) else {}
+    m15_ctx = tfs.get("15m") if isinstance(tfs, dict) and isinstance(tfs.get("15m"), dict) else {}
+    h1_ctx = tfs.get("1h") if isinstance(tfs, dict) and isinstance(tfs.get("1h"), dict) else {}
+
+    vs_m15 = str(d.get("price_vs_ema20_m15") or m15_ctx.get("price_vs_ema20") or "").strip().lower()
+    vs_h1 = str(d.get("price_vs_ema20_h1") or h1_ctx.get("price_vs_ema20") or "").strip().lower()
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+    phase = str(d.get("m15_phase") or d.get("phase_m15") or "").strip().lower()
+    warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+    wl = " ".join(str(w or "").strip().lower() for w in warnings)
+    return (
+        vs_m15 in {"below", "equal"}
+        or vs_h1 == "below"
+        or fan_m15 in {"mixed", "bear", "flat"}
+        or phase in {"mixed", "range", "distribution", "weakening"}
+        or "phase_between" in wl
+        or "impulse_no_exhale" in wl
+    )
+
+
+def _has_fresh_reset_reclaim(d: dict) -> bool:
+    if bool(d.get("fresh_reset_reclaim") or d.get("fresh_reclaim") or d.get("fresh_higher_low_after_reset")):
+        return True
+    warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+    wl = " ".join(str(w or "").strip().lower() for w in warnings)
+    if "fresh_reset_reclaim" in wl or "volume_supported_reclaim" in wl:
+        return True
+    symbol = str(d.get("symbol") or "").strip()
+    tech = d.get("pool_technical_context")
+    selected_tech = tech.get(symbol) if isinstance(tech, dict) and isinstance(tech.get(symbol), dict) else {}
+    tfs = selected_tech.get("timeframes") if isinstance(selected_tech, dict) else {}
+    m15_ctx = tfs.get("15m") if isinstance(tfs, dict) and isinstance(tfs.get("15m"), dict) else {}
+    h1_ctx = tfs.get("1h") if isinstance(tfs, dict) and isinstance(tfs.get("1h"), dict) else {}
+
+    vs_m15 = str(d.get("price_vs_ema20_m15") or m15_ctx.get("price_vs_ema20") or "").strip().lower()
+    vs_h1 = str(d.get("price_vs_ema20_h1") or h1_ctx.get("price_vs_ema20") or "").strip().lower()
+    fan_m15 = str(d.get("ema_fan_m15_state") or "").strip().lower()
+    fan_h1 = str(d.get("ema_fan_h1_state") or "").strip().lower()
+    return vs_m15 == "above" and vs_h1 == "above" and fan_m15 == "bull" and fan_h1 == "bull"
+
+
+def apply_overextended_leader_repeat_guard(d: dict) -> None:
+    if not isinstance(d, dict) or bool(d.get("no_trade")):
+        return
+    ensure_warnings_list(d)
+
+    side = str(d.get("side") or d.get("direction") or "").strip().lower()
+    if side not in {"long", "buy"}:
+        return
+    side = "long"
+
+    selected_change, pool_changes = _pool_change_values(d)
+    top_leader = _is_top_relative_leader(d, selected_change, pool_changes)
+    large_expansion = _has_large_expansion(d, selected_change, pool_changes)
+    m15_unclean = _m15_no_longer_clean(d)
+    overextended = bool(top_leader and large_expansion and m15_unclean)
+    d["overextended_leader_risk"] = overextended
+    if not overextended:
+        return
+
+    symbol = str(d.get("symbol") or "").strip()
+    no_confirm_count = _recent_no_confirm_count_from_payload(d, symbol, side)
+    no_confirm_count = max(no_confirm_count, _recent_no_confirm_count_from_logs(symbol, side))
+    repeated_failure = no_confirm_count >= 2
+    missed_diag = False
+    for block_key in ("diagnostics", "execution_diagnosis"):
+        block = d.get(block_key)
+        if isinstance(block, dict) and (block.get("missed_directional_move") or block.get("repeated_missed_continuation")):
+            missed_diag = True
+    repeated_failure = repeated_failure or missed_diag
+    d["same_asset_direction_recent_no_confirm_count"] = int(no_confirm_count)
+
+    if not repeated_failure:
+        return
+
+    _append_execution_diagnosis(d, no_confirm_count=max(no_confirm_count, 2 if missed_diag else no_confirm_count))
+    _append_unique_str(d, "warnings", OVEREXTENDED_LEADER_WARNING)
+
+    if _has_fresh_reset_reclaim(d):
+        return
+
+    d["no_trade"] = True
+    _append_unique_str(d, "no_trade_reasons", OVEREXTENDED_LEADER_NO_TRADE_REASON)
+    asset_label = _asset_label_from_symbol(d.get("symbol"))
+    d["no_trade_hint"] = (
+        f"{asset_label} остаётся сильным активом, но после резкого 1–2 дневного роста и серии "
+        "неподтверждённых long-сценариев новый long требует reset/reclaim. "
+        "Не догоняем прежний импульс."
+    )
+
+
 # ---------------- Bootstrap ----------------
 BASE = Path(__file__).resolve().parent
 _CLI_CODE = r'''
@@ -8781,7 +9131,12 @@ if args.multi:
         )
         _debug_trace_set_entry_range("entry_range_pre_finalize", signal_raw)
 
-    hints = {"time_msk": time_msk, "mode": mode}
+    hints = {
+        "time_msk": time_msk,
+        "mode": mode,
+        "pool_quotes": pool_snapshot,
+        "pool_technical_context": pool_technical_context,
+    }
     signal = finalize_signal(signal_raw, hints)
     signal["time_msk"] = time_msk
     merge_event_calendar_context(

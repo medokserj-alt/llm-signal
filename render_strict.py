@@ -697,6 +697,9 @@ def main():
                 lines.append("⚠️ Phase flip по M15: вход только после подтверждения (wait_confirm).")
             if mode == "aggressive" and "aggressive_countertrend_no_evidence_wait_confirm" in wl:
                 lines.append("⚠️ Контртренд против сильного H1 — вход только после подтверждения (wait_confirm).")
+            if "overextended_leader_repeat_long_requires_reset_reclaim" in wl:
+                asset_label = str(symbol or "").strip().upper().split("/", 1)[0] or "Asset"
+                lines.append(f"⚠️ {asset_label} overextended leader: long only after fresh reset/reclaim, not because of previous 24h strength.")
             if mode == "aggressive" and bool(data.get("is_us_open_block")):
                 lines.append(
                     "⚠️⚠️ Открытие США (17:00–19:30 МСК): высокая волатильность / ложные движения — ждать подтверждения (wait_confirm). ⚠️⚠️"

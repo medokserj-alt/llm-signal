@@ -186,6 +186,8 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "USA open (17:00–19:30 МСК): non-aggressive режимы заблокированы"
     if low == "neutral_flip_without_reclaim_forbidden":
         return "разворот после импульса (phase flip) без закрепления выше EMA20(M15) — neutral запрещён"
+    if low == "overextended_leader_repeat_long_requires_reset":
+        return "overextended leader после серии no-confirm long требует reset/reclaim"
     if low in {"time_window", "time_window_low_liquidity"}:
         return "риск-окно по времени/ликвидности"
     if low == "time_window_conservative":
@@ -335,6 +337,12 @@ def _reason_to_user_text(reason_key: str, mode: str | None = None) -> str:
         return "USA open (17:00–19:30 МСК): в neutral/conservative сделки не открываем (высокая волатильность и ложные движения)."
     if low == "neutral_flip_without_reclaim_forbidden":
         return "разворот после импульса (phase flip) без закрепления выше EMA20(M15): neutral запрещён; допустимо только в aggressive (лучше wait_confirm)."
+    if low == "overextended_leader_repeat_long_requires_reset":
+        return (
+            "BNB остаётся сильным активом, но после резкого 1–2 дневного роста и серии "
+            "неподтверждённых long-сценариев новый long требует reset/reclaim. "
+            "Не догоняем прежний импульс."
+        )
     if low in {"phase_between", "ema_between_m15_h1", "ema_guard_between"}:
         return "цена/вход в зоне неопределённости между EMA20(M15) и EMA20(H1) — повышенный риск пилы."
     if low == "ema_guard_below_both_long":
@@ -422,6 +430,8 @@ def _what_must_change(reason_keys: list[str], mode: str) -> list[str]:
             add("– Нужен более глубокий и безопасный уровень входа (не пересекающий SL/диапазон); иначе — только aggressive на свой риск.")
         if low == "neutral_flip_without_reclaim_forbidden":
             add("– Дождаться закрепления цены выше EMA20(M15) или рассматривать только aggressive (лучше wait_confirm).")
+        if low == "overextended_leader_repeat_long_requires_reset":
+            add("– Дождаться fresh reset/reclaim: закрепления выше EMA20(M15), свежего higher low или volume-supported reclaim.")
         if low == "conservative_requires_mid_bias":
             add("– Нужен явный MID bias (long/short) и работа строго по нему.")
         if low == "conservative_day_mid_conflict":
@@ -460,7 +470,7 @@ def format_no_trade_message(d: dict) -> str:
         m0 = normalize_mode(first.get("mode"))
         r0 = str(first.get("reason") or "").strip()
         cat0 = classify_reason(r0)
-        user_hint = _effective_user_hint(d) if r0 == "no_trade_hint" else ""
+        user_hint = _effective_user_hint(d) if r0 in {"no_trade_hint", "overextended_leader_repeat_long_requires_reset"} else ""
         detail0 = user_hint or _reason_to_user_text(r0, m0)
         lines.append(
             f"• {MODE_LABELS_RU.get(m0,'Режим')} режим отклонён: {detail0} ({cat0})."

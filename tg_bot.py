@@ -1368,6 +1368,22 @@ def _build_signal_json_v1(
         meta = None
 
     if meta is not None:
+        execution_diagnosis = d.get("execution_diagnosis")
+        if isinstance(execution_diagnosis, dict):
+            diag_out = {}
+            items = execution_diagnosis.get("items")
+            if isinstance(items, list) and "overextended_leader_repeat_long" in items:
+                diag_out["overextended_leader_repeat_long"] = True
+            elif execution_diagnosis.get("overextended_leader_repeat_long"):
+                diag_out["overextended_leader_repeat_long"] = True
+            if execution_diagnosis.get("requires_reset_reclaim"):
+                diag_out["requires_reset_reclaim"] = True
+            count = execution_diagnosis.get("same_asset_direction_recent_no_confirm_count")
+            if isinstance(count, (int, float)) and not isinstance(count, bool):
+                diag_out["same_asset_direction_recent_no_confirm_count"] = int(count)
+            if diag_out:
+                meta["execution_diagnosis"] = diag_out
+
         try:
             rr_val = None
             rr_by_mode = d.get("rr_by_mode")
