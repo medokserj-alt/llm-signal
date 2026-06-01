@@ -14,6 +14,8 @@ _VALID_CATEGORIES = {
 _VALID_PHASES = {"pre_event", "ongoing", "post_event"}
 _VALID_IMPACTS = {"high", "medium", "low"}
 _VALID_DIRECTIONAL_RISKS = {"risk_on", "risk_off", "uncertain", "mixed", "neutral"}
+_VALID_CRITICAL_SEVERITIES = {"medium", "high", "severe"}
+_VALID_CONFIRM_POLICIES = {"normal", "defensive", "block_stale_confirm"}
 
 _STOPWORDS = {
     "a",
@@ -880,6 +882,330 @@ def _prune_anticipated_consequences(
 
 def _contains_any(low: str, needles) -> bool:
     return any(needle in low for needle in needles)
+
+
+def _phrase_hits(low: str, phrases) -> list[str]:
+    hits: list[str] = []
+    for phrase in phrases:
+        needle = _text(phrase).lower()
+        if needle and needle in low and needle not in hits:
+            hits.append(needle)
+    return hits
+
+
+def _entity_hits(low: str, entities) -> list[str]:
+    hits: list[str] = []
+    for entity in entities:
+        needle = _text(entity).lower()
+        if not needle:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", low) and needle not in hits:
+            hits.append(needle)
+    return hits
+
+
+def _critical_topic(
+    *,
+    topic_id: str,
+    severity_floor: str,
+    event_bias: str,
+    matched_entities: list[str],
+    matched_phrases: list[str],
+    escalation_reason: str,
+) -> dict:
+    severity = severity_floor if severity_floor in _VALID_CRITICAL_SEVERITIES else "medium"
+    confirm_policy = "normal"
+    if severity == "medium":
+        confirm_policy = "defensive"
+    elif severity in {"high", "severe"}:
+        confirm_policy = "block_stale_confirm" if severity == "severe" else "defensive"
+    return {
+        "topic_id": topic_id,
+        "severity_floor": severity,
+        "event_bias": event_bias if event_bias in {"risk_off", "risk_on", "mixed", "unknown"} else "unknown",
+        "headline_risk_active": True,
+        "confirm_policy": confirm_policy,
+        "matched_entities": _unique_text_tokens(matched_entities),
+        "matched_phrases": _unique_text_tokens(matched_phrases),
+        "escalation_reason": escalation_reason,
+    }
+
+
+def detect_critical_topics_from_text(text: str) -> list[dict]:
+    low = _text(text).lower()
+    if not low:
+        return []
+
+    topics: list[dict] = []
+
+    geo_entities = _entity_hits(
+        low,
+        (
+            "iran",
+            "us",
+            "u.s.",
+            "trump",
+            "israel",
+            "lebanon",
+            "kuwait",
+            "gulf",
+            "middle east",
+            "hezbollah",
+            "irgc",
+            "houthis",
+            "militia",
+        ),
+    )
+    geo_phrases = _phrase_hits(
+        low,
+        (
+            "halts talks",
+            "halted talks",
+            "suspends negotiations",
+            "suspended negotiations",
+            "talks failed",
+            "peace talks fail",
+            "ceasefire collapse",
+            "war escalation",
+            "war will work out",
+            "struck iranian radar",
+            "radar sites",
+            "missile attack",
+            "missile and drone attacks",
+            "drone attack",
+            "airstrike",
+            "ground offensive",
+            "offensive in lebanon",
+            "retaliation",
+            "proxy forces",
+            "conflict expands",
+        ),
+    )
+    if geo_entities and geo_phrases:
+        severe_markers = _phrase_hits(
+            low,
+            (
+                "struck iranian radar",
+                "missile and drone attacks",
+                "conflict expands",
+                "war escalation",
+                "ceasefire collapse",
+                "ground offensive",
+            ),
+        )
+        topics.append(
+            _critical_topic(
+                topic_id="geopolitical_military_escalation",
+                severity_floor="severe" if len(severe_markers) >= 2 else "high",
+                event_bias="risk_off",
+                matched_entities=geo_entities,
+                matched_phrases=geo_phrases,
+                escalation_reason="military/diplomatic escalation cluster is active in market-moving headlines",
+            )
+        )
+
+    shipping_entities = _entity_hits(
+        low,
+        (
+            "strait of hormuz",
+            "hormuz",
+            "bab el-mandeb",
+            "red sea",
+            "suez canal",
+            "persian gulf",
+            "gulf",
+        ),
+    )
+    shipping_phrases = _phrase_hits(
+        low,
+        (
+            "blockade",
+            "closure",
+            "threat to block",
+            "threatens to block",
+            "shipping disruption",
+            "shipping route disruption",
+            "tanker attacks",
+            "oil tankers come under fire",
+            "oil supply shock",
+            "energy shock",
+        ),
+    )
+    if shipping_entities and shipping_phrases:
+        topics.append(
+            _critical_topic(
+                topic_id="strategic_shipping_energy_chokepoint",
+                severity_floor="severe" if any(p in shipping_phrases for p in ("blockade", "closure", "threatens to block", "threat to block")) else "high",
+                event_bias="risk_off",
+                matched_entities=shipping_entities,
+                matched_phrases=shipping_phrases,
+                escalation_reason="strategic shipping/energy chokepoint risk can reprice crypto beta abruptly",
+            )
+        )
+
+    macro_entities = _entity_hits(low, ("fed", "federal reserve", "treasury", "cpi", "nfp", "fomc", "president"))
+    macro_phrases = _phrase_hits(
+        low,
+        (
+            "fed independence crisis",
+            "fire fed officials",
+            "fire officials over policy",
+            "emergency fed",
+            "unexpected rate policy shock",
+            "cpi surprise",
+            "nfp surprise",
+            "fomc surprise",
+            "capital controls",
+            "debt crisis",
+            "shutdown",
+            "fiscal crisis",
+        ),
+    )
+    if macro_entities and macro_phrases:
+        topics.append(
+            _critical_topic(
+                topic_id="us_macro_policy_shock",
+                severity_floor="high",
+                event_bias="risk_off",
+                matched_entities=macro_entities,
+                matched_phrases=macro_phrases,
+                escalation_reason="urgent US macro/policy shock can force cross-asset repricing",
+            )
+        )
+
+    stablecoin_adoption = _is_stablecoin_adoption_story(low)
+    crypto_entities = _entity_hits(low, ("btc", "bitcoin", "etf", "strategy", "stablecoin", "exchange", "sec", "ofac"))
+    crypto_phrases = _phrase_hits(
+        low,
+        (
+            "record outflows",
+            "etf outflows hit a record",
+            "strategy sells btc",
+            "major issuer sells btc",
+            "stablecoin depeg",
+            "withdrawal halt",
+            "halted withdrawals",
+            "exchange outage",
+            "liquidation cascade",
+            "perp funding extreme",
+            "oi unwind",
+            "major hack",
+            "bridge failure",
+            "exploit",
+            "major enforcement action",
+        ),
+    )
+    if crypto_entities and crypto_phrases and not stablecoin_adoption:
+        topics.append(
+            _critical_topic(
+                topic_id="crypto_market_structure_shock",
+                severity_floor="severe" if any(p in crypto_phrases for p in ("stablecoin depeg", "liquidation cascade", "withdrawal halt", "halted withdrawals")) else "high",
+                event_bias="risk_off",
+                matched_entities=crypto_entities,
+                matched_phrases=crypto_phrases,
+                escalation_reason="crypto market-structure shock can dominate technical continuation",
+            )
+        )
+
+    regulatory_entities = _entity_hits(low, ("ofac", "aml", "vasp", "sanctions", "exchange", "stablecoin", "bridge"))
+    regulatory_phrases = _phrase_hits(
+        low,
+        (
+            "sanctions on crypto flows",
+            "seized crypto funds",
+            "crypto ban",
+            "emergency restrictions",
+            "vasp rules",
+            "liquidity",
+            "exchange access",
+            "aml action",
+            "ofac action",
+        ),
+    )
+    if regulatory_entities and regulatory_phrases and not stablecoin_adoption:
+        topics.append(
+            _critical_topic(
+                topic_id="sanctions_sovereign_regulatory_shock",
+                severity_floor="high",
+                event_bias="risk_off",
+                matched_entities=regulatory_entities,
+                matched_phrases=regulatory_phrases,
+                escalation_reason="sanctions/regulatory shock can affect liquidity or exchange access",
+            )
+        )
+
+    return _merge_critical_topics(topics)
+
+
+def _merge_critical_topics(topics: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for topic in topics:
+        topic_id = _text(topic.get("topic_id"))
+        if not topic_id:
+            continue
+        existing = merged.get(topic_id)
+        if existing is None:
+            merged[topic_id] = copy.deepcopy(topic)
+            continue
+        existing["severity_floor"] = _stronger_regime_severity(existing.get("severity_floor"), topic.get("severity_floor")) or existing.get("severity_floor")
+        existing["confirm_policy"] = _stronger_confirm_policy(existing.get("confirm_policy"), topic.get("confirm_policy"))
+        if existing.get("event_bias") != topic.get("event_bias"):
+            existing["event_bias"] = "mixed" if "risk_off" not in {existing.get("event_bias"), topic.get("event_bias")} else "risk_off"
+        existing["matched_entities"] = _unique_text_tokens([*(existing.get("matched_entities") or []), *(topic.get("matched_entities") or [])])
+        existing["matched_phrases"] = _unique_text_tokens([*(existing.get("matched_phrases") or []), *(topic.get("matched_phrases") or [])])
+        existing["escalation_reason"] = _merge_unique_texts(existing.get("escalation_reason"), topic.get("escalation_reason"), max_items=2)
+    return sorted(merged.values(), key=lambda t: (_regime_severity_rank(t.get("severity_floor")), len(t.get("matched_phrases") or [])), reverse=True)
+
+
+def _stronger_confirm_policy(*values) -> str:
+    order = {"normal": 0, "defensive": 1, "block_stale_confirm": 2}
+    best = "normal"
+    for value in values:
+        text = _text(value)
+        if text in order and order[text] > order[best]:
+            best = text
+    return best
+
+
+def _critical_topic_snapshot_fields(items: list[dict]) -> dict:
+    topics: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        blob = " ".join(
+            [
+                _text(item.get("source_title")),
+                _text(item.get("event")),
+                _text(item.get("summary")),
+                " ".join(item.get("drivers") or []),
+                " ".join(item.get("confirmed_facts") or []),
+                " ".join(item.get("anticipated_consequences") or []),
+                " ".join(item.get("realized_market_events") or []),
+                " ".join(item.get("recent_developments") or []),
+            ]
+        )
+        topics.extend(detect_critical_topics_from_text(blob))
+    topics = _merge_critical_topics(topics)
+    dominant = topics[0] if topics else None
+    event_bias = "neutral"
+    if any(t.get("event_bias") == "risk_off" for t in topics):
+        event_bias = "risk_off"
+    elif any(t.get("event_bias") == "risk_on" for t in topics):
+        event_bias = "risk_on"
+    elif any(t.get("event_bias") in {"mixed", "unknown"} for t in topics):
+        event_bias = "mixed"
+    severity = _text((dominant or {}).get("severity_floor"))
+    return {
+        "critical_topics": topics,
+        "dominant_critical_topic": copy.deepcopy(dominant) if dominant else None,
+        "headline_risk_active": bool(topics),
+        "event_risk_level": severity if severity in {"medium", "high", "severe"} else "low",
+        "event_bias": event_bias,
+        "confirm_policy": _stronger_confirm_policy(*(t.get("confirm_policy") for t in topics)) if topics else "normal",
+        "matched_entities": _unique_text_tokens([entity for topic in topics for entity in (topic.get("matched_entities") or [])]),
+        "matched_phrases": _unique_text_tokens([phrase for topic in topics for phrase in (topic.get("matched_phrases") or [])]),
+        "escalation_reason": _merge_unique_texts(*(topic.get("escalation_reason") for topic in topics), max_items=2) if topics else "",
+    }
 
 
 def _capitalize_text(value: str) -> str:
@@ -1867,10 +2193,26 @@ def normalize_event_risk_snapshot(raw) -> dict:
 
     out.sort(key=_event_risk_sort_key, reverse=True)
 
+    critical_fields = _critical_topic_snapshot_fields(out)
+    regime_layer = _build_event_risk_regime_layer(out)
+    if critical_fields.get("headline_risk_active") and regime_layer:
+        regime_layer = dict(regime_layer)
+        regime_layer["severity"] = _stronger_regime_severity(
+            regime_layer.get("severity"),
+            critical_fields.get("event_risk_level"),
+        ) or regime_layer.get("severity")
+        if critical_fields.get("event_bias") == "risk_off":
+            regime_layer["risk_asymmetry"] = "asymmetric_downside" if regime_layer.get("severity") == "severe" else "downside_elevated"
+        regime_layer["strictness"] = "strict" if regime_layer.get("severity") == "severe" else "elevated"
+        regime_layer["continuation_mode"] = "tactical_only" if regime_layer.get("severity") == "severe" else "confirmation_first"
+        flags = regime_layer.get("flags") if isinstance(regime_layer.get("flags"), list) else []
+        regime_layer["flags"] = _unique_text_tokens([*flags, "critical_topic_alarm", "headline_risk_active"])
+
     return {
         "timestamp_utc": timestamp_utc,
         "event_risk_context": out,
-        "regime_layer": _build_event_risk_regime_layer(out),
+        "regime_layer": regime_layer,
+        **critical_fields,
     }
 
 
@@ -2144,6 +2486,8 @@ def build_event_risk_context(raw_news, *, calendar_events=None) -> dict:
         }
     )
     snapshot["event_risk_context"] = (snapshot.get("event_risk_context") or [])[:3]
+    critical_fields = _critical_topic_snapshot_fields(snapshot.get("event_risk_context") or [])
+    snapshot.update(critical_fields)
     return snapshot
 
 
@@ -2233,4 +2577,17 @@ def attach_event_risk_context(
     normalized = normalize_event_risk_snapshot(snapshot)
     payload[field_name] = copy.deepcopy(normalized.get("event_risk_context") or [])
     payload[timestamp_field] = normalized.get("timestamp_utc") or utc_now_iso()
+    if field_name == "event_risk_context":
+        for key in (
+            "critical_topics",
+            "dominant_critical_topic",
+            "headline_risk_active",
+            "event_risk_level",
+            "event_bias",
+            "confirm_policy",
+            "matched_entities",
+            "matched_phrases",
+            "escalation_reason",
+        ):
+            payload[key] = copy.deepcopy(normalized.get(key))
     return payload

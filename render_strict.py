@@ -336,6 +336,40 @@ def _iter_event_risk_lines(d: dict) -> list[str]:
     return out
 
 
+def _critical_topic_alarm_lines(d: dict) -> list[str]:
+    if not bool(d.get("headline_risk_active")):
+        return []
+    dominant = d.get("dominant_critical_topic")
+    topics = d.get("critical_topics") if isinstance(d.get("critical_topics"), list) else []
+    topic_ids: list[str] = []
+    for item in ([dominant] if isinstance(dominant, dict) else []) + [x for x in topics if isinstance(x, dict)]:
+        topic_id = _one_line(str(item.get("topic_id") or ""))
+        if topic_id and topic_id not in topic_ids:
+            topic_ids.append(topic_id)
+    if not topic_ids:
+        return []
+    bias = _one_line(str(d.get("event_bias") or (dominant or {}).get("event_bias") or "unknown")).replace("_", "-")
+    compatibility = _one_line(str(d.get("risk_compatibility") or "unknown"))
+    if bool(d.get("no_trade")):
+        impact = (
+            "Сигнал не выдан: активен critical topic alarm. "
+            "Risk-on alt-long конфликтует с текущим risk-off headline regime; нужен fresh reset/reclaim или снижение event-risk."
+        )
+    elif compatibility in {"conflicting", "weak"}:
+        impact = (
+            "⚠️ CRITICAL RISK: направление слабое/конфликтует с active risk-off critical topic. "
+            "Entry allowed only after strict confirmation / fresh reclaim."
+        )
+    else:
+        impact = "Влияние на сетап: вход только после strict confirmation; без автоматического входа по старому continuation."
+    return [
+        "⚠️ Critical Topic Alarm",
+        f"Тема: {' / '.join(topic_ids[:2])}",
+        f"Режим: {bias} sensitive",
+        impact,
+    ]
+
+
 def _iter_flow_overlay_lines(d: dict) -> list[str]:
     flow_overlay = d.get("flow_overlay")
     if not isinstance(flow_overlay, dict):
@@ -688,6 +722,8 @@ def main():
                 pass
             for urgent_line in _iter_urgent_lines(data)[:1]:
                 lines.append(urgent_line)
+            for critical_line in _critical_topic_alarm_lines(data):
+                lines.append(critical_line)
             for event_line in _iter_event_risk_lines(data)[:2]:
                 lines.append(event_line)
             for flow_line in _iter_flow_overlay_lines(data)[:2]:

@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover
 import subprocess
 from pathlib import Path
 import pathlib as _pl
+from typing import Any
 from event_risk_context import (
     attach_event_risk_context,
     build_event_risk_context,
@@ -2901,6 +2902,150 @@ def _event_risk_regime_rank(value) -> int:
         "high": 3,
         "severe": 4,
     }.get(text, 0)
+
+
+def _critical_topic_level_rank(value) -> int:
+    text = _normalize_optional_text(value).lower()
+    return {"low": 1, "medium": 2, "high": 3, "severe": 4}.get(text, 0)
+
+
+def _is_risk_on_alt_asset(symbol: Any) -> bool:
+    asset = _normalize_optional_text(symbol).upper().split("/", 1)[0]
+    if asset.endswith("USDT") and len(asset) > 4:
+        asset = asset[:-4]
+    return bool(asset and asset not in {"BTC", "ETH"})
+
+
+def _has_fresh_reset_reclaim(d: dict) -> bool:
+    warnings = d.get("warnings") if isinstance(d.get("warnings"), list) else []
+    wl = " ".join(str(w or "").lower() for w in warnings)
+    rules = d.get("confirmation_rules")
+    rules_text = " ".join(str(x or "") for x in rules) if isinstance(rules, list) else str(rules or "")
+    blob = " ".join(
+        [
+            _normalize_optional_text(d.get("technical_rationale")),
+            _normalize_optional_text(d.get("ema_guard")),
+            rules_text,
+            wl,
+        ]
+    ).lower()
+    return any(
+        needle in blob
+        for needle in (
+            "fresh reset",
+            "fresh reclaim",
+            "reset/reclaim",
+            "reclaim",
+            "закреп",
+            "удержан",
+            "higher-low",
+            "higher low",
+        )
+    )
+
+
+def apply_critical_topic_risk_compatibility(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+    topics = d.get("critical_topics") if isinstance(d.get("critical_topics"), list) else []
+    dominant = d.get("dominant_critical_topic") if isinstance(d.get("dominant_critical_topic"), dict) else (topics[0] if topics else {})
+    if not isinstance(dominant, dict) or not topics:
+        diag = d.get("execution_diagnosis") if isinstance(d.get("execution_diagnosis"), dict) else {}
+        diag.setdefault("critical_topic_alarm", False)
+        d["execution_diagnosis"] = diag
+        return
+
+    topic_id = _normalize_optional_text(dominant.get("topic_id"))
+    severity = _normalize_optional_text(dominant.get("severity_floor")).lower()
+    event_bias = _normalize_optional_text(d.get("event_bias") or dominant.get("event_bias")).lower()
+    confirm_policy = _normalize_optional_text(d.get("confirm_policy") or dominant.get("confirm_policy")).lower() or "defensive"
+    direction = _normalize_optional_text(d.get("direction") or d.get("side")).lower()
+    mode = normalize_mode(d.get("mode"))
+    is_alt_long = direction == "long" and _is_risk_on_alt_asset(d.get("symbol"))
+    fresh_reset = _has_fresh_reset_reclaim(d)
+    conflicting = bool(is_alt_long and event_bias == "risk_off")
+    aligned = bool((direction == "short" and event_bias == "risk_off") or (direction == "long" and event_bias == "risk_on"))
+
+    if aligned:
+        compatibility = "aligned"
+    elif conflicting:
+        compatibility = "conflicting"
+    else:
+        compatibility = "weak" if event_bias in {"risk_off", "mixed", "unknown"} else "unknown"
+
+    d["headline_risk_active"] = True
+    d["confirm_policy"] = confirm_policy if confirm_policy in {"normal", "defensive", "block_stale_confirm"} else "defensive"
+    d["risk_compatibility"] = compatibility
+
+    event_risk = d.get("event_risk") if isinstance(d.get("event_risk"), dict) else {}
+    event_risk["critical_topics"] = copy.deepcopy(topics)
+    event_risk["dominant_critical_topic"] = copy.deepcopy(dominant)
+    event_risk["headline_risk_active"] = True
+    event_risk["confirm_policy"] = d["confirm_policy"]
+    event_risk["event_bias"] = event_bias or "unknown"
+    event_risk["risk_compatibility"] = compatibility
+    event_risk["matched_entities"] = copy.deepcopy(d.get("matched_entities") or dominant.get("matched_entities") or [])
+    event_risk["matched_phrases"] = copy.deepcopy(d.get("matched_phrases") or dominant.get("matched_phrases") or [])
+    event_risk["escalation_reason"] = _normalize_optional_text(d.get("escalation_reason") or dominant.get("escalation_reason"))
+    if _critical_topic_level_rank(severity) > _event_risk_level_rank(event_risk.get("event_risk_level")):
+        event_risk["event_risk_level"] = severity
+    if event_risk.get("mode_action") in {None, "", "none", "confidence_down"}:
+        event_risk["mode_action"] = "wait_confirm"
+
+    display_topics = "/".join(
+        _normalize_optional_text(topic.get("topic_id"))
+        for topic in topics[:2]
+        if isinstance(topic, dict) and _normalize_optional_text(topic.get("topic_id"))
+    )
+    alarm_line = (
+        "⚠️ Critical Topic Alarm: "
+        f"{display_topics or topic_id}; режим {event_bias or 'unknown'} sensitive; "
+        "alt-long требует fresh reset/reclaim, stale continuation не подтверждаем автоматически."
+    )
+    lines = event_risk.get("display_lines") if isinstance(event_risk.get("display_lines"), list) else []
+    if alarm_line not in lines:
+        event_risk["display_lines"] = [alarm_line, *lines]
+    d["event_risk"] = event_risk
+
+    _append_unique_str(d, "warnings", "critical_topic_alarm")
+    _append_unique_str(d, "warnings", f"critical_topic:{topic_id}")
+    d["entry_mode"] = "wait_confirm"
+    _downgrade_confidence(d, 1 if severity == "medium" else 2 if severity == "severe" else 1)
+
+    if conflicting:
+        _append_unique_str(d, "warnings", "critical_topic_risk_off_conflicts_with_alt_long")
+        _append_unique_str(d, "warnings", "alt_long_requires_reset_under_critical_topic_alarm")
+        if severity == "medium":
+            pass
+        elif severity == "high":
+            if mode == "aggressive":
+                d["mode"] = "neutral"
+                _append_unique_str(d, "warnings", "mode_fallback: aggressive->neutral")
+        elif severity == "severe" and not fresh_reset:
+            d["no_trade"] = True
+            _append_unique_str(d, "no_trade_reasons", "critical_topic_risk_off_conflicts_with_alt_long")
+            _append_unique_str(d, "no_trade_reasons", "alt_long_requires_reset_under_critical_topic_alarm")
+            d["no_trade_hint"] = (
+                "Сигнал не выдан: активен critical topic alarm. Risk-on alt-long конфликтует "
+                "с risk-off headline regime; нужен fresh reset/reclaim или снижение event-risk."
+            )
+            event_risk["mode_action"] = "no_trade"
+            d["event_risk"] = event_risk
+
+    if aligned:
+        _append_unique_str(d, "warnings", "critical_topic_direction_aligned_wait_confirm")
+
+    diag = d.get("execution_diagnosis") if isinstance(d.get("execution_diagnosis"), dict) else {}
+    diag.update(
+        {
+            "critical_topic_alarm": True,
+            "dominant_critical_topic": topic_id,
+            "risk_compatibility": compatibility,
+            "requires_reset_reclaim": bool(conflicting),
+            "stale_risk_on_long_blocked": bool(conflicting and severity == "severe" and not fresh_reset and d.get("no_trade")),
+        }
+    )
+    d["execution_diagnosis"] = diag
 
 
 def _structured_event_regime_layer(snapshot: dict) -> dict:
@@ -7374,6 +7519,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
         pass
     try:
         apply_upcoming_event_risk(d)
+    except Exception:
+        pass
+    try:
+        apply_critical_topic_risk_compatibility(d)
     except Exception:
         pass
     try:

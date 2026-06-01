@@ -5,6 +5,50 @@ from event_risk_context import build_event_risk_context, render_event_risk_conte
 
 
 class TestEventRiskContextLayer(unittest.TestCase):
+    def test_critical_topic_detects_iran_talks_halted_as_high_headline_risk(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-06-01 10:00 МСК] [impact:neutral] Iran halts talks with US after latest escalation",
+            calendar_events=[],
+        )
+
+        self.assertTrue(snapshot.get("headline_risk_active"))
+        self.assertEqual(snapshot.get("event_risk_level"), "high")
+        self.assertEqual(snapshot.get("event_bias"), "risk_off")
+        self.assertEqual((snapshot.get("dominant_critical_topic") or {}).get("topic_id"), "geopolitical_military_escalation")
+
+    def test_critical_topic_detects_hormuz_blockade_as_severe(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-06-01 10:00 МСК] [impact:neutral] Iran threatens to block Strait of Hormuz as oil tankers come under fire",
+            calendar_events=[],
+        )
+
+        self.assertEqual(snapshot.get("event_risk_level"), "severe")
+        self.assertEqual((snapshot.get("dominant_critical_topic") or {}).get("topic_id"), "strategic_shipping_energy_chokepoint")
+        self.assertEqual(snapshot.get("confirm_policy"), "block_stale_confirm")
+
+    def test_critical_topic_preserves_multiple_topics_and_dominant(self) -> None:
+        news = "\n".join(
+            [
+                "- US says it struck Iranian radar sites as Kuwait reports missile and drone attacks",
+                "- ETF outflows hit a record while Strategy sells BTC into weakness",
+            ]
+        )
+        snapshot = build_event_risk_context(news, calendar_events=[])
+        topic_ids = [topic.get("topic_id") for topic in snapshot.get("critical_topics") or []]
+
+        self.assertIn("geopolitical_military_escalation", topic_ids)
+        self.assertIn("crypto_market_structure_shock", topic_ids)
+        self.assertTrue(snapshot.get("dominant_critical_topic"))
+
+    def test_stablecoin_adoption_does_not_trigger_critical_macro_policy(self) -> None:
+        snapshot = build_event_risk_context(
+            "- Stablecoin adoption expands in Brazil payments as transaction volume grows",
+            calendar_events=[],
+        )
+
+        self.assertFalse(snapshot.get("headline_risk_active"))
+        self.assertEqual(snapshot.get("critical_topics"), [])
+
     def test_related_talks_headlines_cluster_into_one_ongoing_catalyst(self) -> None:
         news = "\n".join(
             [

@@ -198,6 +198,10 @@ def reason_to_short_text(reason_key: str, mode: str | None = None) -> str:
         return "в активном окне high-impact события conservative не открывает новые сделки"
     if low == "risk_off":
         return "режим risk-off (повышенный риск рынка)"
+    if low == "critical_topic_risk_off_conflicts_with_alt_long":
+        return "critical topic alarm: aggressive alt-long конфликтует с risk-off headline regime"
+    if low == "alt_long_requires_reset_under_critical_topic_alarm":
+        return "alt-long под critical topic alarm требует fresh reset/reclaim"
     if low == "low_rr":
         return "цели слишком близко, поэтому вход не даёт нормального запаса по потенциалу и R:R"
     if low == "tp1_below_min_move":
@@ -304,6 +308,8 @@ def classify_reason(reason_key: str) -> str:
     if k in {
         "time_window",
         "risk_off",
+        "critical_topic_risk_off_conflicts_with_alt_long",
+        "alt_long_requires_reset_under_critical_topic_alarm",
         "time_window_low_liquidity",
         "time_window_conservative",
         "us_open_block_non_aggressive",
