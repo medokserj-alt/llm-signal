@@ -1,0 +1,10 @@
+[Unit]
+Description=Run scheduled DAY publisher every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+Unit=ai-agent-scheduled-day.service
+
+[Install]
+WantedBy=timers.target

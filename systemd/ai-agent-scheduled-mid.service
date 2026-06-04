@@ -1,0 +1,10 @@
+[Unit]
+Description=AI Agent scheduled MID publisher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/llm-signal-next
+EnvironmentFile=-/root/llm-signal-next/.env.tg.clean
+ExecStart=/root/llm-signal-next/scripts/run_scheduled_mid.sh
