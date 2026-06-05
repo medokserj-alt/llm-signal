@@ -24,6 +24,7 @@ def cfg(tmp: Path | None = None) -> sr.SchedulerConfig:
         retry_delay_minutes=60,
         max_attempts=2,
         gate_mode="soft",
+        soft_avoid_downgrade=False,
         signal_state_path=root / "scheduled_signal_state.json",
         publish_state_path=root / "scheduled_publish_state.json",
         due_window_minutes=5,
@@ -93,15 +94,46 @@ class TestAiaGate(unittest.TestCase):
         self.assertTrue(out["allowed"])
         self.assertEqual(out["selected_mode"], "aggressive")
 
-    def test_soft_avoid_without_hard_block_allows_and_downgrades_to_neutral(self) -> None:
+    def test_soft_avoid_without_hard_block_keeps_default_mode_when_downgrade_disabled(self) -> None:
         out = sr.evaluate_aia_gate(
             {"status": "AVOID", "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
             cfg(),
         )
         self.assertTrue(out["allowed"])
         self.assertTrue(out["aia_avoid_soft_allowed"])
+        self.assertFalse(out["soft_avoid_downgrade"])
+        self.assertEqual(out["selected_mode"], "aggressive")
+        self.assertEqual(out["reason"], "avoid_without_hard_block_keep_default_mode")
+
+    def test_soft_avoid_without_hard_block_can_downgrade_when_enabled(self) -> None:
+        c = cfg()
+        c.soft_avoid_downgrade = True
+        out = sr.evaluate_aia_gate(
+            {"status": "AVOID", "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
+            c,
+        )
+        self.assertTrue(out["allowed"])
+        self.assertTrue(out["aia_avoid_soft_allowed"])
+        self.assertTrue(out["soft_avoid_downgrade"])
         self.assertEqual(out["selected_mode"], "neutral")
-        self.assertEqual(out["reason"], "avoid_without_hard_block")
+
+    def test_soft_avoid_with_hard_reasons_blocks(self) -> None:
+        out = sr.evaluate_aia_gate(
+            {
+                "status": "AVOID",
+                "preferred_mode": "conservative",
+                "event_risk_level": "severe",
+                "confirm_policy": "block_stale_confirm",
+                "event_bias": "risk_off",
+                "focus_asset": "SOL",
+                "focus_direction": "LONG",
+            },
+            cfg(),
+        )
+        self.assertFalse(out["allowed"])
+        self.assertFalse(out["aia_avoid_soft_allowed"])
+        self.assertFalse(out["soft_avoid_downgrade"])
+        self.assertIn("severe_block_stale_confirm_conflicts_event_bias", out["hard_block_reasons"])
 
     def test_strict_mode_blocks_avoid(self) -> None:
         c = cfg()
@@ -179,11 +211,15 @@ class TestScheduledSignalState(unittest.TestCase):
             c = cfg(Path(tmpdir))
             state = {"slots": {}}
             slot_time = sr.slot_datetime_msk(date(2026, 6, 5), "12:30")
-            with patch("scheduled_runner.load_aia_context", return_value={"status": "OPEN"}), patch(
+            with patch(
+                "scheduled_runner.load_aia_context",
+                return_value={"status": "AVOID", "preferred_mode": "conservative"},
+            ), patch(
                 "scheduled_runner.generate_and_publish_signal",
                 return_value={"published": False, "reason": "signal_core_no_trade", "signal_id": None},
-            ):
+            ) as publish:
                 asyncio.run(sr.run_signal_slot(datetime(2026, 6, 5, 9, 30, tzinfo=timezone.utc), c, state, "20260605_1230", slot_time, 1, dry_run=True))
+                publish.assert_called_with("aggressive", c, dry_run=True)
                 self.assertEqual(state["slots"]["20260605_1230"]["status"], "deferred")
                 asyncio.run(sr.run_signal_slot(datetime(2026, 6, 5, 10, 30, tzinfo=timezone.utc), c, state, "20260605_1230", slot_time, 2, dry_run=True))
                 self.assertEqual(state["slots"]["20260605_1230"]["status"], "cancelled")
@@ -201,6 +237,8 @@ class TestScheduledSignalState(unittest.TestCase):
         )
         self.assertEqual(row["target_chat_ids"], [-1003492385200, -1003493070625, -1003530482991])
         self.assertEqual(row["aia_status"], "AVOID")
+        self.assertIn("soft_avoid_downgrade", row)
+        self.assertIn("aia_avoid_soft_allowed", row)
         self.assertIn("hard_block_reasons", row)
 
 

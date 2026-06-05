@@ -146,6 +146,7 @@ class SchedulerConfig:
     retry_delay_minutes: int
     max_attempts: int
     gate_mode: str
+    soft_avoid_downgrade: bool
     signal_state_path: Path
     publish_state_path: Path
     due_window_minutes: int
@@ -172,6 +173,7 @@ class SchedulerConfig:
             retry_delay_minutes=max(1, parse_int_env("SCHEDULED_SIGNAL_RETRY_DELAY_MINUTES", 60)),
             max_attempts=max(1, parse_int_env("SCHEDULED_SIGNAL_MAX_ATTEMPTS", 2)),
             gate_mode=gate_mode,
+            soft_avoid_downgrade=parse_bool_env("SCHEDULED_SIGNAL_SOFT_AVOID_DOWNGRADE", False),
             signal_state_path=PROJECT_ROOT / os.getenv("SCHEDULED_SIGNAL_STATE_PATH", "logs/scheduled_signal_state.json"),
             publish_state_path=PROJECT_ROOT / os.getenv("SCHEDULED_PUBLISH_STATE_PATH", "logs/scheduled_publish_state.json"),
             due_window_minutes=max(1, parse_int_env("SCHEDULED_DUE_WINDOW_MINUTES", 5)),
@@ -333,12 +335,15 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
 
     selected_mode = cfg.signal_default_mode
     aia_avoid_soft_allowed = False
+    soft_avoid_downgrade = False
     reason = "allowed"
     if cfg.gate_mode == "soft" and status == "AVOID" and not hard_block_reasons:
         aia_avoid_soft_allowed = True
-        reason = "avoid_without_hard_block"
-        if preferred_mode in {"neutral", "conservative"}:
+        reason = "avoid_without_hard_block_keep_default_mode"
+        if cfg.soft_avoid_downgrade and preferred_mode in {"neutral", "conservative"} and cfg.signal_default_mode == "aggressive":
             selected_mode = "neutral"
+            soft_avoid_downgrade = True
+            reason = "avoid_without_hard_block_downgrade_preferred_mode"
     elif preferred_mode in {"neutral", "conservative"} and cfg.signal_default_mode == "aggressive":
         selected_mode = "neutral"
 
@@ -347,6 +352,7 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         "reason": reason if not hard_block_reasons else ",".join(hard_block_reasons),
         "selected_mode": selected_mode if selected_mode in {"aggressive", "neutral"} else "aggressive",
         "aia_avoid_soft_allowed": aia_avoid_soft_allowed,
+        "soft_avoid_downgrade": soft_avoid_downgrade,
         "hard_block_reasons": hard_block_reasons,
         "aia_status": status,
         "preferred_mode": preferred_mode if preferred_mode in {"aggressive", "neutral", "conservative"} else "unknown",
@@ -543,6 +549,7 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
         "preferred_mode": gate.get("preferred_mode", "unknown"),
         "selected_mode": gate.get("selected_mode", cfg.signal_default_mode),
         "aia_avoid_soft_allowed": bool(gate.get("aia_avoid_soft_allowed")),
+        "soft_avoid_downgrade": bool(gate.get("soft_avoid_downgrade")),
         "focus_asset": gate.get("focus_asset", "none"),
         "focus_direction": gate.get("focus_direction", "unknown"),
         "flow_bias": gate.get("flow_bias", "unknown"),
