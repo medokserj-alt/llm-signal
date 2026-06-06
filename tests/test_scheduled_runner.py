@@ -27,6 +27,7 @@ def cfg(tmp: Path | None = None) -> sr.SchedulerConfig:
         retry_delay_minutes=60,
         max_attempts=2,
         gate_mode="soft",
+        preferred_mode_downgrade_enabled=False,
         soft_avoid_downgrade=False,
         signal_state_path=root / "scheduled_signal_state.json",
         publish_state_path=root / "scheduled_publish_state.json",
@@ -96,6 +97,7 @@ class TestAiaGate(unittest.TestCase):
         out = sr.evaluate_aia_gate({"status": "OPEN", "preferred_mode": "aggressive"}, cfg())
         self.assertTrue(out["allowed"])
         self.assertEqual(out["selected_mode"], "aggressive")
+        self.assertEqual(out["selected_mode_source"], "scheduled_default_soft_no_hard_block")
 
     def test_soft_avoid_without_hard_block_keeps_default_mode_when_downgrade_disabled(self) -> None:
         out = sr.evaluate_aia_gate(
@@ -105,11 +107,49 @@ class TestAiaGate(unittest.TestCase):
         self.assertTrue(out["allowed"])
         self.assertTrue(out["aia_avoid_soft_allowed"])
         self.assertFalse(out["soft_avoid_downgrade"])
+        self.assertFalse(out["preferred_mode_downgrade_enabled"])
         self.assertEqual(out["selected_mode"], "aggressive")
+        self.assertEqual(out["selected_mode_source"], "scheduled_default_soft_no_hard_block")
+        self.assertEqual(out["preferred_mode_ignored_reason"], "soft_gate_no_hard_block")
         self.assertEqual(out["reason"], "avoid_without_hard_block_keep_default_mode")
+
+    def test_caution_directional_preferred_conservative_no_hard_block_keeps_default_mode(self) -> None:
+        out = sr.evaluate_aia_gate(
+            {"status": "CAUTION_DIRECTIONAL", "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
+            cfg(),
+        )
+        self.assertTrue(out["allowed"])
+        self.assertFalse(out["soft_avoid_downgrade"])
+        self.assertEqual(out["selected_mode"], "aggressive")
+        self.assertEqual(out["selected_mode_source"], "scheduled_default_soft_no_hard_block")
+        self.assertEqual(out["preferred_mode_ignored_reason"], "soft_gate_no_hard_block")
+
+    def test_avoid_hard_preferred_conservative_no_hard_block_keeps_default_mode(self) -> None:
+        out = sr.evaluate_aia_gate(
+            {"status": "AVOID_HARD", "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
+            cfg(),
+        )
+        self.assertTrue(out["allowed"])
+        self.assertFalse(out["soft_avoid_downgrade"])
+        self.assertEqual(out["selected_mode"], "aggressive")
+        self.assertEqual(out["selected_mode_source"], "scheduled_default_soft_no_hard_block")
+        self.assertEqual(out["preferred_mode_ignored_reason"], "soft_gate_no_hard_block")
+
+    def test_soft_gate_no_hard_block_ignores_conservative_preference_for_all_aia_statuses(self) -> None:
+        for status in ["CAUTION_DIRECTIONAL", "AVOID_HARD", "AVOID", "WEAK", "OPEN"]:
+            with self.subTest(status=status):
+                out = sr.evaluate_aia_gate(
+                    {"status": status, "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
+                    cfg(),
+                )
+                self.assertTrue(out["allowed"])
+                self.assertEqual(out["selected_mode"], "aggressive")
+                self.assertEqual(out["selected_mode_source"], "scheduled_default_soft_no_hard_block")
+                self.assertEqual(out["preferred_mode_ignored_reason"], "soft_gate_no_hard_block")
 
     def test_soft_avoid_without_hard_block_can_downgrade_when_enabled(self) -> None:
         c = cfg()
+        c.preferred_mode_downgrade_enabled = True
         c.soft_avoid_downgrade = True
         out = sr.evaluate_aia_gate(
             {"status": "AVOID", "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
@@ -117,8 +157,24 @@ class TestAiaGate(unittest.TestCase):
         )
         self.assertTrue(out["allowed"])
         self.assertTrue(out["aia_avoid_soft_allowed"])
+        self.assertTrue(out["preferred_mode_downgrade_enabled"])
         self.assertTrue(out["soft_avoid_downgrade"])
         self.assertEqual(out["selected_mode"], "neutral")
+        self.assertEqual(out["selected_mode_source"], "aia_preferred_mode_soft_downgrade")
+        self.assertEqual(out["preferred_mode_ignored_reason"], "")
+
+    def test_soft_preferred_mode_downgrade_env_enables_old_downgrade_path(self) -> None:
+        with patch.dict("os.environ", {"SCHEDULED_SIGNAL_SOFT_PREFERRED_MODE_DOWNGRADE": "1"}, clear=False):
+            c = sr.SchedulerConfig.from_env()
+        out = sr.evaluate_aia_gate(
+            {"status": "AVOID_HARD", "preferred_mode": "conservative", "focus_asset": "BTC", "focus_direction": "SHORT"},
+            c,
+        )
+        self.assertTrue(out["allowed"])
+        self.assertTrue(out["preferred_mode_downgrade_enabled"])
+        self.assertTrue(out["soft_avoid_downgrade"])
+        self.assertEqual(out["selected_mode"], "neutral")
+        self.assertEqual(out["selected_mode_source"], "aia_preferred_mode_soft_downgrade")
 
     def test_soft_avoid_with_hard_reasons_blocks(self) -> None:
         out = sr.evaluate_aia_gate(
@@ -367,6 +423,10 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertIn("soft_avoid_downgrade", row)
         self.assertIn("aia_avoid_soft_allowed", row)
         self.assertIn("hard_block_reasons", row)
+        self.assertEqual(row["selected_mode"], "aggressive")
+        self.assertEqual(row["selected_mode_source"], "scheduled_default_soft_no_hard_block")
+        self.assertFalse(row["preferred_mode_downgrade_enabled"])
+        self.assertEqual(row["preferred_mode_ignored_reason"], "soft_gate_no_hard_block")
 
 
 if __name__ == "__main__":
