@@ -1624,6 +1624,7 @@ async def _publish_signal_result(
     symbol_hint: str | None,
     sig_html: Path | None,
     run_log: Path | None,
+    skip_aia_forward: bool = False,
 ) -> bool:
     published_at = _utc_now_z()
     signal_id = _infer_signal_id(sig_html, run_log, published_at)
@@ -1693,7 +1694,7 @@ async def _publish_signal_result(
         publish_targets=delivered_chat_ids,
         symbol_hint=symbol_hint,
     )
-    if sig_v1 and _should_send_to_aia_for_target(target_chat_id):
+    if sig_v1 and not skip_aia_forward and _should_send_to_aia_for_target(target_chat_id):
         _queue_aia_signal_forward(
             sig_v1,
             uid=uid,

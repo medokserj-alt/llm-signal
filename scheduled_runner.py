@@ -464,6 +464,29 @@ def read_last_signal_payload() -> dict:
     return read_json(PROJECT_ROOT / "logs/last.json")
 
 
+async def forward_signal_to_aia_awaited(tg_bot, signal_json_v1: dict | None) -> dict:
+    result = {
+        "aia_forward_attempted": False,
+        "aia_forward_ok": False,
+        "aia_forward_error": None,
+        "aia_forward_mode": "awaited_scheduled",
+    }
+    if not signal_json_v1:
+        result["aia_forward_error"] = "payload_build_failed"
+        return result
+
+    result["aia_forward_attempted"] = True
+    try:
+        ok = bool(await asyncio.to_thread(tg_bot.send_signal_to_aia, signal_json_v1))
+    except Exception as exc:
+        result["aia_forward_error"] = str(exc)
+        return result
+    result["aia_forward_ok"] = ok
+    if not ok:
+        result["aia_forward_error"] = "send_signal_to_aia returned false"
+    return result
+
+
 async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, *, dry_run: bool = False) -> dict:
     import tg_bot
 
@@ -517,6 +540,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
             symbol_hint=None,
             sig_html=Path(sig_html),
             run_log=Path(run_log) if run_log else None,
+            skip_aia_forward=True,
         )
     finally:
         tg_bot.get_main_publication_targets = old_get_targets
@@ -525,6 +549,28 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
 
     published_at = datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
+    aia_forward = {
+        "aia_forward_attempted": False,
+        "aia_forward_ok": False,
+        "aia_forward_error": None,
+        "aia_forward_mode": "awaited_scheduled",
+    }
+    if ok:
+        try:
+            tg_bot._AIA_UID_CONTEXT = SCHEDULER_UID
+        except Exception:
+            pass
+        signal_json_v1 = tg_bot._build_signal_json_v1(
+            signal_id=signal_id,
+            published_at=published_at,
+            channel_id=cfg.target_chat_ids[0] if cfg.target_chat_ids else None,
+            origin_chat_id=cfg.target_chat_ids[0] if cfg.target_chat_ids else None,
+            publish_targets=cfg.target_chat_ids.copy(),
+            symbol_hint=None,
+            last_payload=payload,
+            last_json_path=PROJECT_ROOT / "logs/last.json",
+        )
+        aia_forward = await forward_signal_to_aia_awaited(tg_bot, signal_json_v1)
     return {
         "published": bool(ok),
         "reason": "published" if ok else "system_routing_api_error",
@@ -532,6 +578,8 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
         "artifact_path": relpath(Path(sig_html)),
         "run_log": relpath(Path(run_log)) if run_log else None,
         "last_payload": payload,
+        **aia_forward,
+        "aia_forward_warning": "aia_forward_failed" if ok and not aia_forward.get("aia_forward_ok") else None,
     }
 
 
@@ -622,7 +670,18 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "selected_mode": gate["selected_mode"],
                 "signal_id": result.get("signal_id"),
             }
-            row.update({"decision": "publish", "reason": result.get("reason"), "signal_id": result.get("signal_id")})
+            row.update(
+                {
+                    "decision": "publish",
+                    "reason": result.get("reason"),
+                    "signal_id": result.get("signal_id"),
+                    "aia_forward_attempted": bool(result.get("aia_forward_attempted")),
+                    "aia_forward_ok": bool(result.get("aia_forward_ok")),
+                    "aia_forward_error": result.get("aia_forward_error"),
+                    "aia_forward_mode": result.get("aia_forward_mode"),
+                    "aia_forward_warning": result.get("aia_forward_warning"),
+                }
+            )
         else:
             reason = str(result.get("reason") or "no_valid_signal_candidate")
             if attempt < cfg.max_attempts and reason in {"signal_core_no_trade", "no_valid_signal_candidate"}:

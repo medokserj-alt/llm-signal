@@ -1,8 +1,11 @@
 import asyncio
+import inspect
+import json
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import scheduled_runner as sr
@@ -172,6 +175,130 @@ class TestAiaGate(unittest.TestCase):
 
 
 class TestScheduledSignalState(unittest.TestCase):
+    async def _inline_to_thread(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def test_publish_signal_result_keeps_aia_forward_enabled_by_default(self) -> None:
+        import tg_bot
+
+        param = inspect.signature(tg_bot._publish_signal_result).parameters["skip_aia_forward"]
+        self.assertFalse(param.default)
+
+    def test_generate_and_publish_signal_awaits_aia_forward_success(self) -> None:
+        import tg_bot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html = Path(tmpdir) / "signal_20260606_153001.html"
+            log = Path(tmpdir) / "signal_20260606_153001.log"
+            payload = {"symbol": "BTC/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+            publish_kwargs = []
+            built_kwargs = []
+            sent_payloads = []
+
+            async def fake_publish(*args, **kwargs):
+                publish_kwargs.append(kwargs)
+                return True
+
+            c = cfg(Path(tmpdir))
+            with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                "scheduled_runner.read_last_signal_payload",
+                return_value=payload,
+            ), patch(
+                "scheduled_runner.make_context", return_value=SimpleNamespace(bot=SimpleNamespace(sent=[]))
+            ), patch(
+                "scheduled_runner.asyncio.to_thread", self._inline_to_thread
+            ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
+                tg_bot, "html_file_to_tg_text", return_value=["signal text"]
+            ), patch.object(
+                tg_bot, "_publish_signal_result", fake_publish
+            ), patch.object(
+                tg_bot, "_infer_signal_id", return_value="20260606_153001"
+            ), patch.object(
+                tg_bot, "_build_signal_json_v1", side_effect=lambda **kwargs: built_kwargs.append(kwargs) or {"signal_id": kwargs["signal_id"]}
+            ), patch.object(
+                tg_bot, "send_signal_to_aia", side_effect=lambda body: sent_payloads.append(body) or True
+            ):
+                result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
+
+            self.assertTrue(result["published"])
+            self.assertTrue(result["aia_forward_attempted"])
+            self.assertTrue(result["aia_forward_ok"])
+            self.assertIsNone(result["aia_forward_error"])
+            self.assertEqual(result["aia_forward_mode"], "awaited_scheduled")
+            self.assertEqual(sent_payloads, [{"signal_id": "20260606_153001"}])
+            self.assertTrue(publish_kwargs[0]["skip_aia_forward"])
+            self.assertEqual(built_kwargs[0]["publish_targets"], c.target_chat_ids)
+
+    def test_generate_and_publish_signal_aia_failure_keeps_publish(self) -> None:
+        import tg_bot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html = Path(tmpdir) / "signal_20260606_153001.html"
+            log = Path(tmpdir) / "signal_20260606_153001.log"
+            payload = {"symbol": "BTC/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+
+            async def fake_publish(*args, **kwargs):
+                return True
+
+            c = cfg(Path(tmpdir))
+            with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                "scheduled_runner.read_last_signal_payload",
+                return_value=payload,
+            ), patch(
+                "scheduled_runner.make_context", return_value=SimpleNamespace(bot=SimpleNamespace(sent=[]))
+            ), patch(
+                "scheduled_runner.asyncio.to_thread", self._inline_to_thread
+            ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
+                tg_bot, "html_file_to_tg_text", return_value=["signal text"]
+            ), patch.object(
+                tg_bot, "_publish_signal_result", fake_publish
+            ), patch.object(
+                tg_bot, "_infer_signal_id", return_value="20260606_153001"
+            ), patch.object(
+                tg_bot, "_build_signal_json_v1", return_value={"signal_id": "20260606_153001"}
+            ), patch.object(
+                tg_bot, "send_signal_to_aia", side_effect=RuntimeError("aia down")
+            ):
+                result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
+
+            self.assertTrue(result["published"])
+            self.assertEqual(result["reason"], "published")
+            self.assertTrue(result["aia_forward_attempted"])
+            self.assertFalse(result["aia_forward_ok"])
+            self.assertEqual(result["aia_forward_error"], "aia down")
+            self.assertEqual(result["aia_forward_warning"], "aia_forward_failed")
+
+    def test_run_signal_slot_logs_failed_aia_forward_as_publish_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            state = {"slots": {}}
+            slot_time = sr.slot_datetime_msk(date(2026, 6, 5), "09:30")
+            now = datetime(2026, 6, 5, 6, 30, tzinfo=timezone.utc)
+            result = {
+                "published": True,
+                "reason": "published",
+                "signal_id": "20260606_153001",
+                "aia_forward_attempted": True,
+                "aia_forward_ok": False,
+                "aia_forward_error": "aia down",
+                "aia_forward_mode": "awaited_scheduled",
+                "aia_forward_warning": "aia_forward_failed",
+            }
+            with patch("scheduled_runner.LOGS_DIR", Path(tmpdir) / "logs"), patch(
+                "scheduled_runner.load_aia_context", return_value={"status": "OPEN"}
+            ), patch("scheduled_runner.generate_and_publish_signal", return_value=result):
+                asyncio.run(sr.run_signal_slot(now, c, state, "20260605_0930", slot_time, 1, dry_run=False))
+
+            rows = (Path(tmpdir) / "logs" / "scheduled_signal_decisions_20260605.jsonl").read_text(encoding="utf-8").splitlines()
+            row = json.loads(rows[-1])
+            self.assertEqual(row["decision"], "publish")
+            self.assertEqual(row["signal_id"], "20260606_153001")
+            self.assertTrue(row["aia_forward_attempted"])
+            self.assertFalse(row["aia_forward_ok"])
+            self.assertEqual(row["aia_forward_error"], "aia down")
+            self.assertEqual(row["aia_forward_mode"], "awaited_scheduled")
+            self.assertEqual(row["aia_forward_warning"], "aia_forward_failed")
+
     def test_hard_block_defers_then_cancels(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             c = cfg(Path(tmpdir))
