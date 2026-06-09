@@ -130,6 +130,146 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(out["sl"], 583.11)
         self.assertEqual(out["tp"], {"tp1": 612.0, "tp2": 635.0})
         self.assertEqual(out["channel_id"], -1001234567890)
+        self.assertNotIn("event_risk", out)
+
+    def test_build_signal_json_includes_event_risk_and_preserves_severe(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "entry_range": [64000.0, 64200.0],
+            "sl": 64600.0,
+            "tp1": 63200.0,
+            "tp2": 62400.0,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "event_risk_context_timestamp_utc": "2026-06-09T19:30:00Z",
+            "event_risk": {
+                "event_risk_level": "severe",
+                "event_bias": "risk_off",
+                "confirm_policy": "block_stale_confirm",
+                "risk_compatibility": "aligned",
+                "direction_event_compatibility": "aligned",
+                "confirm_profile_used": "strict_event_confirm",
+                "dominant_critical_topic": {"topic_id": "geopolitical_military_escalation"},
+                "critical_topics": [{"topic_id": "geopolitical_military_escalation"}],
+                "headline_risk_active": True,
+                "macro_risk_summary": "fragile geopolitics",
+                "display_lines": ["severe geopolitics"],
+                "urgent_flag": True,
+                "urgent_message": "headline risk active",
+                "generated_at": "2026-06-09T19:31:00Z",
+                "signal_summary": {
+                    "dominant_driver": "geopolitics",
+                    "dominant_phase": "pre_event",
+                    "volatility_risk": "severe",
+                    "execution_caution": "high",
+                },
+            },
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="sig-event-risk-1",
+            published_at="2026-06-09T19:35:00Z",
+            channel_id=-1001234567890,
+        )
+
+        self.assertIsNotNone(out)
+        event = out["event_risk"]
+        self.assertEqual(event["event_risk_level"], "severe")
+        self.assertEqual(event["event_bias"], "risk_off")
+        self.assertEqual(event["direction_event_compatibility"], "aligned")
+        self.assertEqual(event["confirm_profile_used"], "strict_event_confirm")
+        self.assertEqual(event["dominant_driver"], "geopolitics")
+        self.assertEqual(event["dominant_phase"], "pre_event")
+        self.assertEqual(event["volatility_risk"], "severe")
+        self.assertEqual(event["execution_caution"], "high")
+        self.assertEqual(event["event_risk_generated_at"], "2026-06-09T19:31:00Z")
+        self.assertEqual(event["event_risk_context_timestamp_utc"], "2026-06-09T19:30:00Z")
+        self.assertEqual(event["source"], "signal_core")
+
+    def test_unknown_event_risk_level_is_not_collapsed_to_low(self) -> None:
+        tg_bot = _load_tg_bot_module()
+
+        self.assertEqual(tg_bot._normalize_event_risk_level("severe"), "severe")
+        self.assertEqual(tg_bot._normalize_event_risk_level("unexpected"), "unknown")
+
+    def test_build_signal_json_event_risk_prefers_nested_signal_context_over_stale_top_level(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "entry_range": [64000.0, 64200.0],
+            "sl": 64600.0,
+            "tp1": 63200.0,
+            "tp2": 62400.0,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "event_risk_level": "low",
+            "event_bias": "neutral",
+            "direction_event_compatibility": "neutral",
+            "event_risk": {
+                "event_risk_level": "severe",
+                "event_bias": "risk_off",
+                "direction_event_compatibility": "aligned",
+                "confirm_profile_used": "strict_event_confirm",
+                "macro_risk_summary": "fragile geopolitics",
+            },
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="sig-event-risk-precedence",
+            published_at="2026-06-09T19:35:00Z",
+            channel_id=-1001234567890,
+        )
+
+        event = out["event_risk"]
+        self.assertEqual(event["event_risk_level"], "severe")
+        self.assertEqual(event["event_bias"], "risk_off")
+        self.assertEqual(event["direction_event_compatibility"], "aligned")
+
+    def test_build_signal_json_infers_event_risk_from_summary_and_regime(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "entry_range": [64000.0, 64200.0],
+            "sl": 64600.0,
+            "tp1": 63200.0,
+            "tp2": 62400.0,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "event_risk_level": "low",
+            "event_bias": "neutral",
+            "event_risk_regime": {
+                "driver": "geopolitics",
+                "severity": "severe",
+                "risk_asymmetry": "asymmetric_downside",
+            },
+            "event_risk": {
+                "macro_risk_summary": "fragile geopolitics",
+                "signal_summary": {
+                    "dominant_driver": "geopolitics",
+                    "dominant_phase": "pre_event",
+                    "volatility_risk": "high",
+                    "execution_caution": "high",
+                },
+            },
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="sig-event-risk-infer",
+            published_at="2026-06-09T19:35:00Z",
+            channel_id=-1001234567890,
+        )
+
+        event = out["event_risk"]
+        self.assertEqual(event["event_risk_level"], "severe")
+        self.assertEqual(event["event_bias"], "risk_off")
+        self.assertEqual(event["direction_event_compatibility"], "aligned")
 
     def test_build_signal_json_uses_mode_from_last_json_without_uid_context(self) -> None:
         tg_bot = _load_tg_bot_module()

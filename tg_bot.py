@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from zoneinfo import ZoneInfo
 import asyncio
-import os, json, time, subprocess, re, html as htmllib, tempfile
+import os, json, time, subprocess, re, html as htmllib, tempfile, copy
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest, parse as urlparse
@@ -917,6 +917,143 @@ def _try_int(v) -> int | None:
             return None
     return None
 
+VALID_EVENT_RISK_LEVELS = {"low", "medium", "high", "severe"}
+
+
+def _normalize_event_risk_level(raw) -> str:
+    text = str(raw or "").strip().lower()
+    return text if text in VALID_EVENT_RISK_LEVELS else "unknown"
+
+
+def _event_risk_level_rank(raw) -> int:
+    return {"low": 1, "medium": 2, "high": 3, "severe": 4}.get(_normalize_event_risk_level(raw), 0)
+
+
+def _max_event_risk_level(*values) -> str:
+    best = "unknown"
+    best_rank = 0
+    for value in values:
+        normalized = _normalize_event_risk_level(value)
+        rank = _event_risk_level_rank(normalized)
+        if rank > best_rank:
+            best = normalized
+            best_rank = rank
+    return best
+
+
+def _infer_event_risk_level(source: dict, d: dict, signal_summary: dict) -> str:
+    regime = d.get("event_risk_regime") if isinstance(d.get("event_risk_regime"), dict) else {}
+    source_regime = source.get("event_risk_regime") if isinstance(source.get("event_risk_regime"), dict) else {}
+    return _max_event_risk_level(
+        source.get("event_risk_level"),
+        d.get("event_risk_level"),
+        regime.get("severity"),
+        source_regime.get("severity"),
+        signal_summary.get("volatility_risk"),
+        signal_summary.get("execution_caution"),
+    )
+
+
+def _infer_event_bias(source: dict, d: dict) -> str | None:
+    regime = d.get("event_risk_regime") if isinstance(d.get("event_risk_regime"), dict) else {}
+    source_regime = source.get("event_risk_regime") if isinstance(source.get("event_risk_regime"), dict) else {}
+    neutral_seen = False
+    for candidate in (
+        source.get("event_bias"),
+        d.get("event_bias"),
+        regime.get("directional_risk"),
+        regime.get("event_bias"),
+        source_regime.get("directional_risk"),
+        source_regime.get("event_bias"),
+    ):
+        text = str(candidate or "").strip().lower()
+        if text in {"risk_on", "risk_off", "uncertain", "mixed"}:
+            return text
+        if text == "neutral":
+            neutral_seen = True
+    if str(regime.get("risk_asymmetry") or source_regime.get("risk_asymmetry") or "").strip().lower() == "asymmetric_downside":
+        return "risk_off"
+    return "neutral" if neutral_seen else None
+
+
+def _event_direction_compatibility(direction, event_bias) -> str | None:
+    side = str(direction or "").strip().lower()
+    bias = str(event_bias or "").strip().lower()
+    if side not in {"long", "short"}:
+        return None
+    if bias in {"", "neutral", "unknown"}:
+        return "neutral"
+    if bias in {"mixed", "uncertain"}:
+        return "unclear"
+    if (bias == "risk_off" and side == "short") or (bias == "risk_on" and side == "long"):
+        return "aligned"
+    if (bias == "risk_off" and side == "long") or (bias == "risk_on" and side == "short"):
+        return "conflicting"
+    return None
+
+
+def _build_aia_event_risk_payload(d: dict) -> dict:
+    if not isinstance(d, dict):
+        return {}
+    source = d.get("event_risk") if isinstance(d.get("event_risk"), dict) else {}
+    if not source:
+        return {}
+    out = copy.deepcopy(source)
+
+    signal_summary = source.get("signal_summary") if isinstance(source.get("signal_summary"), dict) else {}
+    for src_key, out_key in (
+        ("dominant_driver", "dominant_driver"),
+        ("dominant_phase", "dominant_phase"),
+        ("volatility_risk", "volatility_risk"),
+        ("execution_caution", "execution_caution"),
+    ):
+        if out.get(out_key) is None and signal_summary.get(src_key) is not None:
+            out[out_key] = signal_summary.get(src_key)
+
+    for key in (
+        "event_risk_level",
+        "event_bias",
+        "confirm_policy",
+        "risk_compatibility",
+        "direction_event_compatibility",
+        "confirm_profile_used",
+        "headline_risk_active",
+        "dominant_critical_topic",
+        "critical_topics",
+        "soft_veto_reason",
+        "soft_veto_origin",
+        "macro_risk_summary",
+        "display_lines",
+        "urgent_flag",
+        "urgent_message",
+        "generated_at",
+        "timestamp_utc",
+        "event_risk_context_timestamp_utc",
+    ):
+        if out.get(key) is None and key in d and d.get(key) is not None:
+            out[key] = copy.deepcopy(d.get(key))
+
+    inferred_level = _infer_event_risk_level(source, d, signal_summary)
+    if inferred_level != "unknown" and _event_risk_level_rank(inferred_level) > _event_risk_level_rank(out.get("event_risk_level")):
+        out["event_risk_level"] = inferred_level
+    elif out.get("event_risk_level") is not None:
+        out["event_risk_level"] = _normalize_event_risk_level(out.get("event_risk_level"))
+
+    inferred_bias = _infer_event_bias(source, d)
+    if inferred_bias is not None and (out.get("event_bias") is None or str(out.get("event_bias")).strip().lower() == "neutral"):
+        out["event_bias"] = inferred_bias
+    inferred_compatibility = _event_direction_compatibility(d.get("direction") or d.get("side"), out.get("event_bias"))
+    if inferred_compatibility and (out.get("direction_event_compatibility") is None or str(out.get("direction_event_compatibility")).strip().lower() == "neutral"):
+        out["direction_event_compatibility"] = inferred_compatibility
+    generated_at = out.get("event_risk_generated_at") or out.get("generated_at") or out.get("timestamp_utc")
+    if generated_at is not None:
+        out["event_risk_generated_at"] = generated_at
+    if out.get("event_risk_context_timestamp_utc") is None and d.get("event_risk_context_timestamp_utc") is not None:
+        out["event_risk_context_timestamp_utc"] = d.get("event_risk_context_timestamp_utc")
+    if out.get("source") is None:
+        out["source"] = "signal_core"
+    return out
+
 def _shorten_text(s: str, max_len: int = 220) -> str:
     t = (s or "").strip()
     if not t:
@@ -1504,6 +1641,9 @@ def _build_signal_json_v1(
         out["publish_targets"] = publish_targets
     if entry_price is not None:
         out["entry_price"] = float(entry_price)
+    event_risk = _build_aia_event_risk_payload(d)
+    if event_risk:
+        out["event_risk"] = event_risk
     if meta is not None:
         out["meta"] = meta
         if meta.get("entry_type") == "wait_confirm":

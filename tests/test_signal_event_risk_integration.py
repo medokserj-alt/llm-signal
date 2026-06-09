@@ -60,12 +60,14 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         self.assertEqual(d.get("direction"), "long")
         self.assertEqual(d.get("side"), "long")
         self.assertEqual(d.get("entry_mode"), "wait_confirm")
-        self.assertEqual(d.get("confidence"), "Medium")
+        self.assertEqual(d.get("confidence"), "Low")
         self.assertIn("event_risk_wait_confirm_preferred", d.get("warnings") or [])
         self.assertIn("event_risk_geopolitical_execution_caution", d.get("warnings") or [])
         self.assertIn("event_risk_no_chasing", d.get("warnings") or [])
         self.assertIn("event_risk_continuation_stricter", d.get("warnings") or [])
         self.assertIn("ретеста", str(d.get("confirmation_rules") or "").lower())
+        self.assertEqual((d.get("event_risk") or {}).get("event_risk_level"), "severe")
+        self.assertEqual((d.get("event_risk") or {}).get("event_bias"), "risk_off")
         self.assertEqual(
             d.get("event_risk_summary"),
             {
@@ -134,9 +136,11 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         )
         self.assertEqual(d.get("entry_mode"), "wait_confirm")
         self.assertIn("event_risk_post_event_unstable_follow_through", d.get("warnings") or [])
+        self.assertEqual((d.get("event_risk") or {}).get("event_risk_level"), "severe")
+        self.assertEqual((d.get("event_risk") or {}).get("event_bias"), "risk_off")
         display_lines = " ".join((d.get("event_risk") or {}).get("display_lines") or []).lower()
-        self.assertIn("послесобытийная волатильность", display_lines)
-        self.assertIn("ложные пробои", display_lines)
+        self.assertIn("тяжёлый геополитический режим", display_lines)
+        self.assertIn("fragile geopolitical regime", display_lines)
 
     def test_no_strong_event_risk_preserves_existing_signal_behavior(self) -> None:
         d = self._base_signal()
@@ -187,7 +191,7 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
 
         get_signal_json.apply_upcoming_event_risk(d)
 
-        self.assertIn("геополитическая траектория эскалации остаётся нерешённой", d.get("macro_risk_summary") or "")
+        self.assertIn("тяжёлый геополитический режим остаётся нерешённым", d.get("macro_risk_summary") or "")
         self.assertIn("US CPI", d.get("macro_risk_summary") or "")
 
     def test_macro_risk_summary_puts_structured_driver_first_and_calendar_second(self) -> None:
@@ -222,7 +226,7 @@ class TestSignalEventRiskIntegration(unittest.TestCase):
         get_signal_json.apply_upcoming_event_risk(d)
 
         summary = d.get("macro_risk_summary") or ""
-        structured_text = "геополитическая траектория эскалации остаётся нерешённой"
+        structured_text = "тяжёлый геополитический режим остаётся нерешённым"
         calendar_text = "04.04.2026, 18:00 — US CPI (high)"
         self.assertTrue(summary.startswith(structured_text))
         self.assertLess(summary.index(structured_text), summary.index(calendar_text))

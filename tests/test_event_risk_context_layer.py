@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import get_signal_json
 from event_risk_context import build_event_risk_context, render_event_risk_context_section
@@ -25,6 +28,37 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(snapshot.get("event_risk_level"), "severe")
         self.assertEqual((snapshot.get("dominant_critical_topic") or {}).get("topic_id"), "strategic_shipping_energy_chokepoint")
         self.assertEqual(snapshot.get("confirm_policy"), "block_stale_confirm")
+
+    def test_read_aia_event_risk_context_preserves_severe(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "event_risk_context_latest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "event_risk_level": "severe",
+                        "event_risk_window_active": True,
+                        "nearest_event_minutes": 12,
+                        "event_bias": "risk_off",
+                        "upcoming_events": [{"name": "US CPI", "category": "macro", "impact": "high"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            out = get_signal_json.read_aia_event_risk_context(path)
+
+        self.assertEqual(out["event_risk_level"], "severe")
+        self.assertTrue(out["event_risk_window_active"])
+        self.assertEqual(out["event_bias"], "risk_off")
+
+    def test_read_aia_event_risk_context_unknown_level_is_not_low(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "event_risk_context_latest.json"
+            path.write_text(json.dumps({"event_risk_level": "unexpected"}), encoding="utf-8")
+
+            out = get_signal_json.read_aia_event_risk_context(path)
+
+        self.assertEqual(out["event_risk_level"], "unknown")
 
     def test_critical_topic_preserves_multiple_topics_and_dominant(self) -> None:
         news = "\n".join(

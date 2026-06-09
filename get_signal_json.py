@@ -2879,6 +2879,7 @@ def _event_risk_level_rank(value) -> int:
         "low": 1,
         "medium": 2,
         "high": 3,
+        "severe": 4,
     }.get(text, 0)
 
 
@@ -2890,7 +2891,7 @@ def _max_event_risk_level(*values) -> str:
         if rank > best_rank:
             best = _normalize_optional_text(value).lower() or "none"
             best_rank = rank
-    return best if best in {"none", "low", "medium", "high"} else "none"
+    return best if best in {"none", "low", "medium", "high", "severe"} else "none"
 
 
 def _event_risk_regime_rank(value) -> int:
@@ -3161,6 +3162,35 @@ def _structured_event_regime_layer(snapshot: dict) -> dict:
         "continuation_mode": _normalize_optional_text(layer.get("continuation_mode")).lower(),
         "strictness": _normalize_optional_text(layer.get("strictness")).lower(),
     }
+
+
+def _compact_event_risk_level_from_summary(summary: dict | None, regime_layer: dict | None = None) -> str:
+    summary = summary if isinstance(summary, dict) else {}
+    regime_layer = regime_layer if isinstance(regime_layer, dict) else {}
+    return _max_event_risk_level(
+        regime_layer.get("severity"),
+        summary.get("volatility_risk"),
+        summary.get("execution_caution"),
+    )
+
+
+def _compact_event_bias_from_context(dominant_item: dict | None, regime_layer: dict | None = None) -> str:
+    dominant_item = dominant_item if isinstance(dominant_item, dict) else {}
+    regime_layer = regime_layer if isinstance(regime_layer, dict) else {}
+    fallback_bias = ""
+    bias = _normalize_optional_text(
+        dominant_item.get("directional_risk")
+        or dominant_item.get("event_bias")
+        or regime_layer.get("directional_risk")
+        or regime_layer.get("event_bias")
+    ).lower()
+    if bias in {"risk_on", "risk_off", "mixed"}:
+        return bias
+    if bias in {"uncertain", "neutral"}:
+        fallback_bias = bias
+    if _normalize_optional_text(regime_layer.get("risk_asymmetry")).lower() == "asymmetric_downside":
+        return "risk_off"
+    return fallback_bias or "neutral"
 
 
 def _signal_event_driver_from_category(value) -> str:
@@ -3552,6 +3582,13 @@ def apply_upcoming_event_risk(d: dict) -> None:
         "display_lines": [],
         "signal_summary": copy.deepcopy(event_risk_summary),
     }
+    compact_event_risk_level = _compact_event_risk_level_from_summary(event_risk_summary, regime_layer)
+    if compact_event_risk_level != "none":
+        event_risk["event_risk_level"] = compact_event_risk_level
+    dominant_item = structured_state.get("dominant_item") if isinstance(structured_state.get("dominant_item"), dict) else {}
+    compact_event_bias = _compact_event_bias_from_context(dominant_item, regime_layer)
+    if compact_event_bias:
+        event_risk["event_bias"] = compact_event_bias
 
     if active_other:
         _append_unique_str(d, "warnings", "upcoming_event_caution_window")
@@ -7861,7 +7898,9 @@ def read_aia_event_risk_context(event_risk_path: Path | None = None) -> dict:
             break
 
     return {
-        "event_risk_level": raw.get("event_risk_level") if raw.get("event_risk_level") in {"low", "medium", "high"} else "low",
+        "event_risk_level": raw.get("event_risk_level")
+        if raw.get("event_risk_level") in {"low", "medium", "high", "severe"}
+        else "unknown",
         "event_risk_window_active": bool(raw.get("event_risk_window_active")),
         "nearest_event_minutes": raw.get("nearest_event_minutes") if isinstance(raw.get("nearest_event_minutes"), int) else None,
         "event_bias": raw.get("event_bias")
