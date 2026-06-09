@@ -73,3 +73,51 @@ def test_btc_short_under_risk_off_alarm_can_remain_allowed_wait_confirm() -> Non
     assert out["entry_mode"] == "wait_confirm"
     assert out["risk_compatibility"] == "aligned"
     assert "critical_topic_direction_aligned_wait_confirm" in out["warnings"]
+    assert "severe_event_aligned_direction_strict_confirm_only" in out["warnings"]
+
+
+def test_risk_on_btc_long_can_publish_with_strict_confirm() -> None:
+    out = _base_signal(direction="long", symbol="BTC/USDT")
+    out["event_bias"] = "risk_on"
+    out["critical_topics"][0]["event_bias"] = "risk_on"
+    out["dominant_critical_topic"]["event_bias"] = "risk_on"
+    out.setdefault("warnings", [])
+    out.setdefault("no_trade_reasons", [])
+    get_signal_json.apply_critical_topic_risk_compatibility(out)
+
+    assert out["no_trade"] is False
+    assert out["entry_mode"] == "wait_confirm"
+    assert out["direction_event_compatibility"] == "aligned"
+    assert out["confirm_profile_used"] == "risk_on_long_confirm"
+    assert "severe_event_aligned_direction_strict_confirm_only" in out["warnings"]
+
+
+def test_risk_on_short_without_breakdown_is_no_trade() -> None:
+    out = _base_signal(direction="short", symbol="BTC/USDT")
+    out["event_bias"] = "risk_on"
+    out["critical_topics"][0]["event_bias"] = "risk_on"
+    out["dominant_critical_topic"]["event_bias"] = "risk_on"
+    out["technical_rationale"] = "Weak fade idea near range; structure is mixed and unconfirmed."
+    out.setdefault("warnings", [])
+    out.setdefault("no_trade_reasons", [])
+    get_signal_json.apply_critical_topic_risk_compatibility(out)
+
+    assert out["no_trade"] is True
+    assert out["entry_mode"] == "wait_confirm"
+    assert out["direction_event_compatibility"] == "conflicting"
+    assert "counter_regime_short_requires_confirmed_breakdown" in out["no_trade_reasons"]
+
+
+def test_mixed_regime_low_liquidity_alt_is_no_trade() -> None:
+    out = _base_signal(direction="long", symbol="DOGE/USDT")
+    out["critical_topics"] = []
+    out["dominant_critical_topic"] = {}
+    out["event_bias"] = "mixed"
+    out["event_risk_regime"] = {"severity": "severe", "directional_risk": "mixed"}
+    out.setdefault("warnings", [])
+    out.setdefault("no_trade_reasons", [])
+    get_signal_json.apply_critical_topic_risk_compatibility(out)
+
+    assert out["no_trade"] is True
+    assert out["entry_mode"] == "wait_confirm"
+    assert "mixed_regime_low_liquidity_alt_requires_clean_major" in out["no_trade_reasons"]
