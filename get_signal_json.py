@@ -40,6 +40,7 @@ from event_calendar import (
     build_calendar_risk_summary,
     render_calendar_section,
 )
+from macro_event_guard import evaluate_macro_event_guard, normalize_scheduled_macro_events
 
 VALID_MODES = {"aggressive", "neutral", "conservative"}
 VALID_HOLDING_HORIZONS = {"intraday", "intraday_to_1_2d", "short_swing", "multi_day"}
@@ -1113,6 +1114,9 @@ def _normalize_upcoming_event_item(item):
     for key, value in item.items():
         if key in out or key in text_keys or key in number_keys:
             continue
+        if key == "post_event_classification" and isinstance(value, dict):
+            out[key] = copy.deepcopy(value)
+            continue
         if isinstance(value, (str, int, float, bool)) and not isinstance(value, bool):
             text = _normalize_optional_text(value)
             if text:
@@ -1154,6 +1158,11 @@ def ensure_macro_event_fields(d: dict) -> None:
     )
     d["upcoming_events"] = _merge_upcoming_event_lists(normalized_events)
     d["macro_risk_summary"] = _merge_unique_texts(normalized_summary, max_fragments=3)
+    existing_structured = d.get("scheduled_macro_events") if isinstance(d.get("scheduled_macro_events"), list) else []
+    d["scheduled_macro_events"] = normalize_scheduled_macro_events(
+        [*existing_structured, *d["upcoming_events"]],
+        source="day" if d.get("report_type") == "day" else "mid" if d.get("report_type") == "mid" else "signal",
+    )
 
 
 def _normalize_text_key(value) -> str:
@@ -3725,6 +3734,99 @@ def apply_upcoming_event_risk(d: dict) -> None:
         event_risk.pop("active_events", None)
 
     d["event_risk"] = event_risk
+
+
+def apply_scheduled_macro_event_guard(d: dict) -> None:
+    if not isinstance(d, dict):
+        return
+    ensure_macro_event_fields(d)
+    _normalize_day_mid_context(d)
+    now_dt = _resolve_macro_event_now_dt(d.get("time_msk"))
+    if now_dt is None:
+        return
+    ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
+    events = []
+    for source in (
+        d.get("scheduled_macro_events"),
+        d.get("upcoming_events"),
+        ctx.get("scheduled_macro_events") if isinstance(ctx, dict) else None,
+        ctx.get("upcoming_events") if isinstance(ctx, dict) else None,
+    ):
+        if isinstance(source, list):
+            events.extend(source)
+    structured = normalize_scheduled_macro_events(
+        events,
+        source="signal",
+        now=now_dt,
+        state_path=BASE / "logs" / "macro_event_state.json",
+    )
+    d["scheduled_macro_events"] = structured
+    if isinstance(ctx, dict):
+        ctx["scheduled_macro_events"] = copy.deepcopy(structured)
+        d["day_mid_context"] = ctx
+
+    side = d.get("side") or d.get("direction")
+    guard = evaluate_macro_event_guard(
+        now=now_dt,
+        events=structured,
+        side=str(side or ""),
+        forced_override=os.getenv("ALLOW_MACRO_BLACKOUT_SIGNAL") == "1",
+        state_path=BASE / "logs" / "macro_event_state.json",
+    )
+    d["macro_event_guard"] = guard
+    if not guard.get("active"):
+        return
+
+    event = guard.get("event") if isinstance(guard.get("event"), dict) else {}
+    diagnostics = {
+        "scheduled_macro_event_active": True,
+        "macro_event_name": event.get("event_name"),
+        "macro_event_time_msk": event.get("event_time_msk"),
+        "macro_phase": guard.get("phase"),
+        "macro_policy": guard.get("macro_policy"),
+        "macro_message_type": guard.get("macro_message_type"),
+        "post_event_classification": guard.get("post_event_classification"),
+        "old_narrative_valid": (guard.get("post_event_classification") or {}).get("old_narrative_valid")
+        if isinstance(guard.get("post_event_classification"), dict)
+        else None,
+        "allowed_direction": (guard.get("post_event_classification") or {}).get("allowed_direction")
+        if isinstance(guard.get("post_event_classification"), dict)
+        else None,
+    }
+    d["macro_event_diagnostics"] = diagnostics
+    if isinstance(d.get("event_risk"), dict):
+        d["event_risk"].update(diagnostics)
+
+    if not guard.get("blocked"):
+        if guard.get("phase") == "post_event_classified":
+            policy = str(guard.get("macro_policy") or "")
+            if policy in {"trade_allowed_strict_confirm", "no_chase_wait_pullback"}:
+                d["entry_mode"] = "wait_confirm"
+                _append_unique_str(d, "warnings", "post_event_macro_strict_confirm_required")
+            if guard.get("reason") == "post_event_no_chase_wait_retest":
+                _append_unique_str(d, "warnings", "post_event_no_chase_wait_retest")
+        return
+
+    d["no_trade"] = True
+    reason = str(guard.get("reason") or "scheduled_macro_pre_event_blackout")
+    _append_unique_str(d, "no_trade_reasons", reason)
+    if reason == "scheduled_macro_pre_event_blackout":
+        d["no_trade_hint"] = (
+            f"{event.get('event_name') or 'Macro event'} at {event.get('event_time_msk') or 'scheduled time'} MSK: "
+            f"no new entries before release; management only."
+        )
+        d["blackout_phase"] = "pre_event"
+        d["blackout_remaining_minutes"] = guard.get("blackout_remaining_minutes")
+    elif reason == "post_event_reprice_required":
+        d["no_trade_hint"] = (
+            f"{event.get('event_name') or 'Macro event'} released; post-event reprice classification required before new directional entries."
+        )
+    elif reason == "post_event_reaction_chaotic":
+        d["no_trade_hint"] = "Post-event reaction is chaotic or unclear; no new directional signal."
+    elif reason in {"macro_event_direction_requires_fresh_breakdown", "macro_event_direction_requires_fresh_reclaim"}:
+        d["no_trade_hint"] = "Post-event macro classification invalidates the stale direction until fresh structure confirms."
+    elif reason == "post_event_no_chase_wait_retest":
+        d["no_trade_hint"] = "Post-event direction may be valid, but chasing first impulse is blocked; wait retest/pullback."
 
 
 # ---- тикеры с last и 24h % ----
@@ -7656,6 +7758,10 @@ def finalize_signal(data: dict, hints: dict | None = None, *, fetch_price: bool 
     except Exception:
         pass
     try:
+        apply_scheduled_macro_event_guard(d)
+    except Exception:
+        pass
+    try:
         apply_critical_topic_risk_compatibility(d)
     except Exception:
         pass
@@ -7847,12 +7953,30 @@ def merge_event_calendar_context(
     if not normalized_events and not normalized_summary:
         return ctx
 
+    structured_events = normalize_scheduled_macro_events(
+        normalized_events,
+        source="calendar" if profile == "signal" else profile,
+        now=now_dt,
+        state_path=BASE / "logs" / "macro_event_state.json",
+    )
     d["upcoming_events"] = _merge_upcoming_event_lists(normalized_events, d.get("upcoming_events"))
+    d["scheduled_macro_events"] = normalize_scheduled_macro_events(
+        [*structured_events, *(d.get("scheduled_macro_events") if isinstance(d.get("scheduled_macro_events"), list) else [])],
+        source=profile,
+        now=now_dt,
+        state_path=BASE / "logs" / "macro_event_state.json",
+    )
     d["macro_risk_summary"] = _merge_unique_texts(normalized_summary, d.get("macro_risk_summary"), max_fragments=3)
 
     dm_ctx = d.get("day_mid_context") if isinstance(d.get("day_mid_context"), dict) else {}
     dm_ctx = dict(dm_ctx)
     dm_ctx["upcoming_events"] = _merge_upcoming_event_lists(normalized_events, dm_ctx.get("upcoming_events"))
+    dm_ctx["scheduled_macro_events"] = normalize_scheduled_macro_events(
+        [*structured_events, *(dm_ctx.get("scheduled_macro_events") if isinstance(dm_ctx.get("scheduled_macro_events"), list) else [])],
+        source=profile,
+        now=now_dt,
+        state_path=BASE / "logs" / "macro_event_state.json",
+    )
     dm_ctx["macro_risk_summary"] = _merge_unique_texts(
         normalized_summary,
         dm_ctx.get("macro_risk_summary"),

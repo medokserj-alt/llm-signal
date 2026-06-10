@@ -9,6 +9,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+from macro_event_guard import evaluate_macro_event_guard, macro_dedupe_key, normalize_scheduled_macro_events
 
 MSK = ZoneInfo("Europe/Moscow")
 UTC = timezone.utc
@@ -222,7 +223,7 @@ def due_signal_slots(now_utc: datetime, cfg: SchedulerConfig, state: dict) -> li
         scheduled = slot_datetime_msk(now_msk.date(), hhmm)
         sid = slot_id_for(scheduled)
         sstate = slots_state.get(sid)
-        if isinstance(sstate, dict) and sstate.get("status") in {"cancelled", "deferred", "error"}:
+        if isinstance(sstate, dict) and sstate.get("status") in {"published", "macro_substitution", "cancelled", "deferred", "error"}:
             continue
         if is_due(now_msk, scheduled, cfg.due_window_minutes):
             out.append((sid, scheduled, 1))
@@ -270,6 +271,88 @@ def load_aia_context() -> dict:
                 merged[key] = value
     merged["aia_context_missing"] = missing
     return merged
+
+
+def load_scheduled_macro_events(now_utc: datetime) -> list[dict]:
+    events: list[dict] = []
+    for path in (
+        PROJECT_ROOT / "logs/last.json",
+        PROJECT_ROOT / "logs/macro_event_state.json",
+        PROJECT_ROOT / "data/event_calendar.json",
+    ):
+        data = read_json(path)
+        if not data:
+            continue
+        for key in ("scheduled_macro_events", "calendar_events", "upcoming_events", "events"):
+            value = data.get(key)
+            if isinstance(value, list):
+                events.extend(value)
+    return normalize_scheduled_macro_events(
+        events,
+        source="calendar",
+        now=now_utc,
+        state_path=PROJECT_ROOT / "logs/macro_event_state.json",
+    )
+
+
+def render_macro_event_message(message_type: str, event: dict, classification: dict | None = None) -> str:
+    name = event.get("event_name") or event.get("event") or "Macro event"
+    time_msk = event.get("event_time_msk") or event.get("time_msk") or "scheduled time"
+    if message_type == "PRE_EVENT_MACRO_NOTICE":
+        return (
+            f"📊 MACRO EVENT UPDATE • {name} • {time_msk} МСК\n\n"
+            "До события действует no-new-entry blackout.\n"
+            "Новые входы не открывать; активные позиции только сопровождать."
+        )
+    if message_type == "MACRO_EVENT_ANALYSIS_PENDING":
+        return (
+            f"📊 MACRO EVENT UPDATE • {name} • {time_msk} МСК\n\n"
+            "Данные вышли, но пост-ивентовая реакция ещё не классифицирована.\n"
+            "Новые входы не открывать; ждём 1–2 M15 свечи и оценку BTC/ETH реакции."
+        )
+    cls = classification if isinstance(classification, dict) else {}
+    decision = str(cls.get("execution_policy") or "trade_allowed_strict_confirm").upper()
+    allowed = str(cls.get("allowed_direction") or "none").upper()
+    actual = cls.get("actual_vs_forecast") or cls.get("core_actual_vs_forecast") or "unknown"
+    reaction = cls.get("market_reaction") or "unknown"
+    btc = cls.get("btc_reaction") or "unknown"
+    old_valid = cls.get("old_narrative_valid")
+    if message_type == "MACRO_NO_TRADE_RECOMMENDATION":
+        return (
+            f"📊 MACRO EVENT UPDATE • {name} • {time_msk} МСК\n\n"
+            f"Факт/реакция: {actual}; market read: {reaction}; BTC: {btc}.\n"
+            "Execution: реакция хаотичная/неподтверждённая, новые directional entries не открывать.\n\n"
+            "Decision: NO_TRADE_CHAOTIC"
+        )
+    return (
+        f"📊 MACRO EVENT UPDATE • {name} • {time_msk} МСК\n\n"
+        f"Факт/реакция: {actual}; market read: {reaction}.\n"
+        f"BTC reaction: {btc}; old narrative valid: {old_valid}.\n\n"
+        f"Execution: allowed direction {allowed}; strict confirm / pullback / retest only, no chase.\n"
+        f"Decision: {decision}"
+    )
+
+
+async def publish_macro_event_message(cfg: SchedulerConfig, message: str, *, dry_run: bool = False) -> list[int]:
+    context = make_context(dry_run=dry_run)
+    message_ids: list[int] = []
+    for channel in cfg.target_chat_ids:
+        sent = await context.bot.send_message(chat_id=channel, text=message, parse_mode=None, disable_web_page_preview=True)
+        message_id = getattr(sent, "message_id", None)
+        if isinstance(message_id, int):
+            message_ids.append(message_id)
+    return message_ids
+
+
+def macro_message_allowed(state: dict, dedupe_key: str, message_type: str, now_utc: datetime, classification: dict | None = None) -> bool:
+    dedupe = state.setdefault("macro_dedupe", {})
+    existing = dedupe.get(dedupe_key)
+    if not isinstance(existing, dict):
+        return True
+    if message_type == "MACRO_EVENT_UPDATE":
+        old_cls = existing.get("post_event_classification")
+        return bool(classification and old_cls != classification)
+    return False
 
 
 def _norm(value, default="unknown") -> str:
@@ -634,16 +717,84 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
 async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, slot_id: str, slot_time: datetime, attempt: int, *, dry_run: bool = False) -> None:
     slots = state.setdefault("slots", {})
     current = slots.get(slot_id)
-    if isinstance(current, dict) and current.get("status") == "published":
+    if isinstance(current, dict) and current.get("status") in {"published", "macro_substitution"}:
         gate = evaluate_aia_gate(load_aia_context(), cfg)
         row = base_signal_log_row(now_utc, cfg, slot_id, slot_time, attempt, gate)
-        row.update({"decision": "duplicate_skip", "reason": "already_published", "signal_id": current.get("signal_id")})
+        row.update({"decision": "duplicate_skip", "reason": f"already_{current.get('status')}", "signal_id": current.get("signal_id")})
         if not dry_run:
             append_jsonl(signal_decision_log_path(now_utc), row)
         return
 
     gate = evaluate_aia_gate(load_aia_context(), cfg)
     row = base_signal_log_row(now_utc, cfg, slot_id, slot_time, attempt, gate)
+    macro_events = load_scheduled_macro_events(now_utc)
+    macro_guard = evaluate_macro_event_guard(
+        now=now_utc,
+        events=macro_events,
+        side=str(gate.get("focus_direction") or ""),
+        forced_override=False,
+        state_path=PROJECT_ROOT / "logs/macro_event_state.json",
+    )
+    if macro_guard.get("active"):
+        event = macro_guard.get("event") if isinstance(macro_guard.get("event"), dict) else {}
+        classification = macro_guard.get("post_event_classification") if isinstance(macro_guard.get("post_event_classification"), dict) else None
+        message_type = str(macro_guard.get("macro_message_type") or "MACRO_EVENT_ANALYSIS_PENDING")
+        if macro_guard.get("phase") == "post_event_classified" and classification:
+            if str(classification.get("execution_policy") or "") == "no_trade_chaotic" or str(classification.get("allowed_direction") or "") == "none":
+                message_type = "MACRO_NO_TRADE_RECOMMENDATION"
+            else:
+                message_type = "MACRO_TRADE_PROPOSAL"
+        dedupe_key = macro_dedupe_key(event, message_type, str(macro_guard.get("phase") or "macro"), now_utc)
+        should_send = macro_message_allowed(state, dedupe_key, message_type, now_utc, classification)
+        message_ids: list[int] = []
+        if should_send:
+            message = render_macro_event_message(message_type, event, classification)
+            message_ids = await publish_macro_event_message(cfg, message, dry_run=dry_run)
+            state.setdefault("macro_dedupe", {})[dedupe_key] = {
+                "sent_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
+                "macro_message_type": message_type,
+                "post_event_classification": classification,
+            }
+        slots[slot_id] = {
+            "slot_id": slot_id,
+            "slot_time_msk": slot_time.isoformat(),
+            "attempt": attempt,
+            "status": "macro_substitution",
+            "next_retry_at_msk": None,
+            "reason": macro_guard.get("reason") or "scheduled_signal_substituted_by_macro_event",
+            "selected_mode": gate["selected_mode"],
+            "signal_id": None,
+            "macro_message_type": message_type,
+            "macro_event_name": event.get("event_name"),
+            "macro_event_time_msk": event.get("event_time_msk"),
+            "macro_dedupe_key": dedupe_key,
+            "post_event_classification_status": "present" if classification else "missing",
+        }
+        row.update(
+            {
+                "decision": "macro_substitution",
+                "reason": macro_guard.get("reason") or "scheduled_signal_substituted_by_macro_event",
+                "macro_event_name": event.get("event_name"),
+                "macro_event_time_msk": event.get("event_time_msk"),
+                "macro_phase": macro_guard.get("phase"),
+                "macro_policy": macro_guard.get("macro_policy"),
+                "macro_message_type": message_type,
+                "macro_dedupe_key": dedupe_key,
+                "macro_message_sent": should_send,
+                "macro_message_ids": message_ids,
+                "macro_substitution_applied": True,
+                "scheduled_signal_substituted": True,
+                "post_event_classification": classification,
+                "post_event_classification_status": "present" if classification else "missing",
+                "old_narrative_valid": classification.get("old_narrative_valid") if isinstance(classification, dict) else None,
+                "allowed_direction": classification.get("allowed_direction") if isinstance(classification, dict) else None,
+            }
+        )
+        if not dry_run:
+            write_json_atomic(cfg.signal_state_path, state)
+            append_jsonl(signal_decision_log_path(now_utc), row)
+        return
+
     if not gate["allowed"]:
         if attempt < cfg.max_attempts:
             retry_at = slot_time + timedelta(minutes=cfg.retry_delay_minutes)
