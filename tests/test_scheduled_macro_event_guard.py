@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -77,6 +78,48 @@ class TestScheduledMacroEventGuard(unittest.TestCase):
         self.assertIs(guard["blocked"], True)
         self.assertEqual(guard["reason"], "post_event_reprice_required")
         self.assertEqual(guard["macro_message_type"], "MACRO_EVENT_ANALYSIS_PENDING")
+
+    def test_missing_post_event_classification_ttl_expires_stale_cpi(self) -> None:
+        events = normalize_scheduled_macro_events([_cpi_event()])
+
+        pre_event = evaluate_macro_event_guard(
+            now=datetime(2026, 6, 10, 11, 30, tzinfo=timezone.utc),
+            events=events,
+            side="short",
+        )
+        self.assertIs(pre_event["active"], True)
+        self.assertIs(pre_event["blocked"], True)
+        self.assertEqual(pre_event["phase"], "pre_event")
+        self.assertEqual(pre_event["reason"], "scheduled_macro_pre_event_blackout")
+
+        pending_1535 = evaluate_macro_event_guard(
+            now=datetime(2026, 6, 10, 12, 35, tzinfo=timezone.utc),
+            events=events,
+            side="short",
+        )
+        self.assertIs(pending_1535["active"], True)
+        self.assertIs(pending_1535["blocked"], True)
+        self.assertEqual(pending_1535["phase"], "awaiting_reprice")
+        self.assertEqual(pending_1535["reason"], "post_event_reprice_required")
+        self.assertEqual(pending_1535["macro_message_type"], "MACRO_EVENT_ANALYSIS_PENDING")
+
+        pending_1600 = evaluate_macro_event_guard(
+            now=datetime(2026, 6, 10, 13, 0, tzinfo=timezone.utc),
+            events=events,
+            side="short",
+        )
+        self.assertIs(pending_1600["active"], True)
+        self.assertEqual(pending_1600["reason"], "post_event_reprice_required")
+
+        expired_1831 = evaluate_macro_event_guard(
+            now=datetime(2026, 6, 10, 15, 31, tzinfo=timezone.utc),
+            events=events,
+            side="short",
+        )
+        self.assertIs(expired_1831["active"], False)
+        self.assertIs(expired_1831["blocked"], False)
+        self.assertEqual(expired_1831["phase"], "expired_missing_classification")
+        self.assertEqual(expired_1831["reason"], "macro_event_reprice_expired_without_classification")
 
     def test_softer_risk_on_classification_invalidates_old_btc_short(self) -> None:
         event = _cpi_event()
@@ -207,6 +250,69 @@ class TestScheduledMacroEventGuard(unittest.TestCase):
             self.assertEqual(slot["status"], "macro_substitution")
             self.assertEqual(slot["reason"], "post_event_reprice_required")
             self.assertEqual(slot["macro_message_type"], "MACRO_EVENT_ANALYSIS_PENDING")
+
+    def test_stale_cpi_next_day_0030_uses_normal_scheduled_signal_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            state_path = tmp_path / "scheduled_signal_state.json"
+            cfg = scheduled_runner.SchedulerConfig(
+                start_date_msk=scheduled_runner.date(2026, 6, 10),
+                target_chat_ids=[-1001],
+                day_enabled=False,
+                day_time_msk="09:00",
+                mid_enabled=False,
+                mid_time_msk="08:45",
+                mid_interval_days=3,
+                signal_enabled=True,
+                signal_default_mode="aggressive",
+                signal_slots_msk=["00:30"],
+                retry_delay_minutes=60,
+                max_attempts=2,
+                gate_mode="soft",
+                preferred_mode_downgrade_enabled=False,
+                soft_avoid_downgrade=False,
+                signal_state_path=state_path,
+                publish_state_path=tmp_path / "publish.json",
+                due_window_minutes=5,
+            )
+            now = datetime(2026, 6, 10, 21, 30, tzinfo=timezone.utc)
+            publish_macro = mock.AsyncMock(return_value=[1001])
+            generate_signal = mock.AsyncMock(return_value={"published": True, "reason": "published", "signal_id": "sig-0030"})
+            with mock.patch.object(
+                scheduled_runner,
+                "load_scheduled_macro_events",
+                lambda current: normalize_scheduled_macro_events([_cpi_event()], now=current),
+            ), mock.patch.object(scheduled_runner, "load_aia_context", lambda: {}), mock.patch.object(
+                scheduled_runner, "signal_decision_log_path", lambda current: tmp_path / "decisions.jsonl"
+            ), mock.patch.object(
+                scheduled_runner, "publish_macro_event_message", publish_macro
+            ), mock.patch.object(
+                scheduled_runner, "generate_and_publish_signal", generate_signal
+            ):
+                asyncio.run(
+                    scheduled_runner.run_signal_slot(
+                        now,
+                        cfg,
+                        {},
+                        "20260611_0030",
+                        scheduled_runner.slot_datetime_msk(scheduled_runner.date(2026, 6, 11), "00:30"),
+                        1,
+                        dry_run=False,
+                    )
+                )
+
+            state = scheduled_runner.read_json(state_path)
+            slot = state["slots"]["20260611_0030"]
+            self.assertEqual(slot["status"], "published")
+            self.assertEqual(slot["reason"], "published")
+            self.assertEqual(slot["signal_id"], "sig-0030")
+            publish_macro.assert_not_awaited()
+            generate_signal.assert_awaited_once()
+
+            decision = json.loads((tmp_path / "decisions.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(decision["decision"], "publish")
+            self.assertEqual(decision["macro_phase"], "expired_missing_classification")
+            self.assertEqual(decision["macro_reason"], "macro_event_reprice_expired_without_classification")
 
 
 if __name__ == "__main__":

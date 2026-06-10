@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +35,15 @@ FORCED_HIGH_IMPACT_NEEDLES = (
     "fed press conference",
 )
 VALID_CATEGORIES = {"macro_inflation", "macro_rates", "jobs", "fed", "other"}
+DEFAULT_MACRO_POST_EVENT_ANALYSIS_TTL_MINUTES = 90
+DEFAULT_MACRO_EVENT_GUARD_MAX_AGE_MINUTES = 180
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(int(float(os.getenv(name, str(default)))), 0)
+    except Exception:
+        return default
 
 
 def _text(value: Any) -> str:
@@ -217,6 +227,9 @@ def evaluate_macro_event_guard(
 ) -> dict:
     now_utc = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
     normalized = normalize_scheduled_macro_events(events, now=now_utc, state_path=state_path)
+    post_event_ttl_minutes = _env_int("MACRO_POST_EVENT_ANALYSIS_TTL_MINUTES", DEFAULT_MACRO_POST_EVENT_ANALYSIS_TTL_MINUTES)
+    guard_max_age_minutes = _env_int("MACRO_EVENT_GUARD_MAX_AGE_MINUTES", DEFAULT_MACRO_EVENT_GUARD_MAX_AGE_MINUTES)
+    expired_guard: dict | None = None
     for event in normalized:
         try:
             event_dt = datetime.fromisoformat(str(event["event_time_utc"]).replace("Z", "+00:00")).astimezone(UTC)
@@ -224,6 +237,7 @@ def evaluate_macro_event_guard(
             continue
         pre_start = event_dt - timedelta(minutes=int(event.get("pre_blackout_minutes") or 90))
         cls = event.get("post_event_classification") if isinstance(event.get("post_event_classification"), dict) else None
+        age_minutes = int((now_utc - event_dt).total_seconds() // 60) if now_utc >= event_dt else None
         if pre_start <= now_utc < event_dt:
             remaining = int(max((event_dt - now_utc).total_seconds() // 60, 0))
             return {
@@ -235,9 +249,16 @@ def evaluate_macro_event_guard(
                 "macro_message_type": "PRE_EVENT_MACRO_NOTICE",
                 "event": event,
                 "blackout_remaining_minutes": remaining,
+                "event_age_minutes": age_minutes,
                 "post_event_classification": cls,
             }
-        if now_utc >= event_dt and event.get("post_analysis_required", True) and not cls:
+        if (
+            now_utc >= event_dt
+            and event.get("post_analysis_required", True)
+            and not cls
+            and age_minutes is not None
+            and age_minutes <= post_event_ttl_minutes
+        ):
             return {
                 "active": True,
                 "blocked": not forced_override,
@@ -247,8 +268,30 @@ def evaluate_macro_event_guard(
                 "macro_message_type": "MACRO_EVENT_ANALYSIS_PENDING",
                 "event": event,
                 "blackout_remaining_minutes": 0,
+                "event_age_minutes": age_minutes,
                 "post_event_classification": None,
             }
+        if (
+            now_utc >= event_dt
+            and event.get("post_analysis_required", True)
+            and not cls
+            and age_minutes is not None
+            and age_minutes > guard_max_age_minutes
+        ):
+            expired_guard = {
+                "active": False,
+                "blocked": False,
+                "phase": "expired_missing_classification",
+                "reason": "macro_event_reprice_expired_without_classification",
+                "macro_policy": "expired_stale_event_ignored",
+                "macro_message_type": None,
+                "event": event,
+                "blackout_remaining_minutes": 0,
+                "event_age_minutes": age_minutes,
+                "post_event_classification": None,
+                "events": normalized,
+            }
+            continue
         if now_utc >= event_dt and cls:
             allowed = _text(cls.get("allowed_direction")).lower()
             policy = _text(cls.get("execution_policy")).lower()
@@ -276,8 +319,11 @@ def evaluate_macro_event_guard(
                 "macro_message_type": "MACRO_NO_TRADE_RECOMMENDATION" if blocked else "MACRO_TRADE_PROPOSAL",
                 "event": event,
                 "blackout_remaining_minutes": 0,
+                "event_age_minutes": age_minutes,
                 "post_event_classification": cls,
             }
+    if expired_guard:
+        return expired_guard
     return {"active": False, "blocked": False, "phase": "none", "reason": "none", "events": normalized}
 
 
@@ -285,7 +331,7 @@ def macro_dedupe_key(event: dict, message_type: str, phase: str, now: datetime) 
     if message_type == "PRE_EVENT_MACRO_NOTICE":
         bucket_minutes = 30
     elif message_type == "MACRO_EVENT_ANALYSIS_PENDING":
-        bucket_minutes = 10
+        return f"{event.get('event_id')}:{message_type}:{phase}"
     else:
         bucket_minutes = 24 * 60
     now_msk = now.astimezone(MSK)

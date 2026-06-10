@@ -735,6 +735,21 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         forced_override=False,
         state_path=PROJECT_ROOT / "logs/macro_event_state.json",
     )
+    if macro_guard.get("phase") == "expired_missing_classification":
+        event = macro_guard.get("event") if isinstance(macro_guard.get("event"), dict) else {}
+        row.update(
+            {
+                "macro_event_name": event.get("event_name"),
+                "macro_event_time_msk": event.get("event_time_msk"),
+                "macro_phase": macro_guard.get("phase"),
+                "macro_policy": macro_guard.get("macro_policy"),
+                "macro_reason": macro_guard.get("reason"),
+                "macro_event_age_minutes": macro_guard.get("event_age_minutes"),
+                "macro_substitution_applied": False,
+                "scheduled_signal_substituted": False,
+                "post_event_classification_status": "missing",
+            }
+        )
     if macro_guard.get("active"):
         event = macro_guard.get("event") if isinstance(macro_guard.get("event"), dict) else {}
         classification = macro_guard.get("post_event_classification") if isinstance(macro_guard.get("post_event_classification"), dict) else None
