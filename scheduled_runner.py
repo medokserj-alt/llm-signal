@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
@@ -20,6 +22,30 @@ DEFAULT_TARGET_CHAT_IDS = [-1003492385200, -1003493070625, -1003530482991]
 DEFAULT_START_DATE = "2026-06-05"
 DEFAULT_SIGNAL_SLOTS = ["09:30", "12:30", "15:30", "18:30", "21:30", "00:30"]
 SCHEDULER_UID = -9000605
+
+IN_WORK_SIGNAL_STATUSES = {
+    "WAIT_CONFIRM",
+    "WAIT_POST_EVENT_REPRICE",
+    "CONFIRM_LIVE",
+    "SETUP_ARMED",
+    "ENTRY_LIVE",
+    "HOLD",
+    "TRAIL_STOP",
+    "REDUCE",
+    "MANAGEMENT_ONLY",
+}
+WAIT_REPLACEABLE_STATUSES = {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE"}
+LIVE_POSITION_STATUSES = {"ENTRY_LIVE", "HOLD", "TRAIL_STOP", "REDUCE", "MANAGEMENT_ONLY"}
+NOT_IN_WORK_SIGNAL_STATUSES = {
+    "EXPIRED_NO_CONFIRM",
+    "INVALIDATED_NO_CONFIRM",
+    "CANCEL_WAIT_CONFIRM",
+    "REPLACED_BY_NEW_SIGNAL",
+    "CLOSED",
+    "STOP_LOSS_HIT",
+    "TAKE_PROFIT_DONE",
+}
+SCHEDULED_SIGNAL_LIFECYCLE_EVENTS_PATH = LOGS_DIR / "scheduled_signal_lifecycle_events.jsonl"
 
 
 def utc_now() -> datetime:
@@ -130,6 +156,460 @@ def relpath(path: Path | None) -> str | None:
         return path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except Exception:
         return str(path)
+
+
+def _try_float(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_symbol(value) -> str:
+    text = str(value or "").strip().upper()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def _display_symbol(value) -> str:
+    text = str(value or "").strip().upper()
+    if "/" in text:
+        return text
+    norm = _normalize_symbol(text)
+    if norm.endswith("USDT") and len(norm) > 4:
+        return f"{norm[:-4]}/USDT"
+    return text or "UNKNOWN"
+
+
+def _normalize_direction(value) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"long", "buy"}:
+        return "long"
+    if text in {"short", "sell"}:
+        return "short"
+    return text
+
+
+def _confidence_rank(value) -> int | None:
+    text = str(value or "").strip().lower()
+    if text in {"low", "низкая"}:
+        return 1
+    if text in {"medium", "mid", "средняя"}:
+        return 2
+    if text in {"high", "высокая"}:
+        return 3
+    numeric = _try_float(value)
+    if numeric is None:
+        return None
+    if numeric >= 0.75:
+        return 3
+    if numeric >= 0.5:
+        return 2
+    return 1
+
+
+def _entry_from_payload(payload: dict) -> float | None:
+    entry = _try_float(payload.get("entry_price"))
+    if entry is not None:
+        return entry
+    entry_range = payload.get("entry_range") or payload.get("entry_zone")
+    if isinstance(entry_range, dict):
+        low = _try_float(entry_range.get("min"))
+        high = _try_float(entry_range.get("max"))
+    elif isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
+        low = _try_float(entry_range[0])
+        high = _try_float(entry_range[1])
+    else:
+        low = high = None
+    if low is not None and high is not None:
+        return (low + high) / 2.0
+    return None
+
+
+def _candidate_from_payload(payload: dict, signal_id: str | None = None) -> dict:
+    tp = payload.get("tp") if isinstance(payload.get("tp"), dict) else {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    return {
+        "signal_id": signal_id,
+        "symbol": _normalize_symbol(payload.get("symbol")),
+        "display_symbol": _display_symbol(payload.get("symbol")),
+        "direction": _normalize_direction(payload.get("direction") or payload.get("side")),
+        "entry_price": _entry_from_payload(payload),
+        "sl": _try_float(payload.get("sl")),
+        "tp1": _try_float(payload.get("tp1") if payload.get("tp1") is not None else tp.get("tp1")),
+        "tp2": _try_float(payload.get("tp2") if payload.get("tp2") is not None else tp.get("tp2")),
+        "rr": _try_float(payload.get("rr")),
+        "confidence": payload.get("confidence"),
+        "confidence_rank": _confidence_rank(payload.get("confidence")),
+        "mode": str(payload.get("mode") or meta.get("mode") or "").strip().lower(),
+        "holding_horizon": str(payload.get("holding_horizon") or "").strip().lower(),
+        "strategy_type": str(payload.get("entry_mode") or meta.get("entry_type") or "").strip().lower(),
+        "ema20_m15": _try_float(payload.get("ema20_m15")),
+        "hard_block_conditions": payload.get("hard_block_conditions") if isinstance(payload.get("hard_block_conditions"), list) else [],
+        "no_trade": bool(payload.get("no_trade")),
+    }
+
+
+def _rr_for_signal(signal: dict) -> float | None:
+    explicit = _try_float(signal.get("rr"))
+    if explicit is not None:
+        return explicit
+    entry = _try_float(signal.get("entry_price"))
+    sl = _try_float(signal.get("sl"))
+    tp2 = _try_float(signal.get("tp2"))
+    side = _normalize_direction(signal.get("direction"))
+    if entry is None or sl is None or tp2 is None or entry == sl:
+        return None
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+    if side == "short":
+        reward = entry - tp2
+    else:
+        reward = tp2 - entry
+    return round(reward / risk, 4) if reward > 0 else None
+
+
+def _distance_pct(a: float | None, b: float | None) -> float | None:
+    if a is None or b is None:
+        return None
+    base = max(abs(a), abs(b))
+    if base <= 0:
+        return None
+    return abs(a - b) / base * 100.0
+
+
+def _strategy_compatible(old: dict, new: dict) -> bool:
+    old_strategy = str(old.get("strategy_type") or "").strip().lower()
+    new_strategy = str(new.get("strategy_type") or "").strip().lower()
+    if old_strategy and new_strategy and old_strategy != new_strategy:
+        return False
+    old_mode = str(old.get("mode") or "").strip().lower()
+    new_mode = str(new.get("mode") or "").strip().lower()
+    return not (old_mode and new_mode and old_mode != new_mode)
+
+
+def _horizon_compatible(old: dict, new: dict) -> bool:
+    old_horizon = str(old.get("holding_horizon") or "").strip().lower()
+    new_horizon = str(new.get("holding_horizon") or "").strip().lower()
+    if not old_horizon or not new_horizon:
+        return True
+    intraday_family = {"intraday", "intraday_to_1_2d"}
+    swing_family = {"short_swing", "multi_day"}
+    return old_horizon == new_horizon or {old_horizon, new_horizon} <= intraday_family or {old_horizon, new_horizon} <= swing_family
+
+
+def _parse_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except Exception:
+        pass
+    return rows
+
+
+def _recent_aia_log_paths(now_utc: datetime | None = None, days: int = 7) -> list[Path]:
+    root = Path(os.getenv("AIA_LOGS_DIR", "/root/llm-signal-ai-agent/logs"))
+    if now_utc is None:
+        now_utc = utc_now()
+    out: list[Path] = []
+    for offset in range(days - 1, -1, -1):
+        tag = (now_utc.date() - timedelta(days=offset)).strftime("%Y%m%d")
+        out.append(root / f"agent_actions_{tag}.jsonl")
+    return out
+
+
+def _action_row_to_signal(row: dict) -> dict | None:
+    signal_id = row.get("signal_id")
+    status = str(row.get("status") or "").strip().upper()
+    symbol = _normalize_symbol(row.get("symbol"))
+    direction = _normalize_direction(row.get("direction"))
+    if not signal_id or not status:
+        return None
+    event_risk = row.get("event_risk_context") if isinstance(row.get("event_risk_context"), dict) else {}
+    return {
+        "signal_id": str(signal_id),
+        "status": status,
+        "symbol": symbol,
+        "display_symbol": _display_symbol(symbol),
+        "direction": direction,
+        "entry_price": _try_float(row.get("entry_price")),
+        "sl": _try_float(row.get("sl")),
+        "tp1": _try_float(row.get("tp1")),
+        "tp2": _try_float(row.get("tp2")),
+        "rr": _try_float(row.get("rr")),
+        "confidence": row.get("confidence"),
+        "confidence_rank": _confidence_rank(row.get("confidence")),
+        "mode": str(row.get("mode") or "").strip().lower(),
+        "holding_horizon": str(row.get("holding_horizon") or "").strip().lower(),
+        "strategy_type": str(row.get("entry_mode") or "").strip().lower(),
+        "ts": row.get("ts") or row.get("ts_utc"),
+        "filled": status in LIVE_POSITION_STATUSES or bool(row.get("entry_detection_ts")),
+        "cancelled_by_scheduler": False,
+        "hard_block_conditions": row.get("hard_block_conditions") if isinstance(row.get("hard_block_conditions"), list) else [],
+        "event_risk_level": row.get("event_risk_level") or event_risk.get("event_risk_level"),
+    }
+
+
+def load_in_work_signal_state(now_utc: datetime | None = None) -> list[dict]:
+    latest: dict[str, dict] = {}
+    for path in _recent_aia_log_paths(now_utc):
+        for row in _parse_jsonl(path):
+            signal = _action_row_to_signal(row)
+            if signal is not None:
+                latest[signal["signal_id"]] = {**latest.get(signal["signal_id"], {}), **signal}
+
+    for row in _parse_jsonl(SCHEDULED_SIGNAL_LIFECYCLE_EVENTS_PATH):
+        signal_id = str(row.get("signal_id") or row.get("replaced_signal_id") or "")
+        if not signal_id:
+            continue
+        current = latest.get(signal_id, {"signal_id": signal_id})
+        status = str(row.get("status") or "").strip().upper()
+        if status:
+            current["status"] = status
+        current["cancelled_by_scheduler"] = status in {"CANCEL_WAIT_CONFIRM", "REPLACED_BY_NEW_SIGNAL"}
+        current["replaced_by_signal_id"] = row.get("replaced_by_signal_id")
+        latest[signal_id] = current
+
+    return [
+        signal
+        for signal in latest.values()
+        if str(signal.get("status") or "").upper() in IN_WORK_SIGNAL_STATUSES and not signal.get("cancelled_by_scheduler")
+    ]
+
+
+def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict]) -> dict:
+    out = {
+        "duplicate_in_work_signal_detected": False,
+        "duplicate_signal_id": None,
+        "duplicate_signal_status": None,
+        "publication_type": "full_signal",
+        "replacement_selected": False,
+        "replacement_reason": "",
+        "replaced_signal_id": None,
+        "replacing_signal_id": candidate.get("signal_id"),
+        "old_entry": None,
+        "new_candidate_entry": candidate.get("entry_price"),
+        "old_sl": None,
+        "new_candidate_sl": candidate.get("sl"),
+        "entry_distance_pct": None,
+        "sl_distance_pct": None,
+        "rr_old": None,
+        "rr_new": _rr_for_signal(candidate),
+        "confidence_old": None,
+        "confidence_new": candidate.get("confidence"),
+        "strategy_same_or_compatible": True,
+        "duplicate_signal": None,
+    }
+    symbol = candidate.get("symbol")
+    direction = candidate.get("direction")
+    same_symbol = [s for s in active_signals if s.get("symbol") == symbol]
+    opposite = next((s for s in same_symbol if s.get("direction") and s.get("direction") != direction), None)
+    if opposite is not None:
+        out.update(
+            {
+                "duplicate_in_work_signal_detected": True,
+                "duplicate_signal_id": opposite.get("signal_id"),
+                "duplicate_signal_status": opposite.get("status"),
+                "publication_type": "conflict_update",
+                "replacement_reason": "opposite_direction_in_work_signal",
+                "duplicate_signal": opposite,
+            }
+        )
+        return out
+
+    entry_threshold = _try_float(os.getenv("SCHEDULED_DUPLICATE_ENTRY_DISTANCE_PCT")) or 0.5
+    sl_threshold = _try_float(os.getenv("SCHEDULED_DUPLICATE_SL_DISTANCE_PCT")) or 1.0
+    related: list[tuple[float, dict, float | None, float | None, bool]] = []
+    for old in same_symbol:
+        if old.get("direction") != direction:
+            continue
+        entry_distance = _distance_pct(old.get("entry_price"), candidate.get("entry_price"))
+        sl_distance = _distance_pct(old.get("sl"), candidate.get("sl"))
+        strategy_ok = _strategy_compatible(old, candidate)
+        horizon_ok = _horizon_compatible(old, candidate)
+        if (
+            entry_distance is not None
+            and entry_distance <= entry_threshold
+            and (sl_distance is None or sl_distance <= sl_threshold)
+            and strategy_ok
+            and horizon_ok
+        ):
+            related.append((entry_distance, old, entry_distance, sl_distance, strategy_ok))
+
+    if not related:
+        return out
+
+    _, old, entry_distance, sl_distance, strategy_ok = sorted(related, key=lambda item: item[0])[0]
+    rr_old = _rr_for_signal(old)
+    rr_new = _rr_for_signal(candidate)
+    out.update(
+        {
+            "duplicate_in_work_signal_detected": True,
+            "duplicate_signal_id": old.get("signal_id"),
+            "duplicate_signal_status": old.get("status"),
+            "publication_type": "active_signal_update",
+            "replacement_reason": "same_symbol_direction_in_work",
+            "replaced_signal_id": None,
+            "old_entry": old.get("entry_price"),
+            "old_sl": old.get("sl"),
+            "entry_distance_pct": round(entry_distance, 6) if entry_distance is not None else None,
+            "sl_distance_pct": round(sl_distance, 6) if sl_distance is not None else None,
+            "rr_old": rr_old,
+            "rr_new": rr_new,
+            "confidence_old": old.get("confidence"),
+            "strategy_same_or_compatible": strategy_ok,
+            "duplicate_signal": old,
+        }
+    )
+
+    status = str(old.get("status") or "").upper()
+    if status in LIVE_POSITION_STATUSES:
+        out["publication_type"] = "active_signal_update"
+        out["replacement_reason"] = "existing_signal_live_or_management"
+        return out
+    if status not in WAIT_REPLACEABLE_STATUSES:
+        out["publication_type"] = "active_signal_update"
+        out["replacement_reason"] = "existing_signal_confirmed_or_armed"
+        return out
+    if old.get("filled"):
+        out["replacement_reason"] = "old_signal_already_filled"
+        return out
+    if candidate.get("no_trade") or candidate.get("hard_block_conditions"):
+        out["replacement_reason"] = "candidate_has_hard_block"
+        return out
+
+    rr_not_worse = rr_old is None or rr_new is None or rr_new + 0.0001 >= rr_old
+    old_conf = old.get("confidence_rank")
+    new_conf = candidate.get("confidence_rank")
+    confidence_not_worse = old_conf is None or new_conf is None or new_conf >= old_conf
+    old_risk = abs(float(old["entry_price"]) - float(old["sl"])) if old.get("entry_price") is not None and old.get("sl") is not None else None
+    new_risk = abs(float(candidate["entry_price"]) - float(candidate["sl"])) if candidate.get("entry_price") is not None and candidate.get("sl") is not None else None
+    sl_not_wider = old_risk is None or new_risk is None or new_risk <= old_risk * 1.0025
+    ema20 = candidate.get("ema20_m15")
+    closer_to_structure = False
+    if ema20 is not None and old.get("entry_price") is not None and candidate.get("entry_price") is not None:
+        closer_to_structure = abs(float(candidate["entry_price"]) - ema20) < abs(float(old["entry_price"]) - ema20)
+    materially_better = closer_to_structure or (rr_old is not None and rr_new is not None and rr_new > rr_old + 0.05) or (
+        old_conf is not None and new_conf is not None and new_conf > old_conf
+    ) or (old_risk is not None and new_risk is not None and new_risk < old_risk * 0.995)
+
+    if rr_not_worse and confidence_not_worse and sl_not_wider and materially_better:
+        out["publication_type"] = "replace_wait_confirm"
+        out["replacement_selected"] = True
+        out["replacement_reason"] = "updated_wait_confirm_levels_materially_better"
+        out["replaced_signal_id"] = old.get("signal_id")
+    else:
+        out["replacement_reason"] = "replacement_not_materially_better"
+    return out
+
+
+def _msk_label_from_signal_id(signal_id: str | None) -> str:
+    text = str(signal_id or "")
+    try:
+        if len(text) >= 13 and text[8] == "_":
+            return f"{text[9:11]}:{text[11:13]} МСК"
+    except Exception:
+        pass
+    return "ранее"
+
+
+def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
+    old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
+    symbol = candidate.get("display_symbol") or old.get("display_symbol") or _display_symbol(candidate.get("symbol"))
+    side = str(candidate.get("direction") or old.get("direction") or "").upper()
+    status = old.get("status") or decision.get("duplicate_signal_status") or "UNKNOWN"
+    old_id = old.get("signal_id") or decision.get("duplicate_signal_id")
+    if decision.get("publication_type") == "conflict_update":
+        return (
+            "🔄 RE_EVAL_ACTIVE_SIGNAL\n\n"
+            f"{symbol} уже в работе, но новый scheduled scan видит противоположный bias.\n"
+            f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+            f"Статус AIA: {status}.\n\n"
+            "Решение:\n"
+            "Новый противоположный сигнал не публикуем автоматически.\n"
+            "Нужна AIA management decision: HOLD / REDUCE / CLOSE / TRAIL / RE_EVAL.\n\n"
+            "Это не новый вход."
+        )
+    title = "🔄 MANAGEMENT_UPDATE" if str(status).upper() in LIVE_POSITION_STATUSES else "🔄 ACTIVE SIGNAL UPDATE"
+    entry_line = "Вход уже активирован." if str(status).upper() in LIVE_POSITION_STATUSES else "Вход ещё не активирован."
+    return (
+        f"{title}\n\n"
+        f"{symbol} {side} уже в работе.\n"
+        f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+        f"Статус AIA: {status}.\n"
+        f"{entry_line}\n\n"
+        f"Новый scheduled scan снова выбрал {symbol} {side}, но это та же торговая идея.\n\n"
+        "ТВХ:\n"
+        f"Старая ТВХ: {old.get('entry_price')}\n"
+        f"Новая расчётная ТВХ: {candidate.get('entry_price')}\n\n"
+        "Решение:\n"
+        "Старый setup остаётся актуальным.\n"
+        "Новый сигнал не публикуем, чтобы не дублировать вход.\n"
+        "AIA продолжает сопровождать активный сигнал.\n\n"
+        "Это не новый сигнал."
+    )
+
+
+def render_replacement_prefix(decision: dict, candidate: dict) -> str:
+    old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
+    symbol = candidate.get("display_symbol") or old.get("display_symbol") or _display_symbol(candidate.get("symbol"))
+    side = str(candidate.get("direction") or old.get("direction") or "").upper()
+    old_id = old.get("signal_id") or decision.get("duplicate_signal_id")
+    return (
+        "🔁 UPDATED WAIT_CONFIRM / SIGNAL REPLACEMENT\n\n"
+        f"{symbol} {side} уже был в ожидании подтверждения.\n"
+        f"Старый сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+        "Вход по нему ещё не был исполнен.\n\n"
+        "Новый scheduled scan подтвердил тот же сценарий, но уровни стали актуальнее.\n\n"
+        f"Старый entry: {old.get('entry_price')}\n"
+        f"Новый entry: {candidate.get('entry_price')}\n"
+        f"Старый SL: {old.get('sl')}\n"
+        f"Новый SL: {candidate.get('sl')}\n\n"
+        "Решение:\n"
+        "Старый wait_confirm снимаем и заменяем обновлённым setup.\n"
+        "AIA дальше подтверждает уже новый уровень.\n\n"
+        "Это не второй вход и не scale-in.\n\n"
+    )
+
+
+async def publish_plain_message(cfg: SchedulerConfig, message: str, *, dry_run: bool = False) -> list[int]:
+    context = make_context(dry_run=dry_run)
+    message_ids: list[int] = []
+    for channel in cfg.target_chat_ids:
+        sent = await context.bot.send_message(chat_id=channel, text=message, parse_mode=None, disable_web_page_preview=True)
+        if dry_run:
+            message_ids.append(getattr(sent, "message_id", None))
+    return [mid for mid in message_ids if mid is not None]
+
+
+def emit_replacement_event(decision: dict, candidate: dict) -> None:
+    append_jsonl(
+        SCHEDULED_SIGNAL_LIFECYCLE_EVENTS_PATH,
+        {
+            "ts": utc_now().isoformat().replace("+00:00", "Z"),
+            "status": "REPLACED_BY_NEW_SIGNAL",
+            "reason": "replaced_by_updated_wait_confirm",
+            "signal_id": decision.get("replaced_signal_id"),
+            "replaced_by_signal_id": candidate.get("signal_id"),
+            "replacement_reason": decision.get("replacement_reason"),
+            "old_entry": decision.get("old_entry"),
+            "new_candidate_entry": decision.get("new_candidate_entry"),
+            "old_sl": decision.get("old_sl"),
+            "new_candidate_sl": decision.get("new_candidate_sl"),
+        },
+    )
 
 
 @dataclass
@@ -588,6 +1068,7 @@ async def forward_signal_to_aia_awaited(tg_bot, signal_json_v1: dict | None) -> 
 async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, *, dry_run: bool = False) -> dict:
     import tg_bot
 
+    duplicate_decision = {"publication_type": "full_signal", "duplicate_in_work_signal_detected": False}
     env = {"FORCE_MODE": selected_mode, "SIGNAL_SKIP_AIA_SEND": "1"}
     proc = run_command(["bash", "-lc", "./signal full"], env=env, timeout=1200, dry_run=dry_run)
     if getattr(proc, "returncode", 1) != 0:
@@ -618,7 +1099,37 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
             "signal_id": None,
             "artifact_path": relpath(Path(sig_html)),
             "last_payload": payload,
+            **duplicate_decision,
         }
+
+    published_at = datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
+    candidate = _candidate_from_payload(payload, signal_id=signal_id)
+    duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state())
+    duplicate_result = {k: v for k, v in duplicate_decision.items() if k != "duplicate_signal"}
+
+    if duplicate_decision.get("publication_type") in {"active_signal_update", "conflict_update"}:
+        message = render_duplicate_update_message(duplicate_decision, candidate)
+        message_ids = await publish_plain_message(cfg, message, dry_run=dry_run)
+        return {
+            "published": True,
+            "reason": str(duplicate_decision.get("replacement_reason") or "duplicate_in_work_signal"),
+            "signal_id": None,
+            "artifact_path": relpath(Path(sig_html)),
+            "run_log": relpath(Path(run_log)) if run_log else None,
+            "last_payload": payload,
+            "message_ids": message_ids,
+            "aia_forward_attempted": False,
+            "aia_forward_ok": False,
+            "aia_forward_error": None,
+            "aia_forward_mode": "skipped_duplicate_update",
+            "aia_forward_warning": None,
+            **duplicate_result,
+        }
+
+    publish_text = parts[0]
+    if duplicate_decision.get("publication_type") == "replace_wait_confirm":
+        publish_text = render_replacement_prefix(duplicate_decision, candidate) + parts[0]
 
     old_get_targets = tg_bot.get_main_publication_targets
     old_get_chat = tg_bot.get_main_publication_chat_id
@@ -631,7 +1142,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
         ok = await tg_bot._publish_signal_result(
             context,
             SCHEDULER_UID,
-            text=parts[0],
+            text=publish_text,
             target_chat_id=cfg.target_chat_ids[0],
             delivery_kind="main",
             source="scheduled_runner.py:generate_and_publish_signal",
@@ -645,8 +1156,6 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
         tg_bot.get_main_publication_chat_id = old_get_chat
         tg_bot.get_user_mode = old_get_mode
 
-    published_at = datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-    signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
     aia_forward = {
         "aia_forward_attempted": False,
         "aia_forward_ok": False,
@@ -668,6 +1177,12 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
             last_payload=payload,
             last_json_path=PROJECT_ROOT / "logs/last.json",
         )
+        if signal_json_v1 and duplicate_decision.get("publication_type") == "replace_wait_confirm":
+            signal_json_v1["publication_type"] = "replace_wait_confirm"
+            signal_json_v1["replaced_signal_id"] = duplicate_decision.get("replaced_signal_id")
+            signal_json_v1["replacement_reason"] = duplicate_decision.get("replacement_reason")
+            if not dry_run:
+                emit_replacement_event(duplicate_decision, candidate)
         aia_forward = await forward_signal_to_aia_awaited(tg_bot, signal_json_v1)
     return {
         "published": bool(ok),
@@ -678,6 +1193,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
         "last_payload": payload,
         **aia_forward,
         "aia_forward_warning": "aia_forward_failed" if ok and not aia_forward.get("aia_forward_ok") else None,
+        **duplicate_result,
     }
 
 
@@ -717,7 +1233,7 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
 async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, slot_id: str, slot_time: datetime, attempt: int, *, dry_run: bool = False) -> None:
     slots = state.setdefault("slots", {})
     current = slots.get(slot_id)
-    if isinstance(current, dict) and current.get("status") in {"published", "macro_substitution"}:
+    if isinstance(current, dict) and current.get("status") in {"published", "macro_substitution", "active_signal_update", "replace_wait_confirm", "conflict_update"}:
         gate = evaluate_aia_gate(load_aia_context(), cfg)
         row = base_signal_log_row(now_utc, cfg, slot_id, slot_time, attempt, gate)
         row.update({"decision": "duplicate_skip", "reason": f"already_{current.get('status')}", "signal_id": current.get("signal_id")})
@@ -844,19 +1360,23 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
     try:
         result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run)
         if result.get("published"):
+            publication_type = str(result.get("publication_type") or "full_signal")
             slots[slot_id] = {
                 "slot_id": slot_id,
                 "slot_time_msk": slot_time.isoformat(),
                 "attempt": attempt,
-                "status": "published",
+                "status": "published" if publication_type == "full_signal" else publication_type,
                 "next_retry_at_msk": None,
                 "reason": result.get("reason"),
                 "selected_mode": gate["selected_mode"],
                 "signal_id": result.get("signal_id"),
+                "publication_type": publication_type,
+                "duplicate_signal_id": result.get("duplicate_signal_id"),
+                "replaced_signal_id": result.get("replaced_signal_id"),
             }
             row.update(
                 {
-                    "decision": "publish",
+                    "decision": "publish" if publication_type == "full_signal" else publication_type,
                     "reason": result.get("reason"),
                     "signal_id": result.get("signal_id"),
                     "aia_forward_attempted": bool(result.get("aia_forward_attempted")),
@@ -866,6 +1386,28 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                     "aia_forward_warning": result.get("aia_forward_warning"),
                 }
             )
+            for key in (
+                "duplicate_in_work_signal_detected",
+                "duplicate_signal_id",
+                "duplicate_signal_status",
+                "publication_type",
+                "replacement_selected",
+                "replacement_reason",
+                "replaced_signal_id",
+                "replacing_signal_id",
+                "old_entry",
+                "new_candidate_entry",
+                "old_sl",
+                "new_candidate_sl",
+                "entry_distance_pct",
+                "sl_distance_pct",
+                "rr_old",
+                "rr_new",
+                "confidence_old",
+                "confidence_new",
+                "strategy_same_or_compatible",
+            ):
+                row[key] = result.get(key)
         else:
             reason = str(result.get("reason") or "no_valid_signal_candidate")
             if attempt < cfg.max_attempts and reason in {"signal_core_no_trade", "no_valid_signal_candidate"}:

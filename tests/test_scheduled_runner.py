@@ -234,6 +234,98 @@ class TestScheduledSignalState(unittest.TestCase):
     async def _inline_to_thread(self, func, *args, **kwargs):
         return func(*args, **kwargs)
 
+    def _candidate(self, **overrides) -> dict:
+        base = sr._candidate_from_payload(
+            {
+                "symbol": "BNB/USDT",
+                "direction": "long",
+                "entry_range": [610.0, 610.28],
+                "sl": 604.04,
+                "tp1": 616.4,
+                "tp2": 628.6,
+                "rr": 3.0,
+                "confidence": "high",
+                "entry_mode": "wait_confirm",
+                "holding_horizon": "intraday_to_1_2d",
+                "mode": "neutral",
+                "ema20_m15": 610.14,
+            },
+            signal_id="20260614_123006",
+        )
+        base.update(overrides)
+        return base
+
+    def _old(self, status: str = "WAIT_CONFIRM", **overrides) -> dict:
+        base = {
+            "signal_id": "20260614_093003",
+            "status": status,
+            "symbol": "BNBUSDT",
+            "display_symbol": "BNB/USDT",
+            "direction": "long",
+            "entry_price": 610.2,
+            "sl": 604.1,
+            "tp1": 623.2,
+            "tp2": 629.3,
+            "rr": 3.13,
+            "confidence": "high",
+            "confidence_rank": 3,
+            "mode": "neutral",
+            "holding_horizon": "intraday_to_1_2d",
+            "strategy_type": "wait_confirm",
+            "filled": status in sr.LIVE_POSITION_STATUSES,
+        }
+        base.update(overrides)
+        return base
+
+    def test_wait_confirm_near_duplicate_with_improved_tvh_replaces(self) -> None:
+        candidate = self._candidate(entry_price=610.14, sl=604.1, rr=3.2, ema20_m15=610.14)
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old(rr=3.0)])
+        self.assertEqual(decision["publication_type"], "replace_wait_confirm")
+        self.assertTrue(decision["replacement_selected"])
+        self.assertEqual(decision["replaced_signal_id"], "20260614_093003")
+
+    def test_wait_confirm_near_duplicate_without_material_improvement_updates(self) -> None:
+        candidate = self._candidate(entry_price=610.14, sl=604.04, rr=3.0, ema20_m15=610.0)
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old(rr=3.1)])
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertFalse(decision["replacement_selected"])
+
+    def test_wait_confirm_near_duplicate_with_worse_rr_updates(self) -> None:
+        candidate = self._candidate(entry_price=610.14, sl=603.0, rr=2.0, ema20_m15=610.14)
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old(rr=3.0)])
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertFalse(decision["replacement_selected"])
+
+    def test_setup_armed_near_duplicate_does_not_replace(self) -> None:
+        decision = sr.evaluate_duplicate_publication(self._candidate(), [self._old("SETUP_ARMED", filled=False)])
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertFalse(decision["replacement_selected"])
+
+    def test_entry_live_or_hold_near_duplicate_updates_management(self) -> None:
+        for status in ("ENTRY_LIVE", "HOLD"):
+            decision = sr.evaluate_duplicate_publication(self._candidate(), [self._old(status)])
+            self.assertEqual(decision["publication_type"], "active_signal_update")
+            self.assertFalse(decision["replacement_selected"])
+
+    def test_opposite_direction_existing_signal_conflict_update(self) -> None:
+        candidate = self._candidate(direction="short")
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old("HOLD")])
+        self.assertEqual(decision["publication_type"], "conflict_update")
+        self.assertEqual(decision["replacement_reason"], "opposite_direction_in_work_signal")
+
+    def test_terminal_existing_signal_allows_full_signal(self) -> None:
+        candidate = self._candidate()
+        old = self._old("EXPIRED_NO_CONFIRM")
+        decision = sr.evaluate_duplicate_publication(candidate, [])
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertFalse(decision["duplicate_in_work_signal_detected"])
+        self.assertNotIn(old["status"], sr.IN_WORK_SIGNAL_STATUSES)
+
+    def test_no_in_work_signal_allows_full_signal(self) -> None:
+        decision = sr.evaluate_duplicate_publication(self._candidate(), [])
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertFalse(decision["duplicate_in_work_signal_detected"])
+
     def test_publish_signal_result_keeps_aia_forward_enabled_by_default(self) -> None:
         import tg_bot
 
