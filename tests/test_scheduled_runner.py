@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import os
 import tempfile
 import unittest
 from datetime import date, datetime, timezone
@@ -277,6 +278,41 @@ class TestScheduledSignalState(unittest.TestCase):
         base.update(overrides)
         return base
 
+    def _agent_state(self, *, active: bool = True) -> dict:
+        if not active:
+            return {"active_scenarios": {}, "trades": {}}
+        return {
+            "active_scenarios": {
+                "BNB/USDT": {
+                    "long": {
+                        "primary_signal_id": "20260614_093003",
+                        "primary_lifecycle_state": "TIMEOUT_LIVE",
+                        "primary_position_status": "OPEN",
+                        "secondary_signal_ids": ["20260614_101500"],
+                    }
+                }
+            },
+            "trades": {
+                "20260614_093003": {
+                    "identity": {"signal_id": "20260614_093003"},
+                    "lifecycle": {"lifecycle_state": "TIMEOUT_LIVE"},
+                    "position": {"position_status": "OPEN"},
+                    "signal_snapshot": {
+                        "entry": 610.2,
+                        "sl": 604.1,
+                        "rr": 3.13,
+                        "strategy_type": "wait_confirm",
+                        "mode": "neutral",
+                    },
+                }
+            },
+        }
+
+    def _write_agent_state(self, tmpdir: str, state: dict | None = None) -> Path:
+        path = Path(tmpdir) / "agent_trade_state.json"
+        path.write_text(json.dumps(state if state is not None else self._agent_state()), encoding="utf-8")
+        return path
+
     def test_wait_confirm_near_duplicate_with_improved_tvh_replaces(self) -> None:
         candidate = self._candidate(entry_price=610.14, sl=604.1, rr=3.2, ema20_m15=610.14)
         decision = sr.evaluate_duplicate_publication(candidate, [self._old(rr=3.0)])
@@ -325,6 +361,94 @@ class TestScheduledSignalState(unittest.TestCase):
         decision = sr.evaluate_duplicate_publication(self._candidate(), [])
         self.assertEqual(decision["publication_type"], "full_signal")
         self.assertFalse(decision["duplicate_in_work_signal_detected"])
+
+    def test_state_guard_shadow_management_update_logged_without_publication_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            c.state_guard_state_path = self._write_agent_state(tmpdir)
+            candidate = self._candidate(entry_price=610.14, sl=604.04, rr=3.0)
+            guard = sr.evaluate_state_guard_shadow(candidate, c, now_utc=datetime.now(timezone.utc))
+            self.assertEqual(guard["state_guard_status"], "ok")
+            self.assertEqual(guard["state_guard_decision"], "MANAGEMENT_UPDATE")
+            self.assertFalse(guard["state_guard_can_publish_full_signal"])
+
+            state = {"slots": {}}
+            slot_time = sr.slot_datetime_msk(date(2026, 6, 5), "09:30")
+            result = {
+                "published": True,
+                "reason": "published",
+                "signal_id": "20260614_123006",
+                "candidate_signal_id": "20260614_123006",
+                "publication_type": "full_signal",
+                "last_payload": {
+                    "symbol": "BNB/USDT",
+                    "direction": "long",
+                    "entry_range": [610.0, 610.28],
+                    "sl": 604.04,
+                    "tp1": 616.4,
+                    "tp2": 628.6,
+                    "rr": 3.0,
+                },
+                **guard,
+            }
+            now = datetime(2026, 6, 5, 6, 30, tzinfo=timezone.utc)
+            with patch("scheduled_runner.LOGS_DIR", Path(tmpdir) / "logs"), patch(
+                "scheduled_runner.load_aia_context", return_value={"status": "OPEN"}
+            ), patch("scheduled_runner.generate_and_publish_signal", return_value=result):
+                asyncio.run(sr.run_signal_slot(now, c, state, "20260605_0930", slot_time, 1, dry_run=False))
+
+            row = json.loads((Path(tmpdir) / "logs" / "scheduled_signal_decisions_20260605.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(row["decision"], "publish")
+            self.assertEqual(row["publication_type"], "full_signal")
+            self.assertEqual(row["state_guard_decision"], "MANAGEMENT_UPDATE")
+            self.assertFalse(row["state_guard_can_publish_full_signal"])
+            self.assertEqual(state["slots"]["20260605_0930"]["status"], "published")
+
+    def test_state_guard_shadow_missing_state_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            c.state_guard_state_path = Path(tmpdir) / "missing_agent_trade_state.json"
+            guard = sr.evaluate_state_guard_shadow(self._candidate(), c, now_utc=datetime.now(timezone.utc))
+            self.assertEqual(guard["state_guard_status"], "unavailable")
+
+    def test_state_guard_shadow_stale_state_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            c.state_guard_state_path = self._write_agent_state(tmpdir)
+            c.state_guard_max_age_minutes = 15
+            old = datetime(2026, 6, 5, 6, 0, tzinfo=timezone.utc).timestamp()
+            os.utime(c.state_guard_state_path, (old, old))
+            guard = sr.evaluate_state_guard_shadow(
+                self._candidate(),
+                c,
+                now_utc=datetime(2026, 6, 5, 6, 30, tzinfo=timezone.utc),
+            )
+            self.assertEqual(guard["state_guard_status"], "stale")
+
+    def test_state_guard_shadow_guard_exception_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            c.state_guard_state_path = self._write_agent_state(tmpdir)
+
+            def fake_loader():
+                def raise_guard(candidate, state):
+                    raise RuntimeError("guard failed")
+
+                return raise_guard
+
+            with patch("scheduled_runner._load_state_guard_api", side_effect=fake_loader), self.assertLogs("scheduled_runner", level="ERROR"):
+                guard = sr.evaluate_state_guard_shadow(self._candidate(), c, now_utc=datetime.now(timezone.utc))
+            self.assertEqual(guard["state_guard_status"], "error")
+            self.assertIn("guard failed", guard["state_guard_explanation"])
+
+    def test_state_guard_shadow_allow_full_signal_when_no_active_scenario(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            c.state_guard_state_path = self._write_agent_state(tmpdir, self._agent_state(active=False))
+            guard = sr.evaluate_state_guard_shadow(self._candidate(), c, now_utc=datetime.now(timezone.utc))
+            self.assertEqual(guard["state_guard_status"], "ok")
+            self.assertEqual(guard["state_guard_decision"], "ALLOW_FULL_SIGNAL")
+            self.assertTrue(guard["state_guard_can_publish_full_signal"])
 
     def test_publish_signal_result_keeps_aia_forward_enabled_by_default(self) -> None:
         import tg_bot

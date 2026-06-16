@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -17,6 +19,9 @@ MSK = ZoneInfo("Europe/Moscow")
 UTC = timezone.utc
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOGS_DIR = PROJECT_ROOT / "logs"
+LOGGER = logging.getLogger(__name__)
+AGENT_STATE_REPO_ROOT = Path(os.getenv("STATE_GUARD_AGENT_REPO_ROOT", "/root/llm-signal-ai-agent"))
+DEFAULT_STATE_GUARD_STATE_PATH = AGENT_STATE_REPO_ROOT / "logs/agent_trade_state.json"
 
 DEFAULT_TARGET_CHAT_IDS = [-1003492385200, -1003493070625, -1003530482991]
 DEFAULT_START_DATE = "2026-06-05"
@@ -46,6 +51,24 @@ NOT_IN_WORK_SIGNAL_STATUSES = {
     "TAKE_PROFIT_DONE",
 }
 SCHEDULED_SIGNAL_LIFECYCLE_EVENTS_PATH = LOGS_DIR / "scheduled_signal_lifecycle_events.jsonl"
+STATE_GUARD_DECISION_LOG_FIELDS = (
+    "state_guard_shadow_enabled",
+    "state_guard_status",
+    "state_guard_decision",
+    "state_guard_can_publish_full_signal",
+    "state_guard_recommended_publication_type",
+    "state_guard_reason",
+    "state_guard_primary_signal_id",
+    "state_guard_primary_lifecycle_state",
+    "state_guard_primary_position_status",
+    "state_guard_duplicate_detected",
+    "state_guard_conflict_detected",
+    "state_guard_replacement_candidate",
+    "state_guard_entry_distance_pct",
+    "state_guard_sl_distance_pct",
+    "state_guard_secondary_signal_ids",
+    "state_guard_explanation",
+)
 
 
 def utc_now() -> datetime:
@@ -239,6 +262,7 @@ def _candidate_from_payload(payload: dict, signal_id: str | None = None) -> dict
         "sl": _try_float(payload.get("sl")),
         "tp1": _try_float(payload.get("tp1") if payload.get("tp1") is not None else tp.get("tp1")),
         "tp2": _try_float(payload.get("tp2") if payload.get("tp2") is not None else tp.get("tp2")),
+        "tp3": _try_float(payload.get("tp3") if payload.get("tp3") is not None else tp.get("tp3")),
         "rr": _try_float(payload.get("rr")),
         "confidence": payload.get("confidence"),
         "confidence_rank": _confidence_rank(payload.get("confidence")),
@@ -632,6 +656,9 @@ class SchedulerConfig:
     signal_state_path: Path
     publish_state_path: Path
     due_window_minutes: int
+    state_guard_shadow_enabled: bool = True
+    state_guard_state_path: Path = DEFAULT_STATE_GUARD_STATE_PATH
+    state_guard_max_age_minutes: int = 15
 
     @classmethod
     def from_env(cls) -> "SchedulerConfig":
@@ -660,6 +687,9 @@ class SchedulerConfig:
             signal_state_path=PROJECT_ROOT / os.getenv("SCHEDULED_SIGNAL_STATE_PATH", "logs/scheduled_signal_state.json"),
             publish_state_path=PROJECT_ROOT / os.getenv("SCHEDULED_PUBLISH_STATE_PATH", "logs/scheduled_publish_state.json"),
             due_window_minutes=max(1, parse_int_env("SCHEDULED_DUE_WINDOW_MINUTES", 5)),
+            state_guard_shadow_enabled=parse_bool_env("STATE_GUARD_SHADOW_ENABLED", True),
+            state_guard_state_path=Path(os.getenv("STATE_GUARD_STATE_PATH", str(DEFAULT_STATE_GUARD_STATE_PATH))),
+            state_guard_max_age_minutes=max(1, parse_int_env("STATE_GUARD_MAX_AGE_MINUTES", 15)),
         )
 
 
@@ -669,6 +699,156 @@ def publish_decision_log_path(now_utc: datetime) -> Path:
 
 def signal_decision_log_path(now_utc: datetime) -> Path:
     return LOGS_DIR / f"scheduled_signal_decisions_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.jsonl"
+
+
+def scheduled_state_guard_shadow_log_path(now_utc: datetime) -> Path:
+    return LOGS_DIR / f"scheduled_state_guard_shadow_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.jsonl"
+
+
+def _state_guard_base(enabled: bool, status: str) -> dict:
+    return {
+        "state_guard_shadow_enabled": enabled,
+        "state_guard_status": status,
+        "state_guard_decision": None,
+        "state_guard_can_publish_full_signal": None,
+        "state_guard_recommended_publication_type": None,
+        "state_guard_reason": None,
+        "state_guard_primary_signal_id": None,
+        "state_guard_primary_lifecycle_state": None,
+        "state_guard_primary_position_status": None,
+        "state_guard_duplicate_detected": None,
+        "state_guard_conflict_detected": None,
+        "state_guard_replacement_candidate": None,
+        "state_guard_entry_distance_pct": None,
+        "state_guard_sl_distance_pct": None,
+        "state_guard_secondary_signal_ids": [],
+        "state_guard_explanation": None,
+    }
+
+
+def build_state_guard_candidate(candidate: dict, *, source: str = "scheduled", created_at: str | None = None) -> dict:
+    return {
+        "signal_id": candidate.get("signal_id"),
+        "symbol": candidate.get("display_symbol") or candidate.get("symbol"),
+        "direction": candidate.get("direction"),
+        "entry": _try_float(candidate.get("entry") if candidate.get("entry") is not None else candidate.get("entry_price")),
+        "sl": _try_float(candidate.get("sl")),
+        "tp1": _try_float(candidate.get("tp1")),
+        "tp2": _try_float(candidate.get("tp2")),
+        "tp3": _try_float(candidate.get("tp3")),
+        "mode": candidate.get("mode"),
+        "rr": _rr_for_signal(candidate),
+        "source": source,
+        "created_at": created_at,
+        "strategy_type": candidate.get("strategy_type"),
+    }
+
+
+def _load_state_guard_api():
+    repo_root = str(AGENT_STATE_REPO_ROOT)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from app.state.state_query import evaluate_candidate_signal
+
+    return evaluate_candidate_signal
+
+
+def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_utc: datetime | None = None) -> dict:
+    if not cfg.state_guard_shadow_enabled:
+        return _state_guard_base(False, "disabled")
+    now_utc = now_utc or utc_now()
+    state_path = cfg.state_guard_state_path
+    out = _state_guard_base(True, "unavailable")
+    try:
+        stat = state_path.stat()
+    except FileNotFoundError:
+        return out
+    except Exception as exc:
+        out["state_guard_explanation"] = f"state file unavailable: {exc}"
+        return out
+
+    age_seconds = max(0.0, now_utc.timestamp() - stat.st_mtime)
+    if age_seconds > cfg.state_guard_max_age_minutes * 60:
+        out["state_guard_status"] = "stale"
+        out["state_guard_explanation"] = (
+            f"state file older than {cfg.state_guard_max_age_minutes} minutes "
+            f"({round(age_seconds / 60.0, 2)} minutes)"
+        )
+        return out
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        out["state_guard_explanation"] = f"state file unavailable: {exc}"
+        return out
+    if not isinstance(state, dict):
+        out["state_guard_explanation"] = "state file did not contain a JSON object"
+        return out
+
+    guard_candidate = build_state_guard_candidate(
+        candidate,
+        created_at=now_utc.isoformat().replace("+00:00", "Z"),
+    )
+    try:
+        evaluate_candidate_signal = _load_state_guard_api()
+        evaluation = evaluate_candidate_signal(guard_candidate, state)
+    except Exception as exc:
+        LOGGER.exception("State Query Guard shadow evaluation failed")
+        out["state_guard_status"] = "error"
+        out["state_guard_explanation"] = str(exc)
+        return out
+
+    out.update(
+        {
+            "state_guard_status": "ok",
+            "state_guard_decision": evaluation.get("decision"),
+            "state_guard_can_publish_full_signal": evaluation.get("can_publish_full_signal"),
+            "state_guard_recommended_publication_type": evaluation.get("recommended_publication_type"),
+            "state_guard_reason": evaluation.get("reason"),
+            "state_guard_primary_signal_id": evaluation.get("primary_signal_id"),
+            "state_guard_primary_lifecycle_state": evaluation.get("primary_lifecycle_state"),
+            "state_guard_primary_position_status": evaluation.get("primary_position_status"),
+            "state_guard_duplicate_detected": evaluation.get("duplicate_detected"),
+            "state_guard_conflict_detected": evaluation.get("conflict_detected"),
+            "state_guard_replacement_candidate": evaluation.get("replacement_candidate"),
+            "state_guard_entry_distance_pct": evaluation.get("entry_distance_pct"),
+            "state_guard_sl_distance_pct": evaluation.get("sl_distance_pct"),
+            "state_guard_secondary_signal_ids": evaluation.get("secondary_signal_ids") or [],
+            "state_guard_explanation": evaluation.get("explanation"),
+        }
+    )
+    return out
+
+
+def state_guard_shadow_log_row(
+    now_utc: datetime,
+    slot_id: str,
+    result: dict,
+) -> dict:
+    payload = result.get("last_payload") if isinstance(result.get("last_payload"), dict) else {}
+    candidate = _candidate_from_payload(payload, signal_id=result.get("signal_id"))
+    return {
+        "ts": now_utc.isoformat().replace("+00:00", "Z"),
+        "slot_id": slot_id,
+        "candidate_signal_id": result.get("candidate_signal_id") or result.get("signal_id"),
+        "symbol": candidate.get("display_symbol") or candidate.get("symbol"),
+        "direction": candidate.get("direction"),
+        "candidate_entry": candidate.get("entry_price"),
+        "candidate_sl": candidate.get("sl"),
+        "candidate_rr": _rr_for_signal(candidate),
+        "guard_status": result.get("state_guard_status"),
+        "guard_decision": result.get("state_guard_decision"),
+        "can_publish_full_signal": result.get("state_guard_can_publish_full_signal"),
+        "recommended_publication_type": result.get("state_guard_recommended_publication_type"),
+        "reason": result.get("state_guard_reason"),
+        "primary_signal_id": result.get("state_guard_primary_signal_id"),
+        "primary_lifecycle_state": result.get("state_guard_primary_lifecycle_state"),
+        "primary_position_status": result.get("state_guard_primary_position_status"),
+        "duplicate_detected": result.get("state_guard_duplicate_detected"),
+        "conflict_detected": result.get("state_guard_conflict_detected"),
+        "replacement_candidate": result.get("state_guard_replacement_candidate"),
+        "explanation": result.get("state_guard_explanation"),
+    }
 
 
 def is_due(now_msk: datetime, scheduled_msk: datetime, window_minutes: int) -> bool:
@@ -1105,6 +1285,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
     published_at = datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
     candidate = _candidate_from_payload(payload, signal_id=signal_id)
+    state_guard_shadow = evaluate_state_guard_shadow(candidate, cfg)
     duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state())
     duplicate_result = {k: v for k, v in duplicate_decision.items() if k != "duplicate_signal"}
 
@@ -1115,6 +1296,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
             "published": True,
             "reason": str(duplicate_decision.get("replacement_reason") or "duplicate_in_work_signal"),
             "signal_id": None,
+            "candidate_signal_id": signal_id,
             "artifact_path": relpath(Path(sig_html)),
             "run_log": relpath(Path(run_log)) if run_log else None,
             "last_payload": payload,
@@ -1124,6 +1306,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
             "aia_forward_error": None,
             "aia_forward_mode": "skipped_duplicate_update",
             "aia_forward_warning": None,
+            **state_guard_shadow,
             **duplicate_result,
         }
 
@@ -1188,11 +1371,13 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
         "published": bool(ok),
         "reason": "published" if ok else "system_routing_api_error",
         "signal_id": signal_id if ok else None,
+        "candidate_signal_id": signal_id,
         "artifact_path": relpath(Path(sig_html)),
         "run_log": relpath(Path(run_log)) if run_log else None,
         "last_payload": payload,
         **aia_forward,
         "aia_forward_warning": "aia_forward_failed" if ok and not aia_forward.get("aia_forward_ok") else None,
+        **state_guard_shadow,
         **duplicate_result,
     }
 
@@ -1359,6 +1544,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
 
     try:
         result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run)
+        state_guard_shadow_available = "state_guard_status" in result
         if result.get("published"):
             publication_type = str(result.get("publication_type") or "full_signal")
             slots[slot_id] = {
@@ -1408,6 +1594,8 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "strategy_same_or_compatible",
             ):
                 row[key] = result.get(key)
+            for key in STATE_GUARD_DECISION_LOG_FIELDS:
+                row[key] = result.get(key)
         else:
             reason = str(result.get("reason") or "no_valid_signal_candidate")
             if attempt < cfg.max_attempts and reason in {"signal_core_no_trade", "no_valid_signal_candidate"}:
@@ -1435,6 +1623,9 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                     "signal_id": None,
                 }
                 row.update({"decision": "cancel", "reason": reason})
+            for key in STATE_GUARD_DECISION_LOG_FIELDS:
+                if key in result:
+                    row[key] = result.get(key)
     except Exception as exc:
         slots[slot_id] = {
             "slot_id": slot_id,
@@ -1450,6 +1641,8 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
     if not dry_run:
         write_json_atomic(cfg.signal_state_path, state)
         append_jsonl(signal_decision_log_path(now_utc), row)
+        if "state_guard_shadow_available" in locals() and state_guard_shadow_available:
+            append_jsonl(scheduled_state_guard_shadow_log_path(now_utc), state_guard_shadow_log_row(now_utc, slot_id, result))
 
 
 async def run_publish_job(kind: str, now_utc: datetime, cfg: SchedulerConfig, *, dry_run: bool = False) -> None:
