@@ -35,12 +35,35 @@ IN_WORK_SIGNAL_STATUSES = {
     "SETUP_ARMED",
     "ENTRY_LIVE",
     "HOLD",
+    "TIMEOUT_LIVE",
+    "TP1_HIT_LIVE",
+    "TP2_HIT_LIVE",
     "TRAIL_STOP",
     "REDUCE",
+    "RUNNER_ACTIVE",
     "MANAGEMENT_ONLY",
 }
 WAIT_REPLACEABLE_STATUSES = {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE"}
 LIVE_POSITION_STATUSES = {"ENTRY_LIVE", "HOLD", "TRAIL_STOP", "REDUCE", "MANAGEMENT_ONLY"}
+SCHEDULED_POSITION_BLOCKING_STATUSES = {
+    "ENTRY_LIVE",
+    "HOLD",
+    "TP1_HIT_LIVE",
+    "REDUCE",
+    "TRAIL_STOP",
+    "RUNNER_ACTIVE",
+}
+SCHEDULED_PENDING_EXPIRING_STATUSES = {
+    "WAIT_CONFIRM",
+    "CONFIRM_LIVE",
+    "SETUP_ARMED",
+    "WAIT_POST_EVENT_REPRICE",
+}
+SCHEDULED_ADVISORY_NON_BLOCKING_STATUSES = {
+    "RE_EVAL_ACTIVE_SIGNAL",
+    "MARKET_REPRICE_ALERT",
+    "ACTIVE_SIGNAL_UPDATE",
+}
 NOT_IN_WORK_SIGNAL_STATUSES = {
     "EXPIRED_NO_CONFIRM",
     "INVALIDATED_NO_CONFIRM",
@@ -88,6 +111,18 @@ def parse_int_env(name: str, default: int) -> int:
         return int(str(raw).strip()) if raw is not None and str(raw).strip() else default
     except Exception:
         return default
+
+
+def scheduled_active_pending_max_age_hours() -> int:
+    return max(1, parse_int_env("SCHEDULED_ACTIVE_PENDING_MAX_AGE_HOURS", 6))
+
+
+def scheduled_wait_confirm_fallback_max_age_hours() -> int:
+    return max(1, parse_int_env("SCHEDULED_WAIT_CONFIRM_FALLBACK_MAX_AGE_HOURS", 2))
+
+
+def scheduled_post_event_reprice_max_age_minutes() -> int:
+    return max(1, parse_int_env("SCHEDULED_POST_EVENT_REPRICE_MAX_AGE_MINUTES", 90))
 
 
 def parse_date_env(name: str, default: str) -> date:
@@ -343,6 +378,137 @@ def _parse_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _parse_signal_datetime(value) -> datetime | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).replace(microsecond=0)
+
+
+def _signal_event_time(signal: dict) -> datetime | None:
+    parsed = [
+        _parse_signal_datetime(signal.get(key))
+        for key in (
+            "last_event_at",
+            "last_event_at_utc",
+            "updated_at",
+            "updated_at_utc",
+            "created_at",
+            "created_at_utc",
+            "published_at",
+            "published_at_utc",
+            "timestamp",
+            "timestamp_utc",
+            "ts",
+            "ts_utc",
+        )
+    ]
+    times = [dt for dt in parsed if dt is not None]
+    return max(times) if times else None
+
+
+def _signal_id_date(signal_id: str | None) -> date | None:
+    text = str(signal_id or "")
+    if len(text) < 8 or not text[:8].isdigit():
+        return None
+    try:
+        return datetime.strptime(text[:8], "%Y%m%d").date()
+    except Exception:
+        return None
+
+
+def _signal_position_status(signal: dict) -> str:
+    return str(signal.get("position_status") or signal.get("primary_position_status") or "").strip().upper()
+
+
+def _signal_has_open_position(signal: dict) -> bool:
+    status = str(signal.get("status") or "").strip().upper()
+    position_status = _signal_position_status(signal)
+    explicit_open = (
+        position_status == "OPEN"
+        or bool(signal.get("open_position"))
+        or bool(signal.get("position_open"))
+        or bool(signal.get("runner_active"))
+        or bool(signal.get("runner_open"))
+    )
+    return (
+        explicit_open
+        or status in SCHEDULED_POSITION_BLOCKING_STATUSES
+        or (status == "TIMEOUT_LIVE" and explicit_open)
+        or (status == "TP2_HIT_LIVE" and explicit_open)
+    )
+
+
+def _stale_active_signal_defaults() -> dict:
+    return {
+        "stale_active_signal_ignored": False,
+        "stale_active_signal_id": None,
+        "stale_active_signal_status": None,
+        "stale_active_signal_age_hours": None,
+        "stale_active_signal_reason": None,
+    }
+
+
+def _stale_active_signal_result(signal: dict, *, now_utc: datetime | None = None) -> dict:
+    now_utc = (now_utc or utc_now()).astimezone(UTC).replace(microsecond=0)
+    status = str(signal.get("status") or "").strip().upper()
+    signal_id = str(signal.get("signal_id") or "") or None
+    out = _stale_active_signal_defaults()
+    out.update({"stale_active_signal_id": signal_id, "stale_active_signal_status": status or None})
+
+    if not status:
+        return out
+    if _signal_has_open_position(signal):
+        return out
+    if status in SCHEDULED_ADVISORY_NON_BLOCKING_STATUSES:
+        out.update({"stale_active_signal_ignored": True, "stale_active_signal_reason": "advisory_state_non_blocking"})
+        return out
+    if status not in SCHEDULED_PENDING_EXPIRING_STATUSES:
+        return out
+
+    event_time = _signal_event_time(signal)
+    valid_until = _parse_signal_datetime(signal.get("valid_until") or signal.get("valid_until_utc") or signal.get("wait_confirm_valid_until"))
+    if status == "WAIT_CONFIRM" and valid_until is None:
+        timeout_minutes = _try_float(signal.get("confirm_timeout_minutes") or signal.get("wait_confirm_timeout_minutes"))
+        if timeout_minutes is not None and event_time is not None:
+            valid_until = event_time + timedelta(minutes=max(1.0, timeout_minutes))
+
+    if status == "WAIT_CONFIRM" and valid_until is not None:
+        age_hours = (now_utc - valid_until).total_seconds() / 3600.0
+        out["stale_active_signal_age_hours"] = round(max(0.0, age_hours), 3)
+        if now_utc > valid_until:
+            out.update({"stale_active_signal_ignored": True, "stale_active_signal_reason": "wait_confirm_valid_until_expired"})
+        return out
+
+    max_age_hours = scheduled_active_pending_max_age_hours()
+    if status == "WAIT_CONFIRM":
+        max_age_hours = scheduled_wait_confirm_fallback_max_age_hours()
+    elif status == "WAIT_POST_EVENT_REPRICE":
+        max_age_hours = scheduled_post_event_reprice_max_age_minutes() / 60.0
+
+    if event_time is not None:
+        age_hours = (now_utc - event_time).total_seconds() / 3600.0
+        out["stale_active_signal_age_hours"] = round(max(0.0, age_hours), 3)
+        if age_hours > max_age_hours:
+            out.update({"stale_active_signal_ignored": True, "stale_active_signal_reason": "pending_state_ttl_expired"})
+        return out
+
+    signal_day = _signal_id_date(signal_id)
+    if signal_day is not None and (to_msk(now_utc).date() - signal_day).days > 1:
+        out.update({"stale_active_signal_ignored": True, "stale_active_signal_reason": "signal_id_date_expired"})
+    return out
+
+
 def _recent_aia_log_paths(now_utc: datetime | None = None, days: int = 7) -> list[Path]:
     root = Path(os.getenv("AIA_LOGS_DIR", "/root/llm-signal-ai-agent/logs"))
     if now_utc is None:
@@ -379,6 +545,12 @@ def _action_row_to_signal(row: dict) -> dict | None:
         "holding_horizon": str(row.get("holding_horizon") or "").strip().lower(),
         "strategy_type": str(row.get("entry_mode") or "").strip().lower(),
         "ts": row.get("ts") or row.get("ts_utc"),
+        "created_at": row.get("created_at"),
+        "published_at": row.get("published_at"),
+        "last_event_at": row.get("last_event_at") or row.get("updated_at"),
+        "valid_until": row.get("valid_until"),
+        "confirm_timeout_minutes": row.get("confirm_timeout_minutes"),
+        "position_status": row.get("position_status"),
         "filled": status in LIVE_POSITION_STATUSES or bool(row.get("entry_detection_ts")),
         "cancelled_by_scheduler": False,
         "hard_block_conditions": row.get("hard_block_conditions") if isinstance(row.get("hard_block_conditions"), list) else [],
@@ -402,6 +574,10 @@ def load_in_work_signal_state(now_utc: datetime | None = None) -> list[dict]:
         status = str(row.get("status") or "").strip().upper()
         if status:
             current["status"] = status
+        if row.get("ts") or row.get("ts_utc"):
+            current["last_event_at"] = row.get("ts") or row.get("ts_utc")
+        if row.get("position_status"):
+            current["position_status"] = row.get("position_status")
         current["cancelled_by_scheduler"] = status in {"CANCEL_WAIT_CONFIRM", "REPLACED_BY_NEW_SIGNAL"}
         current["replaced_by_signal_id"] = row.get("replaced_by_signal_id")
         latest[signal_id] = current
@@ -409,11 +585,15 @@ def load_in_work_signal_state(now_utc: datetime | None = None) -> list[dict]:
     return [
         signal
         for signal in latest.values()
-        if str(signal.get("status") or "").upper() in IN_WORK_SIGNAL_STATUSES and not signal.get("cancelled_by_scheduler")
+        if (
+            str(signal.get("status") or "").upper() in IN_WORK_SIGNAL_STATUSES
+            or _signal_position_status(signal) == "OPEN"
+        )
+        and not signal.get("cancelled_by_scheduler")
     ]
 
 
-def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict]) -> dict:
+def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], *, now_utc: datetime | None = None) -> dict:
     out = {
         "duplicate_in_work_signal_detected": False,
         "duplicate_signal_id": None,
@@ -435,10 +615,32 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict]) 
         "confidence_new": candidate.get("confidence"),
         "strategy_same_or_compatible": True,
         "duplicate_signal": None,
+        **_stale_active_signal_defaults(),
     }
     symbol = candidate.get("symbol")
     direction = candidate.get("direction")
-    same_symbol = [s for s in active_signals if s.get("symbol") == symbol]
+    same_symbol = []
+    for signal in active_signals:
+        if signal.get("symbol") != symbol:
+            continue
+        if now_utc is None:
+            same_symbol.append(signal)
+            continue
+        stale_result = _stale_active_signal_result(signal, now_utc=now_utc)
+        if stale_result.get("stale_active_signal_ignored"):
+            if not out["stale_active_signal_ignored"]:
+                out.update(stale_result)
+            LOGGER.info(
+                "stale active signal ignored",
+                extra={
+                    "stale_active_signal_id": stale_result.get("stale_active_signal_id"),
+                    "stale_active_signal_status": stale_result.get("stale_active_signal_status"),
+                    "stale_active_signal_age_hours": stale_result.get("stale_active_signal_age_hours"),
+                    "stale_active_signal_reason": stale_result.get("stale_active_signal_reason"),
+                },
+            )
+            continue
+        same_symbol.append(signal)
     opposite = next((s for s in same_symbol if s.get("direction") and s.get("direction") != direction), None)
     if opposite is not None:
         out.update(
@@ -1245,7 +1447,13 @@ async def forward_signal_to_aia_awaited(tg_bot, signal_json_v1: dict | None) -> 
     return result
 
 
-async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, *, dry_run: bool = False) -> dict:
+async def generate_and_publish_signal(
+    selected_mode: str,
+    cfg: SchedulerConfig,
+    *,
+    dry_run: bool = False,
+    now_utc: datetime | None = None,
+) -> dict:
     import tg_bot
 
     duplicate_decision = {"publication_type": "full_signal", "duplicate_in_work_signal_detected": False}
@@ -1286,7 +1494,7 @@ async def generate_and_publish_signal(selected_mode: str, cfg: SchedulerConfig, 
     signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
     candidate = _candidate_from_payload(payload, signal_id=signal_id)
     state_guard_shadow = evaluate_state_guard_shadow(candidate, cfg)
-    duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state())
+    duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state(now_utc), now_utc=now_utc)
     duplicate_result = {k: v for k, v in duplicate_decision.items() if k != "duplicate_signal"}
 
     if duplicate_decision.get("publication_type") in {"active_signal_update", "conflict_update"}:
@@ -1543,7 +1751,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         return
 
     try:
-        result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run)
+        result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run, now_utc=now_utc)
         state_guard_shadow_available = "state_guard_status" in result
         if result.get("published"):
             publication_type = str(result.get("publication_type") or "full_signal")
@@ -1592,6 +1800,11 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "confidence_old",
                 "confidence_new",
                 "strategy_same_or_compatible",
+                "stale_active_signal_ignored",
+                "stale_active_signal_id",
+                "stale_active_signal_status",
+                "stale_active_signal_age_hours",
+                "stale_active_signal_reason",
             ):
                 row[key] = result.get(key)
             for key in STATE_GUARD_DECISION_LOG_FIELDS:

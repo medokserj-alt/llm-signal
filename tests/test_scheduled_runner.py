@@ -349,6 +349,73 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertEqual(decision["publication_type"], "conflict_update")
         self.assertEqual(decision["replacement_reason"], "opposite_direction_in_work_signal")
 
+    def test_old_confirm_live_without_position_does_not_conflict_update(self) -> None:
+        now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        old = self._old(
+            "CONFIRM_LIVE",
+            signal_id="20260613_104510",
+            ts="2026-06-13T07:45:10Z",
+            filled=False,
+            position_status="",
+        )
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertTrue(decision["stale_active_signal_ignored"])
+        self.assertEqual(decision["stale_active_signal_id"], "20260613_104510")
+        self.assertEqual(decision["stale_active_signal_status"], "CONFIRM_LIVE")
+        self.assertEqual(decision["stale_active_signal_reason"], "pending_state_ttl_expired")
+
+    def test_recent_confirm_live_still_conflict_updates(self) -> None:
+        now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        old = self._old("CONFIRM_LIVE", ts="2026-06-17T06:30:00Z", filled=False, position_status="")
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+        self.assertEqual(decision["publication_type"], "conflict_update")
+        self.assertFalse(decision["stale_active_signal_ignored"])
+
+    def test_old_entry_live_hold_open_position_still_conflict_updates(self) -> None:
+        now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        for status in ("ENTRY_LIVE", "HOLD"):
+            with self.subTest(status=status):
+                old = self._old(status, ts="2026-06-13T07:45:10Z", position_status="OPEN")
+                decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+                self.assertEqual(decision["publication_type"], "conflict_update")
+                self.assertFalse(decision["stale_active_signal_ignored"])
+
+    def test_old_wait_confirm_older_than_fallback_ttl_is_ignored(self) -> None:
+        now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        old = self._old("WAIT_CONFIRM", ts="2026-06-17T06:00:00Z", filled=False, position_status="")
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertTrue(decision["stale_active_signal_ignored"])
+        self.assertEqual(decision["stale_active_signal_reason"], "pending_state_ttl_expired")
+
+    def test_advisory_states_do_not_block_full_signal(self) -> None:
+        now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        for status in ("MARKET_REPRICE_ALERT", "RE_EVAL_ACTIVE_SIGNAL", "ACTIVE_SIGNAL_UPDATE"):
+            with self.subTest(status=status):
+                decision = sr.evaluate_duplicate_publication(
+                    candidate,
+                    [self._old(status, ts="2026-06-17T09:00:00Z", filled=False, position_status="")],
+                    now_utc=now,
+                )
+                self.assertEqual(decision["publication_type"], "full_signal")
+                self.assertTrue(decision["stale_active_signal_ignored"])
+                self.assertEqual(decision["stale_active_signal_reason"], "advisory_state_non_blocking")
+
+    def test_missing_timestamp_old_signal_id_date_is_ignored(self) -> None:
+        now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        old = self._old("CONFIRM_LIVE", signal_id="20260613_104510", filled=False, position_status="")
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertTrue(decision["stale_active_signal_ignored"])
+        self.assertEqual(decision["stale_active_signal_reason"], "signal_id_date_expired")
+
     def test_terminal_existing_signal_allows_full_signal(self) -> None:
         candidate = self._candidate()
         old = self._old("EXPIRED_NO_CONFIRM")
@@ -617,8 +684,9 @@ class TestScheduledSignalState(unittest.TestCase):
                 "scheduled_runner.generate_and_publish_signal",
                 return_value={"published": False, "reason": "signal_core_no_trade", "signal_id": None},
             ) as publish:
-                asyncio.run(sr.run_signal_slot(datetime(2026, 6, 5, 9, 30, tzinfo=timezone.utc), c, state, "20260605_1230", slot_time, 1, dry_run=True))
-                publish.assert_called_with("aggressive", c, dry_run=True)
+                now = datetime(2026, 6, 5, 9, 30, tzinfo=timezone.utc)
+                asyncio.run(sr.run_signal_slot(now, c, state, "20260605_1230", slot_time, 1, dry_run=True))
+                publish.assert_called_with("aggressive", c, dry_run=True, now_utc=now)
                 self.assertEqual(state["slots"]["20260605_1230"]["status"], "deferred")
                 asyncio.run(sr.run_signal_slot(datetime(2026, 6, 5, 10, 30, tzinfo=timezone.utc), c, state, "20260605_1230", slot_time, 2, dry_run=True))
                 self.assertEqual(state["slots"]["20260605_1230"]["status"], "cancelled")
