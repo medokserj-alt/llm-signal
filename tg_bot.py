@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from zoneinfo import ZoneInfo
 import asyncio
+import sys
 import os, json, time, subprocess, re, html as htmllib, tempfile, copy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +77,9 @@ from user_registry import (
 
 BASE = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE
+LOGS_DIR = PROJECT_ROOT / "logs"
+AGENT_STATE_REPO_ROOT = Path(os.getenv("AGENT_STATE_REPO_ROOT", "/root/llm-signal-ai-agent"))
+DEFAULT_MANUAL_STATE_GUARD_STATE_PATH = AGENT_STATE_REPO_ROOT / "logs/agent_trade_state.json"
 FIXED_BOT_ASSETS = ["BTC", "ETH", "BNB", "SOL", "XRP"]
 
 if load_dotenv is not None:
@@ -87,6 +91,30 @@ SIGNAL_BOT_TOKEN = os.getenv("TELEGRAM_SIGNAL_BOT_TOKEN")
 SIGNAL_BOT_USERNAME = os.getenv("TELEGRAM_SIGNAL_BOT_USERNAME", "LLM_signals_pa_dev_bot")
 ENV_PATH = BASE / ".env.tg.clean"
 PANEL_SYMBOLS_MAX = int(os.getenv("TELEGRAM_PANEL_SYMBOLS_MAX", "18") or "18")
+
+MANUAL_STATE_GUARD_SHADOW_ENABLED = os.getenv("MANUAL_STATE_GUARD_SHADOW_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED = os.getenv("MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT = os.getenv(
+    "MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
+MANUAL_STATE_GUARD_MAX_AGE_MINUTES = max(
+    1,
+    int(os.getenv("MANUAL_STATE_GUARD_MAX_AGE_MINUTES", os.getenv("STATE_GUARD_MAX_AGE_MINUTES", "15")) or "15"),
+)
+MANUAL_STATE_GUARD_STATE_PATH = Path(
+    os.getenv("MANUAL_STATE_GUARD_STATE_PATH", os.getenv("STATE_GUARD_STATE_PATH", str(DEFAULT_MANUAL_STATE_GUARD_STATE_PATH)))
+)
 
 # ============== AIA (AI Agent) ==============
 
@@ -787,6 +815,7 @@ def _log_signal_publication(
     source: str,
     signal_id: str | None,
     delivery_kind: str,
+    manual_state_guard: dict | None = None,
 ) -> None:
     record = {
         "event": event,
@@ -799,6 +828,8 @@ def _log_signal_publication(
         "delivery_kind": delivery_kind,
         "ts": _utc_now_z(),
     }
+    if isinstance(manual_state_guard, dict):
+        record.update(manual_state_guard)
     print("[signal_publish] " + json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
 
 def format_done(done_line: str, logs_path: str | None = None) -> str:
@@ -898,6 +929,246 @@ def _read_last_signal_json(path: Path | None = None) -> dict | None:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+def _jsonl_append(path: Path, row: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+def _manual_state_guard_shadow_log_path(now_utc: datetime) -> Path:
+    return LOGS_DIR / f"manual_state_guard_shadow_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.jsonl"
+
+def _manual_state_guard_base(enabled: bool, status: str) -> dict:
+    return {
+        "manual_state_guard_shadow_enabled": enabled,
+        "manual_state_guard_status": status,
+        "manual_state_guard_decision": None,
+        "manual_state_guard_can_publish_full_signal": None,
+        "manual_state_guard_recommended_publication_type": None,
+        "manual_state_guard_reason": None,
+        "manual_state_guard_primary_signal_id": None,
+        "manual_state_guard_primary_lifecycle_state": None,
+        "manual_state_guard_primary_position_status": None,
+        "manual_state_guard_duplicate_detected": None,
+        "manual_state_guard_conflict_detected": None,
+        "manual_state_guard_replacement_candidate": None,
+        "manual_state_guard_entry_distance_pct": None,
+        "manual_state_guard_sl_distance_pct": None,
+        "manual_state_guard_secondary_signal_ids": [],
+        "manual_state_guard_explanation": None,
+    }
+
+def _manual_state_guard_try_float(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+def _manual_state_guard_signal_rr(payload: dict, mode: str | None) -> float | None:
+    rr_by_mode = payload.get("rr_by_mode")
+    if isinstance(rr_by_mode, dict) and mode:
+        value = _manual_state_guard_try_float(rr_by_mode.get(mode))
+        if value is not None:
+            return value
+    return _manual_state_guard_try_float(payload.get("rr"))
+
+def _manual_state_guard_candidate_from_payload(
+    payload: dict | None,
+    *,
+    signal_id: str,
+    symbol_hint: str | None,
+    mode: str | None,
+    created_at: str,
+) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    symbol = payload.get("symbol") or payload.get("asset") or symbol_hint
+    direction = payload.get("direction") or payload.get("side")
+    entry = _manual_state_guard_try_float(payload.get(f"entry_price_{mode}")) if mode else None
+    if entry is None:
+        entry = _manual_state_guard_try_float(payload.get("entry_price"))
+    if entry is None:
+        entry_range = payload.get("entry_range")
+        if isinstance(entry_range, dict):
+            low = _manual_state_guard_try_float(entry_range.get("min"))
+            high = _manual_state_guard_try_float(entry_range.get("max"))
+        elif isinstance(entry_range, (list, tuple)) and len(entry_range) == 2:
+            low = _manual_state_guard_try_float(entry_range[0])
+            high = _manual_state_guard_try_float(entry_range[1])
+        else:
+            low = high = None
+        if low is not None and high is not None:
+            entry = (low + high) / 2.0
+    sl = None
+    sl_by_mode = payload.get("sl_by_mode")
+    if isinstance(sl_by_mode, dict) and mode:
+        sl = _manual_state_guard_try_float(sl_by_mode.get(mode))
+    if sl is None:
+        sl = _manual_state_guard_try_float(payload.get("sl"))
+
+    tp1 = _manual_state_guard_try_float(payload.get("tp1"))
+    tp2 = _manual_state_guard_try_float(payload.get("tp2"))
+    tp3 = _manual_state_guard_try_float(payload.get("tp3"))
+    tp_by_mode = payload.get("tp_by_mode")
+    if isinstance(tp_by_mode, dict) and mode and isinstance(tp_by_mode.get(mode), dict):
+        mode_tp = tp_by_mode[mode]
+        tp1 = _manual_state_guard_try_float(mode_tp.get("tvh1") or mode_tp.get("tp1")) or tp1
+        tp2 = _manual_state_guard_try_float(mode_tp.get("tvh2") or mode_tp.get("tp2")) or tp2
+        tp3 = _manual_state_guard_try_float(mode_tp.get("tvh3") or mode_tp.get("tp3")) or tp3
+
+    if not symbol or not direction:
+        return None
+    return {
+        "signal_id": signal_id,
+        "symbol": str(symbol),
+        "direction": str(direction).strip().lower(),
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "mode": mode,
+        "source": "manual",
+        "created_at": created_at,
+        "rr": _manual_state_guard_signal_rr(payload, mode),
+        "strategy_type": payload.get("strategy_type") or payload.get("strategy"),
+    }
+
+def _load_manual_state_guard_api():
+    repo_root = str(AGENT_STATE_REPO_ROOT)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from app.state.state_query import evaluate_candidate_signal
+
+    return evaluate_candidate_signal
+
+def _evaluate_manual_state_guard(candidate: dict | None, *, now_utc: datetime) -> dict:
+    if not MANUAL_STATE_GUARD_SHADOW_ENABLED:
+        return _manual_state_guard_base(False, "disabled")
+    out = _manual_state_guard_base(True, "unavailable")
+    if not isinstance(candidate, dict):
+        out["manual_state_guard_status"] = "error"
+        out["manual_state_guard_explanation"] = "manual candidate unavailable"
+        return out
+    try:
+        stat = MANUAL_STATE_GUARD_STATE_PATH.stat()
+    except FileNotFoundError:
+        return out
+    except Exception as exc:
+        out["manual_state_guard_explanation"] = f"state file unavailable: {exc}"
+        return out
+    age_seconds = max(0.0, now_utc.timestamp() - stat.st_mtime)
+    if age_seconds > MANUAL_STATE_GUARD_MAX_AGE_MINUTES * 60:
+        out["manual_state_guard_status"] = "stale"
+        out["manual_state_guard_explanation"] = (
+            f"state file older than {MANUAL_STATE_GUARD_MAX_AGE_MINUTES} minutes "
+            f"({round(age_seconds / 60.0, 2)} minutes)"
+        )
+        return out
+    try:
+        state = json.loads(MANUAL_STATE_GUARD_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        out["manual_state_guard_explanation"] = f"state file unavailable: {exc}"
+        return out
+    if not isinstance(state, dict):
+        out["manual_state_guard_explanation"] = "state file did not contain a JSON object"
+        return out
+    try:
+        evaluation = _load_manual_state_guard_api()(candidate, state)
+    except Exception as exc:
+        out["manual_state_guard_status"] = "error"
+        out["manual_state_guard_explanation"] = str(exc)
+        return out
+    out.update(
+        {
+            "manual_state_guard_status": "ok",
+            "manual_state_guard_decision": evaluation.get("decision"),
+            "manual_state_guard_can_publish_full_signal": evaluation.get("can_publish_full_signal"),
+            "manual_state_guard_recommended_publication_type": evaluation.get("recommended_publication_type"),
+            "manual_state_guard_reason": evaluation.get("reason"),
+            "manual_state_guard_primary_signal_id": evaluation.get("primary_signal_id"),
+            "manual_state_guard_primary_lifecycle_state": evaluation.get("primary_lifecycle_state"),
+            "manual_state_guard_primary_position_status": evaluation.get("primary_position_status"),
+            "manual_state_guard_duplicate_detected": evaluation.get("duplicate_detected"),
+            "manual_state_guard_conflict_detected": evaluation.get("conflict_detected"),
+            "manual_state_guard_replacement_candidate": evaluation.get("replacement_candidate"),
+            "manual_state_guard_entry_distance_pct": evaluation.get("entry_distance_pct"),
+            "manual_state_guard_sl_distance_pct": evaluation.get("sl_distance_pct"),
+            "manual_state_guard_secondary_signal_ids": evaluation.get("secondary_signal_ids") or [],
+            "manual_state_guard_explanation": evaluation.get("explanation"),
+        }
+    )
+    return out
+
+def _manual_state_guard_enforcement_action(result: dict) -> str:
+    if not MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED:
+        return "disabled"
+    if not MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT:
+        return "disabled"
+    if result.get("manual_state_guard_status") != "ok":
+        return "none"
+    if result.get("manual_state_guard_can_publish_full_signal") is not False:
+        return "none"
+    if result.get("manual_state_guard_duplicate_detected") is not True:
+        return "none"
+    primary_lifecycle = str(result.get("manual_state_guard_primary_lifecycle_state") or "").upper()
+    primary_position = str(result.get("manual_state_guard_primary_position_status") or "").upper()
+    if primary_lifecycle not in {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE"}:
+        return "none"
+    if primary_position in {"OPEN", "PARTIALLY_REDUCED", "RUNNER_ACTIVE"}:
+        return "none"
+    if result.get("manual_state_guard_replacement_candidate") is True:
+        return "replace_wait_confirm"
+    return "duplicate_wait_confirm_suppressed"
+
+def _manual_state_guard_jsonl_row(
+    *,
+    now_utc: datetime,
+    request_type: str,
+    candidate: dict | None,
+    result: dict,
+    enforcement_action: str,
+) -> dict:
+    candidate = candidate if isinstance(candidate, dict) else {}
+    return {
+        "ts": now_utc.isoformat().replace("+00:00", "Z"),
+        "request_type": request_type,
+        "candidate_signal_id": candidate.get("signal_id"),
+        "symbol": candidate.get("symbol"),
+        "direction": candidate.get("direction"),
+        "candidate_entry": candidate.get("entry"),
+        "candidate_sl": candidate.get("sl"),
+        "candidate_rr": candidate.get("rr"),
+        "guard_status": result.get("manual_state_guard_status"),
+        "guard_decision": result.get("manual_state_guard_decision"),
+        "can_publish_full_signal": result.get("manual_state_guard_can_publish_full_signal"),
+        "recommended_publication_type": result.get("manual_state_guard_recommended_publication_type"),
+        "reason": result.get("manual_state_guard_reason"),
+        "primary_signal_id": result.get("manual_state_guard_primary_signal_id"),
+        "primary_lifecycle_state": result.get("manual_state_guard_primary_lifecycle_state"),
+        "primary_position_status": result.get("manual_state_guard_primary_position_status"),
+        "duplicate_detected": result.get("manual_state_guard_duplicate_detected"),
+        "conflict_detected": result.get("manual_state_guard_conflict_detected"),
+        "replacement_candidate": result.get("manual_state_guard_replacement_candidate"),
+        "explanation": result.get("manual_state_guard_explanation"),
+        "enforcement_enabled": bool(
+            MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED
+            and MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT
+        ),
+        "enforcement_action": enforcement_action,
+    }
+
+def _should_evaluate_manual_state_guard(source: str, delivery_kind: str, text: str) -> bool:
+    if source.startswith("scheduled_runner.py:"):
+        return False
+    if "📌 Сигнал не выдан" in text:
+        return False
+    return delivery_kind in {"main", "personal"}
 
 def _try_int(v) -> int | None:
     if v is None:
@@ -1770,6 +2041,47 @@ async def _publish_signal_result(
     signal_id = _infer_signal_id(sig_html, run_log, published_at)
     symbol = _resolve_signal_symbol(symbol_hint)
     mode = get_user_mode(uid)
+    manual_state_guard = None
+    if _should_evaluate_manual_state_guard(source, delivery_kind, text):
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        last_payload = _read_last_signal_json()
+        candidate = _manual_state_guard_candidate_from_payload(
+            last_payload,
+            signal_id=signal_id,
+            symbol_hint=symbol_hint,
+            mode=mode,
+            created_at=published_at,
+        )
+        manual_state_guard = _evaluate_manual_state_guard(candidate, now_utc=now_utc)
+        enforcement_action = _manual_state_guard_enforcement_action(manual_state_guard)
+        manual_state_guard["manual_state_guard_enforcement_action"] = enforcement_action
+        manual_state_guard["manual_duplicate_suppressed"] = enforcement_action in {
+            "duplicate_wait_confirm_suppressed",
+            "replace_wait_confirm",
+        }
+        _jsonl_append(
+            _manual_state_guard_shadow_log_path(now_utc),
+            _manual_state_guard_jsonl_row(
+                now_utc=now_utc,
+                request_type=source,
+                candidate=candidate,
+                result=manual_state_guard,
+                enforcement_action=enforcement_action,
+            ),
+        )
+        if enforcement_action in {"duplicate_wait_confirm_suppressed", "replace_wait_confirm"}:
+            _log_signal_publication(
+                event="telegram_publish_suppressed",
+                uid=uid,
+                symbol=symbol,
+                mode=mode,
+                target_chat_id=target_chat_id,
+                source=source,
+                signal_id=signal_id,
+                delivery_kind=delivery_kind,
+                manual_state_guard=manual_state_guard,
+            )
+            return False
     delivered_chat_ids = await _deliver_publication_targets(
         context,
         uid,
@@ -1787,6 +2099,7 @@ async def _publish_signal_result(
             source=source,
             signal_id=signal_id,
             delivery_kind=delivery_kind,
+            manual_state_guard=manual_state_guard,
         )
         return False
 
@@ -1800,6 +2113,7 @@ async def _publish_signal_result(
             source=source,
             signal_id=signal_id,
             delivery_kind=delivery_kind,
+            manual_state_guard=manual_state_guard,
         )
 
     if "📌 Сигнал не выдан" in text:

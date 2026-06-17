@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -473,6 +474,188 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertEqual(payload["origin_chat_id"], -1003492385200)
         self.assertEqual(payload["origin_user_id"], 6308066297)
         self.assertEqual(payload["publish_targets"], [-1003492385200])
+
+    def _run_manual_guard_publish(self, evaluation: dict | None, *, enforcement: bool = False, state_exists: bool = True):
+        context = _FakeContext()
+        signal_events = []
+        aia_signal_calls = []
+        captured_candidates = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state_path = tmp / "agent_trade_state.json"
+            if state_exists:
+                state_path.write_text("{}", encoding="utf-8")
+            self.tg_bot.LOGS_DIR = tmp
+            self.tg_bot.MANUAL_STATE_GUARD_SHADOW_ENABLED = True
+            self.tg_bot.MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED = enforcement
+            self.tg_bot.MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT = enforcement
+            self.tg_bot.MANUAL_STATE_GUARD_STATE_PATH = state_path
+            self.tg_bot.MANUAL_STATE_GUARD_MAX_AGE_MINUTES = 15
+            self.tg_bot._read_last_signal_json = lambda *args, **kwargs: {
+                "symbol": "BTC/USDT",
+                "direction": "short",
+                "entry_price_neutral": 65005.84,
+                "entry_range": {"min": 64950.0, "max": 65061.68},
+                "sl": 65655.90,
+                "tp1": 64000.0,
+                "tp2": 63200.0,
+                "tp3": 62500.0,
+                "rr": 1.7,
+            }
+            self.tg_bot._log_signal_publication = lambda **kwargs: signal_events.append(kwargs)
+            self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: aia_signal_calls.append((payload, kwargs))
+
+            def fake_loader():
+                def fake_evaluate(candidate, state):
+                    captured_candidates.append(candidate)
+                    return evaluation or {
+                        "decision": "ALLOW_FULL_SIGNAL",
+                        "can_publish_full_signal": True,
+                        "recommended_publication_type": "FULL_SIGNAL",
+                        "reason": "no_active_scenario",
+                        "explanation": "allow",
+                    }
+
+                return fake_evaluate
+
+            self.tg_bot._load_manual_state_guard_api = fake_loader
+            ok = asyncio.run(
+                self.tg_bot._publish_signal_result(
+                    context,
+                    6308066297,
+                    text="BTC/USDT signal body",
+                    target_chat_id=-1003492385200,
+                    delivery_kind="main",
+                    source="tg_bot.py:_run_full_core",
+                    symbol_hint=None,
+                    sig_html=REPO_ROOT / "signal_20260618_001545.html",
+                    run_log=REPO_ROOT / "logs" / "signal_20260618_001545.log",
+                )
+            )
+            rows = []
+            for path in tmp.glob("manual_state_guard_shadow_*.jsonl"):
+                rows.extend(
+                    [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                )
+        return {
+            "ok": ok,
+            "context": context,
+            "signal_events": signal_events,
+            "aia_signal_calls": aia_signal_calls,
+            "captured_candidates": captured_candidates,
+            "shadow_rows": rows,
+        }
+
+    def test_manual_state_guard_shadow_allows_full_signal_without_active_scenario(self) -> None:
+        result = self._run_manual_guard_publish(None)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([call["chat_id"] for call in result["context"].bot.calls], [-1003492385200])
+        event = [e for e in result["signal_events"] if e["event"] == "telegram_publish"][0]
+        guard = event["manual_state_guard"]
+        self.assertEqual(guard["manual_state_guard_status"], "ok")
+        self.assertEqual(guard["manual_state_guard_decision"], "ALLOW_FULL_SIGNAL")
+        self.assertTrue(guard["manual_state_guard_can_publish_full_signal"])
+        candidate = result["captured_candidates"][0]
+        self.assertEqual(candidate["source"], "manual")
+        self.assertEqual(candidate["symbol"], "BTC/USDT")
+        self.assertEqual(candidate["direction"], "short")
+        self.assertEqual(candidate["entry"], 65005.84)
+        self.assertEqual(candidate["sl"], 65655.90)
+        self.assertEqual(result["shadow_rows"][0]["guard_decision"], "ALLOW_FULL_SIGNAL")
+
+    def test_manual_state_guard_shadow_records_duplicate_with_enforcement_disabled(self) -> None:
+        evaluation = {
+            "decision": "SUPPRESS_DUPLICATE",
+            "can_publish_full_signal": False,
+            "recommended_publication_type": "SUPPRESS_DUPLICATE",
+            "reason": "duplicate_wait_confirm",
+            "primary_signal_id": "20260617_234341",
+            "primary_lifecycle_state": "WAIT_CONFIRM",
+            "primary_position_status": "",
+            "duplicate_detected": True,
+            "conflict_detected": False,
+            "replacement_candidate": False,
+            "entry_distance_pct": 0.188929,
+            "sl_distance_pct": 0.188939,
+            "secondary_signal_ids": [],
+            "explanation": "duplicate",
+        }
+        result = self._run_manual_guard_publish(evaluation, enforcement=False)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([call["chat_id"] for call in result["context"].bot.calls], [-1003492385200])
+        event = [e for e in result["signal_events"] if e["event"] == "telegram_publish"][0]
+        guard = event["manual_state_guard"]
+        self.assertEqual(guard["manual_state_guard_decision"], "SUPPRESS_DUPLICATE")
+        self.assertFalse(guard["manual_state_guard_can_publish_full_signal"])
+        self.assertTrue(guard["manual_state_guard_duplicate_detected"])
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "disabled")
+        self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "disabled")
+
+    def test_manual_duplicate_wait_confirm_enforcement_suppresses_full_publish(self) -> None:
+        evaluation = {
+            "decision": "SUPPRESS_DUPLICATE",
+            "can_publish_full_signal": False,
+            "recommended_publication_type": "SUPPRESS_DUPLICATE",
+            "reason": "duplicate_wait_confirm",
+            "primary_signal_id": "20260617_234341",
+            "primary_lifecycle_state": "WAIT_CONFIRM",
+            "primary_position_status": "",
+            "duplicate_detected": True,
+            "conflict_detected": False,
+            "replacement_candidate": False,
+            "entry_distance_pct": 0.188929,
+            "sl_distance_pct": 0.188939,
+            "secondary_signal_ids": [],
+            "explanation": "duplicate",
+        }
+        result = self._run_manual_guard_publish(evaluation, enforcement=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["context"].bot.calls, [])
+        self.assertEqual(result["aia_signal_calls"], [])
+        event = result["signal_events"][0]
+        self.assertEqual(event["event"], "telegram_publish_suppressed")
+        guard = event["manual_state_guard"]
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "duplicate_wait_confirm_suppressed")
+        self.assertTrue(guard["manual_duplicate_suppressed"])
+        self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "duplicate_wait_confirm_suppressed")
+
+    def test_manual_state_guard_missing_state_continues_publication(self) -> None:
+        result = self._run_manual_guard_publish(None, state_exists=False)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([call["chat_id"] for call in result["context"].bot.calls], [-1003492385200])
+        event = [e for e in result["signal_events"] if e["event"] == "telegram_publish"][0]
+        self.assertEqual(event["manual_state_guard"]["manual_state_guard_status"], "unavailable")
+        self.assertEqual(result["shadow_rows"][0]["guard_status"], "unavailable")
+
+    def test_manual_state_guard_shadow_records_opposite_open_conflict(self) -> None:
+        evaluation = {
+            "decision": "CONFLICT_UPDATE",
+            "can_publish_full_signal": False,
+            "recommended_publication_type": "CONFLICT_UPDATE",
+            "reason": "opposite_direction_active_scenario_exists",
+            "primary_signal_id": "20260618_000001",
+            "primary_lifecycle_state": "ENTRY_LIVE",
+            "primary_position_status": "OPEN",
+            "duplicate_detected": False,
+            "conflict_detected": True,
+            "replacement_candidate": False,
+            "entry_distance_pct": 0.0,
+            "sl_distance_pct": 0.0,
+            "secondary_signal_ids": [],
+            "explanation": "conflict",
+        }
+        result = self._run_manual_guard_publish(evaluation, enforcement=True)
+
+        self.assertTrue(result["ok"])
+        event = [e for e in result["signal_events"] if e["event"] == "telegram_publish"][0]
+        guard = event["manual_state_guard"]
+        self.assertEqual(guard["manual_state_guard_decision"], "CONFLICT_UPDATE")
+        self.assertTrue(guard["manual_state_guard_conflict_detected"])
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "none")
 
     def test_single_mode_skips_separate_analysis_header_publish(self) -> None:
         result = self._run_symbol_publish(6308066297, symbol="SOL/USDT")
