@@ -25,6 +25,18 @@ def _cpi_event() -> dict:
     }
 
 
+def _fomc_event() -> dict:
+    return {
+        "time_msk": "17.06.2026, 21:00",
+        "date_msk": "17.06.2026",
+        "event": "FOMC Meeting",
+        "category": "fed",
+        "impact": "high",
+        "window_before_min": 90,
+        "source": "calendar",
+    }
+
+
 class TestScheduledMacroEventGuard(unittest.TestCase):
     def test_day_mid_structured_scheduled_event_persisted(self) -> None:
         payload = {"upcoming_events": [], "macro_risk_summary": "", "day_mid_context": {}}
@@ -178,6 +190,63 @@ class TestScheduledMacroEventGuard(unittest.TestCase):
 
         self.assertIs(signal["no_trade"], True)
         self.assertIn("post_event_reaction_chaotic", signal["no_trade_reasons"])
+
+    def test_manual_post_fomc_signal_gets_structured_macro_event_context(self) -> None:
+        event = _fomc_event()
+        event["post_event_classification"] = {
+            "market_reaction": "risk_off",
+            "btc_reaction": "impulse_down",
+            "old_narrative_valid": False,
+            "allowed_direction": "short",
+            "execution_policy": "trade_allowed_strict_confirm",
+        }
+        signal = {
+            "time_msk": "17.06.2026, 23:43",
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "side": "short",
+            "mode": "aggressive",
+            "no_trade": False,
+            "no_trade_reasons": [],
+            "upcoming_events": [event],
+            "day_mid_context": {},
+        }
+
+        get_signal_json.apply_scheduled_macro_event_guard(signal)
+
+        ctx = signal["macro_event_context"]
+        self.assertEqual(ctx["event_name"], "FOMC Meeting")
+        self.assertEqual(ctx["event_type"], "macro_policy")
+        self.assertEqual(ctx["event_time_msk"], "2026-06-17T21:00:00+03:00")
+        self.assertEqual(ctx["phase"], "post_event")
+        self.assertIs(ctx["post_event_window_active"], True)
+        self.assertIs(ctx["post_event_reprice_required"], False)
+        self.assertEqual(ctx["post_event_classification"], "bearish")
+        self.assertIs(ctx["old_narrative_valid"], False)
+        self.assertEqual(ctx["allowed_direction"], "short")
+        self.assertEqual(signal["macro_event_diagnostics"]["macro_context_source"], "macro_event_guard")
+
+    def test_immediate_post_fomc_before_reprice_classification_is_structured(self) -> None:
+        signal = {
+            "time_msk": "17.06.2026, 21:10",
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "side": "short",
+            "mode": "aggressive",
+            "no_trade": False,
+            "no_trade_reasons": [],
+            "upcoming_events": [_fomc_event()],
+            "day_mid_context": {},
+        }
+
+        get_signal_json.apply_scheduled_macro_event_guard(signal)
+
+        ctx = signal["macro_event_context"]
+        self.assertEqual(ctx["event_name"], "FOMC Meeting")
+        self.assertEqual(ctx["phase"], "post_event")
+        self.assertIs(ctx["post_event_reprice_required"], True)
+        self.assertEqual(ctx["post_event_classification"], "not_classified")
+        self.assertIn("post_event_reprice_required", signal["no_trade_reasons"])
 
     def test_debug_override_allows_manual_blackout_signal(self) -> None:
         signal = {

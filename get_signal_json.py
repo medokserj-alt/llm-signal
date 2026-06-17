@@ -3736,6 +3736,93 @@ def apply_upcoming_event_risk(d: dict) -> None:
     d["event_risk"] = event_risk
 
 
+def _iso_msk_from_macro_event(event: dict) -> str | None:
+    if not isinstance(event, dict):
+        return None
+    if event.get("event_time_utc"):
+        try:
+            dt = datetime.fromisoformat(str(event.get("event_time_utc")).strip().replace("Z", "+00:00"))
+            return dt.astimezone(ZoneInfo("Europe/Moscow")).replace(microsecond=0).isoformat()
+        except Exception:
+            pass
+    parsed = _parse_msk_datetime(
+        event.get("event_time_msk") or event.get("time_msk"),
+        date_hint=event.get("date_msk"),
+    )
+    if parsed is None:
+        return None
+    return parsed.astimezone(ZoneInfo("Europe/Moscow")).replace(microsecond=0).isoformat()
+
+
+def _macro_event_external_phase(guard: dict) -> str | None:
+    phase = str((guard or {}).get("phase") or "").strip().lower()
+    if phase == "pre_event":
+        return "pre_event"
+    if phase in {"awaiting_reprice", "post_event_classified", "expired_missing_classification"}:
+        return "post_event"
+    return None
+
+
+def _normalize_post_event_classification_label(classification: dict | None, guard: dict) -> str | None:
+    if not isinstance(classification, dict) or not classification:
+        if _macro_event_external_phase(guard) == "post_event":
+            return "not_classified"
+        return None
+    for key in ("post_event_classification", "classification", "market_reaction", "btc_reaction"):
+        value = str(classification.get(key) or "").strip().lower()
+        if value in {"bearish", "bullish", "mixed", "unclear", "not_classified"}:
+            return value
+        if value in {"risk_off", "impulse_down", "down"}:
+            return "bearish"
+        if value in {"risk_on", "impulse_up", "up"}:
+            return "bullish"
+        if value in {"chaotic", "whipsaw", "two_way"}:
+            return "mixed"
+        if value in {"unknown", "none"}:
+            return "unclear"
+    return "unclear"
+
+
+def _normalize_macro_allowed_direction(classification: dict | None) -> str | None:
+    if not isinstance(classification, dict) or not classification:
+        return None
+    value = str(classification.get("allowed_direction") or "").strip().lower()
+    if value in {"long", "short", "both", "observe_only"}:
+        return value
+    if value in {"none", "no_trade", "stand_aside"}:
+        return "observe_only"
+    return None
+
+
+def _build_macro_event_context_from_guard(guard: dict) -> dict | None:
+    if not isinstance(guard, dict):
+        return None
+    phase = _macro_event_external_phase(guard)
+    event = guard.get("event") if isinstance(guard.get("event"), dict) else {}
+    if not phase or not event:
+        return None
+    classification = guard.get("post_event_classification") if isinstance(guard.get("post_event_classification"), dict) else None
+    event_time_msk = _iso_msk_from_macro_event(event)
+    context = {
+        "event_name": event.get("event_name") or event.get("event") or event.get("name"),
+        "event_type": "macro_policy" if str(event.get("category") or "").lower() in {"fed", "macro_rates", ""} else event.get("category"),
+        "event_time_msk": event_time_msk or event.get("event_time_msk") or event.get("time_msk"),
+        "event_time_utc": event.get("event_time_utc"),
+        "phase": phase,
+        "macro_policy": guard.get("macro_policy"),
+        "post_event_window_active": phase == "post_event" and guard.get("phase") in {"awaiting_reprice", "post_event_classified"},
+        "post_event_reprice_required": guard.get("reason") == "post_event_reprice_required",
+        "post_event_classification": _normalize_post_event_classification_label(classification, guard),
+        "old_narrative_valid": classification.get("old_narrative_valid") if isinstance(classification, dict) else None,
+        "allowed_direction": _normalize_macro_allowed_direction(classification),
+        "classification_reason": guard.get("reason"),
+        "source": "macro_event_guard",
+    }
+    if isinstance(classification, dict):
+        context["post_event_classification_raw"] = copy.deepcopy(classification)
+    return {key: value for key, value in context.items() if value is not None}
+
+
 def apply_scheduled_macro_event_guard(d: dict) -> None:
     if not isinstance(d, dict):
         return
@@ -3774,24 +3861,30 @@ def apply_scheduled_macro_event_guard(d: dict) -> None:
         state_path=BASE / "logs" / "macro_event_state.json",
     )
     d["macro_event_guard"] = guard
+    macro_context = _build_macro_event_context_from_guard(guard)
+    if macro_context:
+        d["macro_event_context"] = macro_context
+    else:
+        d.pop("macro_event_context", None)
     if not guard.get("active"):
         return
 
     event = guard.get("event") if isinstance(guard.get("event"), dict) else {}
+    macro_context = d.get("macro_event_context") if isinstance(d.get("macro_event_context"), dict) else {}
     diagnostics = {
+        "macro_event_context_present": bool(macro_context),
         "scheduled_macro_event_active": True,
-        "macro_event_name": event.get("event_name"),
-        "macro_event_time_msk": event.get("event_time_msk"),
-        "macro_phase": guard.get("phase"),
+        "macro_event_name": macro_context.get("event_name") or event.get("event_name"),
+        "macro_event_time_msk": macro_context.get("event_time_msk") or event.get("event_time_msk"),
+        "macro_phase": macro_context.get("phase") or guard.get("phase"),
         "macro_policy": guard.get("macro_policy"),
         "macro_message_type": guard.get("macro_message_type"),
-        "post_event_classification": guard.get("post_event_classification"),
-        "old_narrative_valid": (guard.get("post_event_classification") or {}).get("old_narrative_valid")
-        if isinstance(guard.get("post_event_classification"), dict)
-        else None,
-        "allowed_direction": (guard.get("post_event_classification") or {}).get("allowed_direction")
-        if isinstance(guard.get("post_event_classification"), dict)
-        else None,
+        "post_event_window_active": macro_context.get("post_event_window_active"),
+        "post_event_reprice_required": macro_context.get("post_event_reprice_required"),
+        "post_event_classification": macro_context.get("post_event_classification"),
+        "old_narrative_valid": macro_context.get("old_narrative_valid"),
+        "allowed_direction": macro_context.get("allowed_direction"),
+        "macro_context_source": macro_context.get("source") or "macro_event_guard",
     }
     d["macro_event_diagnostics"] = diagnostics
     if isinstance(d.get("event_risk"), dict):
