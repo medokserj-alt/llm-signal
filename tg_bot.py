@@ -1695,6 +1695,7 @@ def _build_signal_json_v1(
     sl = d.get("sl")
     tp1 = d.get("tp1")
     tp2 = d.get("tp2")
+    tp3 = d.get("tp3")
 
     if not symbol or not direction:
         return None
@@ -1874,22 +1875,32 @@ def _build_signal_json_v1(
         tp_by_mode = d.get("tp_by_mode")
         tp1_mode = None
         tp2_mode = None
+        tp3_mode = None
         if isinstance(tp_by_mode, dict):
             tp_m = tp_by_mode.get(mode)
             if isinstance(tp_m, dict):
                 tp1_mode = tp_m.get("tvh1")
                 tp2_mode = tp_m.get("tvh2")
+                tp3_mode = tp_m.get("tvh3") if tp_m.get("tvh3") is not None else tp_m.get("tp3")
 
         tp1_mode_f = _try_float(tp1_mode)
         tp2_mode_f = _try_float(tp2_mode)
-        if tp1_mode_f is not None or tp2_mode_f is not None:
+        tp3_mode_f = _try_float(tp3_mode)
+        if tp1_mode_f is not None or tp2_mode_f is not None or tp3_mode_f is not None:
             tp_out = {"tp1": tp1_mode_f, "tp2": tp2_mode_f}
+            if tp3_mode_f is not None:
+                tp_out["tp3"] = tp3_mode_f
         else:
             tp_out = {"tp1": (_try_float(tp1) if tp1 is not None else None), "tp2": (_try_float(tp2) if tp2 is not None else None)}
+            tp3_f = _try_float(tp3) if tp3 is not None else None
+            if tp3_f is not None:
+                tp_out["tp3"] = tp3_f
     except Exception:
         try:
             sl_val = float(sl)
             tp_out = {"tp1": (float(tp1) if tp1 is not None else None), "tp2": (float(tp2) if tp2 is not None else None)}
+            if tp3 is not None:
+                tp_out["tp3"] = float(tp3)
         except Exception:
             return None
 

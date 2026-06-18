@@ -107,11 +107,12 @@ class TestTgBotSignalPayload(unittest.TestCase):
             "sl": 583.11,
             "tp1": 612.0,
             "tp2": 635.0,
+            "tp3": 650.0,
             "mode": "neutral",
             "entry_mode": "pullback",
             "entry_price_neutral": 589.0,
             "sl_by_mode": {"neutral": 583.11},
-            "tp_by_mode": {"neutral": {"tvh1": 612.0, "tvh2": 635.0}},
+            "tp_by_mode": {"neutral": {"tvh1": 612.0, "tvh2": 635.0, "tvh3": 650.0}},
         }
 
         out = tg_bot._build_signal_json_v1(
@@ -128,9 +129,35 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(out["entry_zone"], [586.0, 592.0])
         self.assertEqual(out["entry_price"], 589.0)
         self.assertEqual(out["sl"], 583.11)
-        self.assertEqual(out["tp"], {"tp1": 612.0, "tp2": 635.0})
+        self.assertEqual(out["tp"], {"tp1": 612.0, "tp2": 635.0, "tp3": 650.0})
         self.assertEqual(out["channel_id"], -1001234567890)
         self.assertNotIn("event_risk", out)
+
+    def test_build_signal_json_preserves_top_level_tp3_without_mode_targets(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "entry_range": [64107.054705, 64492.478604],
+            "sl": 64942.77,
+            "tp1": 63317.0,
+            "tp2": 62678.0,
+            "tp3": 62356.5,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "entry_price_neutral": 64299.77,
+            "sl_by_mode": {"neutral": 64942.77},
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="20260618_093003",
+            published_at="2026-06-18T06:31:50Z",
+            channel_id="-1001234567890",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tp"], {"tp1": 63317.0, "tp2": 62678.0, "tp3": 62356.5})
 
     def test_build_signal_json_includes_event_risk_and_preserves_severe(self) -> None:
         tg_bot = _load_tg_bot_module()

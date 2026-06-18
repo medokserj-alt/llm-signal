@@ -196,6 +196,8 @@ def _persist_final_signal_payload(signal_json_v1: dict, *, last_json_path: Path 
             data["tp1"] = tp.get("tp1")
         if tp.get("tp2") is not None:
             data["tp2"] = tp.get("tp2")
+        if tp.get("tp3") is not None:
+            data["tp3"] = tp.get("tp3")
 
     signal_id = signal_json_v1.get("signal_id")
     if signal_id:
