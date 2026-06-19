@@ -366,6 +366,51 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertEqual(decision["stale_active_signal_status"], "CONFIRM_LIVE")
         self.assertEqual(decision["stale_active_signal_reason"], "pending_state_ttl_expired")
 
+    def test_old_tp1_hit_without_runner_expires_as_blocker(self) -> None:
+        now = datetime(2026, 6, 19, 15, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        old = self._old(
+            "TP1_HIT_LIVE",
+            signal_id="20260618_093003",
+            direction="long",
+            ts="2026-06-18T06:30:03Z",
+            position_status="",
+            runner_active=False,
+        )
+
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertTrue(decision["stale_tp1_hit_signal_ignored"])
+        self.assertEqual(decision["stale_tp1_hit_signal_id"], "20260618_093003")
+        self.assertEqual(decision["stale_tp1_hit_signal_reason"], "tp1_hit_without_runner_expired")
+
+    def test_tp1_hit_with_runner_remains_active_blocker(self) -> None:
+        now = datetime(2026, 6, 19, 15, 30, tzinfo=timezone.utc)
+        candidate = self._candidate(direction="short")
+        old = self._old(
+            "TP1_HIT_LIVE",
+            signal_id="20260618_093003",
+            direction="long",
+            ts="2026-06-18T06:30:03Z",
+            position_status="",
+            runner_active=True,
+        )
+
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+
+        self.assertEqual(decision["publication_type"], "conflict_update")
+        self.assertFalse(decision["stale_tp1_hit_signal_ignored"])
+
+    def test_sl_hit_live_is_not_in_work_blocker(self) -> None:
+        candidate = self._candidate(direction="short")
+        old = self._old("SL_HIT_LIVE", direction="long", ts="2026-06-19T13:50:04Z")
+
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=datetime(2026, 6, 19, 15, 30, tzinfo=timezone.utc))
+
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertFalse(decision["duplicate_in_work_signal_detected"])
+
     def test_recent_confirm_live_still_conflict_updates(self) -> None:
         now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
         candidate = self._candidate(direction="short")
@@ -517,6 +562,56 @@ class TestScheduledSignalState(unittest.TestCase):
             self.assertEqual(guard["state_guard_decision"], "ALLOW_FULL_SIGNAL")
             self.assertTrue(guard["state_guard_can_publish_full_signal"])
 
+    def test_state_guard_duplicate_runtime_enforcement_disabled_logs_shadow_only(self) -> None:
+        c = cfg()
+        guard = {
+            "state_guard_decision": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_recommended_publication_type": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_duplicate_detected": True,
+            "state_guard_can_publish_full_signal": False,
+            "state_guard_primary_lifecycle_state": "SETUP_ARMED",
+            "state_guard_entry_distance_pct": 0.062956,
+            "state_guard_sl_distance_pct": 0.124711,
+        }
+
+        action = sr.state_guard_duplicate_runtime_action(guard, c)
+
+        self.assertFalse(action["scheduled_state_guard_duplicate_enforcement_enabled"])
+        self.assertTrue(action["scheduled_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "shadow_only")
+
+    def test_state_guard_duplicate_runtime_enforcement_enabled_suppresses_full_signal(self) -> None:
+        c = cfg()
+        c.scheduled_state_guard_duplicate_enforcement_enabled = True
+        guard = {
+            "state_guard_decision": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_recommended_publication_type": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_duplicate_detected": True,
+            "state_guard_can_publish_full_signal": False,
+            "state_guard_primary_lifecycle_state": "CONFIRM_LIVE",
+            "state_guard_entry_distance_pct": 0.062956,
+            "state_guard_sl_distance_pct": 0.124711,
+        }
+
+        action = sr.state_guard_duplicate_runtime_action(guard, c)
+
+        self.assertTrue(action["scheduled_state_guard_duplicate_enforcement_enabled"])
+        self.assertTrue(action["scheduled_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "enforce_duplicate_suppression")
+
+    def test_day_bias_diagnostics_flags_risk_off_long_as_counter_regime(self) -> None:
+        payload = {"day_mid_context": {"day_bias": "risk-off"}}
+        candidate = {"direction": "long"}
+
+        diag = sr.day_bias_diagnostics(payload, candidate, gate={})
+
+        self.assertEqual(diag["day_bias_direction"], "short")
+        self.assertEqual(diag["candidate_direction"], "long")
+        self.assertEqual(diag["signal_direction_vs_day_bias"], "counter")
+        self.assertTrue(diag["counter_regime_signal"])
+        self.assertEqual(diag["counter_regime_allowed_reason"], "none")
+        self.assertFalse(diag["market_override_detected"])
+
     def test_publish_signal_result_keeps_aia_forward_enabled_by_default(self) -> None:
         import tg_bot
 
@@ -556,6 +651,8 @@ class TestScheduledSignalState(unittest.TestCase):
                 tg_bot, "_build_signal_json_v1", side_effect=lambda **kwargs: built_kwargs.append(kwargs) or {"signal_id": kwargs["signal_id"]}
             ), patch.object(
                 tg_bot, "send_signal_to_aia", side_effect=lambda body: sent_payloads.append(body) or True
+            ), patch(
+                "scheduled_runner.load_in_work_signal_state", return_value=[]
             ):
                 result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
 
@@ -597,6 +694,8 @@ class TestScheduledSignalState(unittest.TestCase):
                 tg_bot, "_build_signal_json_v1", return_value={"signal_id": "20260606_153001"}
             ), patch.object(
                 tg_bot, "send_signal_to_aia", side_effect=RuntimeError("aia down")
+            ), patch(
+                "scheduled_runner.load_in_work_signal_state", return_value=[]
             ):
                 result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
 

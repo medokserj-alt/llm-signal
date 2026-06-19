@@ -159,6 +159,33 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out["tp"], {"tp1": 63317.0, "tp2": 62678.0, "tp3": 62356.5})
 
+    def test_build_signal_json_prefers_official_tp_over_shifted_mode_tvh(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "short",
+            "entry_range": [62719.31, 62719.31],
+            "sl": 63346.5,
+            "tp1": 61735.61,
+            "tp2": 61112.02,
+            "tp3": 60798.42,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "entry_price_neutral": 62719.31,
+            "sl_by_mode": {"neutral": 63346.5},
+            "tp_by_mode": {"neutral": {"tvh1": 61112.02, "tvh2": 59864.84}},
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="20260619_123003",
+            published_at="2026-06-19T09:30:03Z",
+            channel_id="-1001234567890",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out["tp"], {"tp1": 61735.61, "tp2": 61112.02, "tp3": 60798.42})
+
     def test_build_signal_json_includes_event_risk_and_preserves_severe(self) -> None:
         tg_bot = _load_tg_bot_module()
         tg_bot._AIA_UID_CONTEXT = None

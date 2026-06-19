@@ -1871,6 +1871,9 @@ def _build_signal_json_v1(
         if sl_val is None:
             sl_val = float(sl)
 
+        top_tp1_f = _try_float(tp1) if tp1 is not None else None
+        top_tp2_f = _try_float(tp2) if tp2 is not None else None
+        top_tp3_f = _try_float(tp3) if tp3 is not None else None
         tp_out: dict = {"tp1": None, "tp2": None}
         tp_by_mode = d.get("tp_by_mode")
         tp1_mode = None
@@ -1886,15 +1889,16 @@ def _build_signal_json_v1(
         tp1_mode_f = _try_float(tp1_mode)
         tp2_mode_f = _try_float(tp2_mode)
         tp3_mode_f = _try_float(tp3_mode)
-        if tp1_mode_f is not None or tp2_mode_f is not None or tp3_mode_f is not None:
+        if top_tp1_f is not None or top_tp2_f is not None or top_tp3_f is not None:
+            tp_out = {"tp1": top_tp1_f, "tp2": top_tp2_f}
+            if top_tp3_f is not None:
+                tp_out["tp3"] = top_tp3_f
+        elif tp1_mode_f is not None or tp2_mode_f is not None or tp3_mode_f is not None:
             tp_out = {"tp1": tp1_mode_f, "tp2": tp2_mode_f}
             if tp3_mode_f is not None:
                 tp_out["tp3"] = tp3_mode_f
         else:
-            tp_out = {"tp1": (_try_float(tp1) if tp1 is not None else None), "tp2": (_try_float(tp2) if tp2 is not None else None)}
-            tp3_f = _try_float(tp3) if tp3 is not None else None
-            if tp3_f is not None:
-                tp_out["tp3"] = tp3_f
+            tp_out = {"tp1": top_tp1_f, "tp2": top_tp2_f}
     except Exception:
         try:
             sl_val = float(sl)

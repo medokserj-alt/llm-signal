@@ -70,6 +70,7 @@ NOT_IN_WORK_SIGNAL_STATUSES = {
     "CANCEL_WAIT_CONFIRM",
     "REPLACED_BY_NEW_SIGNAL",
     "CLOSED",
+    "SL_HIT_LIVE",
     "STOP_LOSS_HIT",
     "TAKE_PROFIT_DONE",
 }
@@ -123,6 +124,10 @@ def scheduled_wait_confirm_fallback_max_age_hours() -> int:
 
 def scheduled_post_event_reprice_max_age_minutes() -> int:
     return max(1, parse_int_env("SCHEDULED_POST_EVENT_REPRICE_MAX_AGE_MINUTES", 90))
+
+
+def scheduled_tp1_hit_without_runner_max_age_hours() -> int:
+    return max(1, parse_int_env("SCHEDULED_TP1_HIT_WITHOUT_RUNNER_MAX_AGE_HOURS", 12))
 
 
 def parse_date_env(name: str, default: str) -> date:
@@ -431,16 +436,23 @@ def _signal_position_status(signal: dict) -> str:
     return str(signal.get("position_status") or signal.get("primary_position_status") or "").strip().upper()
 
 
+def _signal_runner_or_open_position_known(signal: dict) -> bool:
+    position_status = _signal_position_status(signal)
+    return (
+        position_status in {"OPEN", "RUNNER_ACTIVE"}
+        or bool(signal.get("runner_active"))
+        or bool(signal.get("runner_open"))
+        or bool(signal.get("open_position"))
+        or bool(signal.get("position_open"))
+    )
+
+
 def _signal_has_open_position(signal: dict) -> bool:
     status = str(signal.get("status") or "").strip().upper()
     position_status = _signal_position_status(signal)
-    explicit_open = (
-        position_status == "OPEN"
-        or bool(signal.get("open_position"))
-        or bool(signal.get("position_open"))
-        or bool(signal.get("runner_active"))
-        or bool(signal.get("runner_open"))
-    )
+    explicit_open = _signal_runner_or_open_position_known(signal)
+    if status == "TP1_HIT_LIVE":
+        return explicit_open
     return (
         explicit_open
         or status in SCHEDULED_POSITION_BLOCKING_STATUSES
@@ -456,6 +468,10 @@ def _stale_active_signal_defaults() -> dict:
         "stale_active_signal_status": None,
         "stale_active_signal_age_hours": None,
         "stale_active_signal_reason": None,
+        "stale_tp1_hit_signal_ignored": False,
+        "stale_tp1_hit_signal_id": None,
+        "stale_tp1_hit_signal_age_hours": None,
+        "stale_tp1_hit_signal_reason": None,
     }
 
 
@@ -469,6 +485,23 @@ def _stale_active_signal_result(signal: dict, *, now_utc: datetime | None = None
     if not status:
         return out
     if _signal_has_open_position(signal):
+        return out
+    if status == "TP1_HIT_LIVE":
+        event_time = _signal_event_time(signal)
+        if event_time is not None:
+            age_hours = (now_utc - event_time).total_seconds() / 3600.0
+            out["stale_active_signal_age_hours"] = round(max(0.0, age_hours), 3)
+            if age_hours > scheduled_tp1_hit_without_runner_max_age_hours():
+                out.update(
+                    {
+                        "stale_active_signal_ignored": True,
+                        "stale_active_signal_reason": "tp1_hit_without_runner_expired",
+                        "stale_tp1_hit_signal_ignored": True,
+                        "stale_tp1_hit_signal_id": signal_id,
+                        "stale_tp1_hit_signal_age_hours": round(max(0.0, age_hours), 3),
+                        "stale_tp1_hit_signal_reason": "tp1_hit_without_runner_expired",
+                    }
+                )
         return out
     if status in SCHEDULED_ADVISORY_NON_BLOCKING_STATUSES:
         out.update({"stale_active_signal_ignored": True, "stale_active_signal_reason": "advisory_state_non_blocking"})
@@ -538,6 +571,7 @@ def _action_row_to_signal(row: dict) -> dict | None:
         "sl": _try_float(row.get("sl")),
         "tp1": _try_float(row.get("tp1")),
         "tp2": _try_float(row.get("tp2")),
+        "tp3": _try_float(row.get("tp3")),
         "rr": _try_float(row.get("rr")),
         "confidence": row.get("confidence"),
         "confidence_rank": _confidence_rank(row.get("confidence")),
@@ -551,6 +585,8 @@ def _action_row_to_signal(row: dict) -> dict | None:
         "valid_until": row.get("valid_until"),
         "confirm_timeout_minutes": row.get("confirm_timeout_minutes"),
         "position_status": row.get("position_status"),
+        "runner_active": row.get("runner_active"),
+        "runner_status": row.get("runner_status"),
         "filled": status in LIVE_POSITION_STATUSES or bool(row.get("entry_detection_ts")),
         "cancelled_by_scheduler": False,
         "hard_block_conditions": row.get("hard_block_conditions") if isinstance(row.get("hard_block_conditions"), list) else [],
@@ -621,6 +657,8 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
     direction = candidate.get("direction")
     same_symbol = []
     for signal in active_signals:
+        if str(signal.get("status") or "").strip().upper() in NOT_IN_WORK_SIGNAL_STATUSES:
+            continue
         if signal.get("symbol") != symbol:
             continue
         if now_utc is None:
@@ -861,6 +899,7 @@ class SchedulerConfig:
     state_guard_shadow_enabled: bool = True
     state_guard_state_path: Path = DEFAULT_STATE_GUARD_STATE_PATH
     state_guard_max_age_minutes: int = 15
+    scheduled_state_guard_duplicate_enforcement_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "SchedulerConfig":
@@ -892,6 +931,10 @@ class SchedulerConfig:
             state_guard_shadow_enabled=parse_bool_env("STATE_GUARD_SHADOW_ENABLED", True),
             state_guard_state_path=Path(os.getenv("STATE_GUARD_STATE_PATH", str(DEFAULT_STATE_GUARD_STATE_PATH))),
             state_guard_max_age_minutes=max(1, parse_int_env("STATE_GUARD_MAX_AGE_MINUTES", 15)),
+            scheduled_state_guard_duplicate_enforcement_enabled=parse_bool_env(
+                "SCHEDULED_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED",
+                False,
+            ),
         )
 
 
@@ -1020,6 +1063,82 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
         }
     )
     return out
+
+
+def state_guard_duplicate_runtime_action(state_guard: dict, cfg: SchedulerConfig) -> dict:
+    duplicate_decision = str(state_guard.get("state_guard_decision") or "").strip().upper()
+    recommended = str(state_guard.get("state_guard_recommended_publication_type") or "").strip().upper()
+    duplicate_detected = bool(state_guard.get("state_guard_duplicate_detected"))
+    can_publish = state_guard.get("state_guard_can_publish_full_signal")
+    active_status = str(state_guard.get("state_guard_primary_lifecycle_state") or "").strip().upper()
+    entry_distance = _try_float(state_guard.get("state_guard_entry_distance_pct"))
+    sl_distance = _try_float(state_guard.get("state_guard_sl_distance_pct"))
+    eligible = (
+        duplicate_detected
+        and can_publish is False
+        and active_status in {"WAIT_CONFIRM", "CONFIRM_LIVE", "SETUP_ARMED", "ENTRY_LIVE", "HOLD", "TIMEOUT_LIVE"}
+        and (entry_distance is None or entry_distance <= 0.5)
+        and (sl_distance is None or sl_distance <= 1.0)
+        and (duplicate_decision in {"ACTIVE_SIGNAL_UPDATE", "SUPPRESS_DUPLICATE"} or recommended in {"ACTIVE_SIGNAL_UPDATE", "SUPPRESS_DUPLICATE"})
+    )
+    return {
+        "scheduled_state_guard_duplicate_enforcement_enabled": bool(
+            cfg.scheduled_state_guard_duplicate_enforcement_enabled
+        ),
+        "scheduled_state_guard_duplicate_runtime_eligible": eligible,
+        "scheduled_state_guard_duplicate_runtime_action": (
+            "enforce_duplicate_suppression"
+            if eligible and cfg.scheduled_state_guard_duplicate_enforcement_enabled
+            else "shadow_only"
+            if eligible
+            else "none"
+        ),
+    }
+
+
+def _day_bias_to_direction(value) -> str | None:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        return None
+    if text in {"short", "bearish", "risk_off", "down", "sell"}:
+        return "short"
+    if text in {"long", "bullish", "risk_on", "up", "buy"}:
+        return "long"
+    return None
+
+
+def day_bias_diagnostics(payload: dict, candidate: dict, gate: dict) -> dict:
+    ctx = payload.get("day_mid_context") if isinstance(payload.get("day_mid_context"), dict) else {}
+    raw_day_bias = (
+        ctx.get("day_bias")
+        or payload.get("day_bias")
+        or payload.get("day_bias_direction")
+        or gate.get("day_bias")
+        or gate.get("event_bias")
+    )
+    day_bias_direction = _day_bias_to_direction(raw_day_bias)
+    candidate_direction = _normalize_direction(candidate.get("direction"))
+    vs = "unknown"
+    counter = False
+    if day_bias_direction and candidate_direction:
+        vs = "aligned" if day_bias_direction == candidate_direction else "counter"
+        counter = vs == "counter"
+    market_override = bool(payload.get("market_override_detected") or payload.get("market_override") or payload.get("override_detected"))
+    allowed_reason = None
+    if counter:
+        allowed_reason = (
+            payload.get("counter_regime_allowed_reason")
+            or payload.get("market_override_reason")
+            or ("market_override_detected" if market_override else "none")
+        )
+    return {
+        "day_bias_direction": day_bias_direction or "unknown",
+        "candidate_direction": candidate_direction or "unknown",
+        "signal_direction_vs_day_bias": vs,
+        "counter_regime_signal": counter,
+        "counter_regime_allowed_reason": allowed_reason,
+        "market_override_detected": market_override,
+    }
 
 
 def state_guard_shadow_log_row(
@@ -1494,6 +1613,52 @@ async def generate_and_publish_signal(
     signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
     candidate = _candidate_from_payload(payload, signal_id=signal_id)
     state_guard_shadow = evaluate_state_guard_shadow(candidate, cfg)
+    state_guard_runtime = state_guard_duplicate_runtime_action(state_guard_shadow, cfg)
+    day_diagnostics = day_bias_diagnostics(payload, candidate, gate={})
+    if state_guard_runtime.get("scheduled_state_guard_duplicate_runtime_action") == "enforce_duplicate_suppression":
+        decision = {
+            "publication_type": str(
+                state_guard_shadow.get("state_guard_recommended_publication_type") or "active_signal_update"
+            ).strip().lower(),
+            "duplicate_signal_id": state_guard_shadow.get("state_guard_primary_signal_id"),
+            "duplicate_signal_status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
+            "replacement_reason": state_guard_shadow.get("state_guard_reason") or "state_guard_duplicate_active_scenario",
+            "duplicate_signal": {
+                "signal_id": state_guard_shadow.get("state_guard_primary_signal_id"),
+                "status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
+                "display_symbol": candidate.get("display_symbol"),
+                "direction": candidate.get("direction"),
+            },
+        }
+        publication_type = decision["publication_type"]
+        if publication_type not in {"active_signal_update", "suppress_duplicate"}:
+            publication_type = "active_signal_update"
+            decision["publication_type"] = publication_type
+        message = render_duplicate_update_message(decision, candidate)
+        message_ids = await publish_plain_message(cfg, message, dry_run=dry_run)
+        return {
+            "published": True,
+            "reason": decision["replacement_reason"],
+            "signal_id": None,
+            "candidate_signal_id": signal_id,
+            "artifact_path": relpath(Path(sig_html)),
+            "run_log": relpath(Path(run_log)) if run_log else None,
+            "last_payload": payload,
+            "message_ids": message_ids,
+            "publication_type": publication_type,
+            "duplicate_in_work_signal_detected": True,
+            "duplicate_signal_id": decision["duplicate_signal_id"],
+            "duplicate_signal_status": decision["duplicate_signal_status"],
+            "replacement_reason": decision["replacement_reason"],
+            "aia_forward_attempted": False,
+            "aia_forward_ok": False,
+            "aia_forward_error": None,
+            "aia_forward_mode": "skipped_state_guard_duplicate",
+            "aia_forward_warning": None,
+            **state_guard_shadow,
+            **state_guard_runtime,
+            **day_diagnostics,
+        }
     duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state(now_utc), now_utc=now_utc)
     duplicate_result = {k: v for k, v in duplicate_decision.items() if k != "duplicate_signal"}
 
@@ -1515,6 +1680,8 @@ async def generate_and_publish_signal(
             "aia_forward_mode": "skipped_duplicate_update",
             "aia_forward_warning": None,
             **state_guard_shadow,
+            **state_guard_runtime,
+            **day_diagnostics,
             **duplicate_result,
         }
 
@@ -1586,6 +1753,8 @@ async def generate_and_publish_signal(
         **aia_forward,
         "aia_forward_warning": "aia_forward_failed" if ok and not aia_forward.get("aia_forward_ok") else None,
         **state_guard_shadow,
+        **state_guard_runtime,
+        **day_diagnostics,
         **duplicate_result,
     }
 
@@ -1805,6 +1974,19 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "stale_active_signal_status",
                 "stale_active_signal_age_hours",
                 "stale_active_signal_reason",
+                "stale_tp1_hit_signal_ignored",
+                "stale_tp1_hit_signal_id",
+                "stale_tp1_hit_signal_age_hours",
+                "stale_tp1_hit_signal_reason",
+                "scheduled_state_guard_duplicate_enforcement_enabled",
+                "scheduled_state_guard_duplicate_runtime_eligible",
+                "scheduled_state_guard_duplicate_runtime_action",
+                "day_bias_direction",
+                "candidate_direction",
+                "signal_direction_vs_day_bias",
+                "counter_regime_signal",
+                "counter_regime_allowed_reason",
+                "market_override_detected",
             ):
                 row[key] = result.get(key)
             for key in STATE_GUARD_DECISION_LOG_FIELDS:
