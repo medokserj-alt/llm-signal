@@ -343,6 +343,60 @@ class TestScheduledSignalState(unittest.TestCase):
             self.assertEqual(decision["publication_type"], "active_signal_update")
             self.assertFalse(decision["replacement_selected"])
 
+    def test_managed_status_near_duplicate_updates_management(self) -> None:
+        for status in ("REDUCE", "PARTIALLY_REDUCED", "TP1_HIT_LIVE", "TP2_HIT_LIVE", "RUNNER_ACTIVE", "TRAIL_STOP"):
+            with self.subTest(status=status):
+                decision = sr.evaluate_duplicate_publication(
+                    self._candidate(),
+                    [self._old(status, position_status="PARTIALLY_REDUCED")],
+                    now_utc=datetime(2026, 6, 14, 10, 0, tzinfo=timezone.utc),
+                )
+                self.assertEqual(decision["publication_type"], "active_signal_update")
+                self.assertTrue(decision["duplicate_in_work_signal_detected"])
+
+    def test_sol_near_duplicate_regression_updates_active_signal(self) -> None:
+        candidate = sr._candidate_from_payload(
+            {
+                "symbol": "SOL/USDT",
+                "direction": "long",
+                "entry_price": 71.60,
+                "sl": 70.88,
+                "tp1": 72.32,
+                "tp2": 73.03,
+                "tp3": 73.75,
+                "mode": "neutral",
+            },
+            signal_id="20260621_003000",
+        )
+        old = {
+            **self._old(
+                "ENTRY_LIVE",
+                signal_id="20260620_153003",
+                symbol="SOLUSDT",
+                display_symbol="SOL/USDT",
+                entry_price=71.67,
+                sl=70.95,
+                tp1=72.49,
+                tp2=73.10,
+                position_status="OPEN",
+                ts="2026-06-20T14:53:00Z",
+            ),
+            "tp3": 73.82,
+        }
+
+        decision = sr.evaluate_duplicate_publication(
+            candidate,
+            [old],
+            now_utc=datetime(2026, 6, 20, 21, 30, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertTrue(decision["duplicate_in_work_signal_detected"])
+        self.assertEqual(decision["duplicate_signal_id"], "20260620_153003")
+        self.assertEqual(decision["replacement_reason"], "existing_signal_live_or_management")
+        self.assertAlmostEqual(decision["entry_distance_pct"], 0.09767, places=4)
+        self.assertAlmostEqual(decision["sl_distance_pct"], 0.09866, places=4)
+
     def test_opposite_direction_existing_signal_conflict_update(self) -> None:
         candidate = self._candidate(direction="short")
         decision = sr.evaluate_duplicate_publication(candidate, [self._old("HOLD")])
@@ -483,6 +537,10 @@ class TestScheduledSignalState(unittest.TestCase):
             self.assertEqual(guard["state_guard_status"], "ok")
             self.assertEqual(guard["state_guard_decision"], "MANAGEMENT_UPDATE")
             self.assertFalse(guard["state_guard_can_publish_full_signal"])
+            self.assertTrue(guard["active_same_direction_scenario_found"])
+            self.assertEqual(guard["active_same_direction_signal_id"], "20260614_093003")
+            self.assertEqual(guard["active_same_direction_status"], "TIMEOUT_LIVE")
+            self.assertTrue(guard["duplicate_detected"])
 
             state = {"slots": {}}
             slot_time = sr.slot_datetime_msk(date(2026, 6, 5), "09:30")
@@ -584,11 +642,11 @@ class TestScheduledSignalState(unittest.TestCase):
         c = cfg()
         c.scheduled_state_guard_duplicate_enforcement_enabled = True
         guard = {
-            "state_guard_decision": "ACTIVE_SIGNAL_UPDATE",
-            "state_guard_recommended_publication_type": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_decision": "MANAGEMENT_UPDATE",
+            "state_guard_recommended_publication_type": "MANAGEMENT_UPDATE",
             "state_guard_duplicate_detected": True,
             "state_guard_can_publish_full_signal": False,
-            "state_guard_primary_lifecycle_state": "CONFIRM_LIVE",
+            "state_guard_primary_lifecycle_state": "TP2_HIT_LIVE",
             "state_guard_entry_distance_pct": 0.062956,
             "state_guard_sl_distance_pct": 0.124711,
         }
@@ -598,6 +656,7 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertTrue(action["scheduled_state_guard_duplicate_enforcement_enabled"])
         self.assertTrue(action["scheduled_state_guard_duplicate_runtime_eligible"])
         self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "enforce_duplicate_suppression")
+        self.assertEqual(action["duplicate_enforcement_action"], "enforce_duplicate_suppression")
 
     def test_day_bias_diagnostics_flags_risk_off_long_as_counter_regime(self) -> None:
         payload = {"day_mid_context": {"day_bias": "risk-off"}}

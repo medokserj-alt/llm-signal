@@ -44,14 +44,45 @@ IN_WORK_SIGNAL_STATUSES = {
     "MANAGEMENT_ONLY",
 }
 WAIT_REPLACEABLE_STATUSES = {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE"}
-LIVE_POSITION_STATUSES = {"ENTRY_LIVE", "HOLD", "TRAIL_STOP", "REDUCE", "MANAGEMENT_ONLY"}
+LIVE_POSITION_STATUSES = {
+    "ENTRY_LIVE",
+    "HOLD",
+    "TIMEOUT_LIVE",
+    "TP1_HIT_LIVE",
+    "TP2_HIT_LIVE",
+    "TRAIL_STOP",
+    "REDUCE",
+    "RUNNER_ACTIVE",
+    "PARTIALLY_REDUCED",
+    "MANAGEMENT_ONLY",
+}
 SCHEDULED_POSITION_BLOCKING_STATUSES = {
     "ENTRY_LIVE",
     "HOLD",
+    "TIMEOUT_LIVE",
     "TP1_HIT_LIVE",
+    "TP2_HIT_LIVE",
     "REDUCE",
     "TRAIL_STOP",
     "RUNNER_ACTIVE",
+    "PARTIALLY_REDUCED",
+    "MANAGEMENT_ONLY",
+}
+ACTIVE_SAME_DIRECTION_DUPLICATE_BLOCKING_STATUSES = {
+    "WAIT_CONFIRM",
+    "CONFIRM_LIVE",
+    "SETUP_ARMED",
+    "ENTRY_LIVE",
+    "HOLD",
+    "TIMEOUT_LIVE",
+    "NEAR_TP1",
+    "TP1_HIT_LIVE",
+    "TP2_HIT_LIVE",
+    "REDUCE",
+    "TRAIL_STOP",
+    "RUNNER_ACTIVE",
+    "PARTIALLY_REDUCED",
+    "MANAGEMENT_ONLY",
 }
 SCHEDULED_PENDING_EXPIRING_STATUSES = {
     "WAIT_CONFIRM",
@@ -85,6 +116,9 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_primary_signal_id",
     "state_guard_primary_lifecycle_state",
     "state_guard_primary_position_status",
+    "state_guard_active_same_direction_scenario_found",
+    "state_guard_active_same_direction_signal_id",
+    "state_guard_active_same_direction_status",
     "state_guard_duplicate_detected",
     "state_guard_conflict_detected",
     "state_guard_replacement_candidate",
@@ -92,6 +126,12 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_sl_distance_pct",
     "state_guard_secondary_signal_ids",
     "state_guard_explanation",
+    "active_same_direction_scenario_found",
+    "active_same_direction_signal_id",
+    "active_same_direction_status",
+    "duplicate_detected",
+    "duplicate_enforcement_enabled",
+    "duplicate_enforcement_action",
 )
 
 
@@ -1053,6 +1093,11 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             "state_guard_primary_signal_id": evaluation.get("primary_signal_id"),
             "state_guard_primary_lifecycle_state": evaluation.get("primary_lifecycle_state"),
             "state_guard_primary_position_status": evaluation.get("primary_position_status"),
+            "state_guard_active_same_direction_scenario_found": evaluation.get("active_same_direction_scenario_found"),
+            "state_guard_active_same_direction_signal_id": evaluation.get("active_same_direction_signal_id")
+            or evaluation.get("primary_signal_id"),
+            "state_guard_active_same_direction_status": evaluation.get("active_same_direction_status")
+            or evaluation.get("primary_lifecycle_state"),
             "state_guard_duplicate_detected": evaluation.get("duplicate_detected"),
             "state_guard_conflict_detected": evaluation.get("conflict_detected"),
             "state_guard_replacement_candidate": evaluation.get("replacement_candidate"),
@@ -1060,6 +1105,12 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             "state_guard_sl_distance_pct": evaluation.get("sl_distance_pct"),
             "state_guard_secondary_signal_ids": evaluation.get("secondary_signal_ids") or [],
             "state_guard_explanation": evaluation.get("explanation"),
+            "active_same_direction_scenario_found": evaluation.get("active_same_direction_scenario_found"),
+            "active_same_direction_signal_id": evaluation.get("active_same_direction_signal_id")
+            or evaluation.get("primary_signal_id"),
+            "active_same_direction_status": evaluation.get("active_same_direction_status")
+            or evaluation.get("primary_lifecycle_state"),
+            "duplicate_detected": evaluation.get("duplicate_detected"),
         }
     )
     return out
@@ -1076,23 +1127,29 @@ def state_guard_duplicate_runtime_action(state_guard: dict, cfg: SchedulerConfig
     eligible = (
         duplicate_detected
         and can_publish is False
-        and active_status in {"WAIT_CONFIRM", "CONFIRM_LIVE", "SETUP_ARMED", "ENTRY_LIVE", "HOLD", "TIMEOUT_LIVE"}
+        and active_status in ACTIVE_SAME_DIRECTION_DUPLICATE_BLOCKING_STATUSES
         and (entry_distance is None or entry_distance <= 0.5)
         and (sl_distance is None or sl_distance <= 1.0)
-        and (duplicate_decision in {"ACTIVE_SIGNAL_UPDATE", "SUPPRESS_DUPLICATE"} or recommended in {"ACTIVE_SIGNAL_UPDATE", "SUPPRESS_DUPLICATE"})
+        and (
+            duplicate_decision in {"ACTIVE_SIGNAL_UPDATE", "MANAGEMENT_UPDATE", "SUPPRESS_DUPLICATE"}
+            or recommended in {"ACTIVE_SIGNAL_UPDATE", "MANAGEMENT_UPDATE", "SUPPRESS_DUPLICATE"}
+        )
     )
+    action = (
+        "enforce_duplicate_suppression"
+        if eligible and cfg.scheduled_state_guard_duplicate_enforcement_enabled
+        else "shadow_only"
+        if eligible
+        else "none"
+    )
+    enabled = bool(cfg.scheduled_state_guard_duplicate_enforcement_enabled)
     return {
-        "scheduled_state_guard_duplicate_enforcement_enabled": bool(
-            cfg.scheduled_state_guard_duplicate_enforcement_enabled
-        ),
+        "scheduled_state_guard_duplicate_enforcement_enabled": enabled,
         "scheduled_state_guard_duplicate_runtime_eligible": eligible,
-        "scheduled_state_guard_duplicate_runtime_action": (
-            "enforce_duplicate_suppression"
-            if eligible and cfg.scheduled_state_guard_duplicate_enforcement_enabled
-            else "shadow_only"
-            if eligible
-            else "none"
-        ),
+        "scheduled_state_guard_duplicate_runtime_action": action,
+        "scheduled_state_guard_enforcement_action": action,
+        "duplicate_enforcement_enabled": enabled,
+        "duplicate_enforcement_action": action,
     }
 
 
@@ -1981,6 +2038,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "scheduled_state_guard_duplicate_enforcement_enabled",
                 "scheduled_state_guard_duplicate_runtime_eligible",
                 "scheduled_state_guard_duplicate_runtime_action",
+                "scheduled_state_guard_enforcement_action",
                 "day_bias_direction",
                 "candidate_direction",
                 "signal_direction_vs_day_bias",
