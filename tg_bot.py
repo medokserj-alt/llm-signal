@@ -959,6 +959,13 @@ def _manual_state_guard_base(enabled: bool, status: str) -> dict:
         "manual_state_guard_sl_distance_pct": None,
         "manual_state_guard_secondary_signal_ids": [],
         "manual_state_guard_explanation": None,
+        "manual_state_guard_previous_signal_id": None,
+        "manual_state_guard_previous_outcome": None,
+        "manual_state_guard_previous_tp_reached": None,
+        "manual_state_guard_previous_runner_status": None,
+        "manual_state_guard_reentry_signal": None,
+        "manual_state_guard_reentry_allowed": None,
+        "manual_state_guard_reentry_reason": None,
     }
 
 def _manual_state_guard_try_float(value) -> float | None:
@@ -1101,6 +1108,13 @@ def _evaluate_manual_state_guard(candidate: dict | None, *, now_utc: datetime) -
             "manual_state_guard_sl_distance_pct": evaluation.get("sl_distance_pct"),
             "manual_state_guard_secondary_signal_ids": evaluation.get("secondary_signal_ids") or [],
             "manual_state_guard_explanation": evaluation.get("explanation"),
+            "manual_state_guard_previous_signal_id": evaluation.get("previous_signal_id"),
+            "manual_state_guard_previous_outcome": evaluation.get("previous_outcome"),
+            "manual_state_guard_previous_tp_reached": evaluation.get("previous_tp_reached"),
+            "manual_state_guard_previous_runner_status": evaluation.get("previous_runner_status"),
+            "manual_state_guard_reentry_signal": evaluation.get("reentry_signal"),
+            "manual_state_guard_reentry_allowed": evaluation.get("reentry_allowed"),
+            "manual_state_guard_reentry_reason": evaluation.get("reentry_reason"),
         }
     )
     return out
@@ -1155,6 +1169,13 @@ def _manual_state_guard_jsonl_row(
         "duplicate_detected": result.get("manual_state_guard_duplicate_detected"),
         "conflict_detected": result.get("manual_state_guard_conflict_detected"),
         "replacement_candidate": result.get("manual_state_guard_replacement_candidate"),
+        "previous_signal_id": result.get("manual_state_guard_previous_signal_id"),
+        "previous_outcome": result.get("manual_state_guard_previous_outcome"),
+        "previous_tp_reached": result.get("manual_state_guard_previous_tp_reached"),
+        "previous_runner_status": result.get("manual_state_guard_previous_runner_status"),
+        "reentry_signal": result.get("manual_state_guard_reentry_signal"),
+        "reentry_allowed": result.get("manual_state_guard_reentry_allowed"),
+        "reentry_reason": result.get("manual_state_guard_reentry_reason"),
         "explanation": result.get("manual_state_guard_explanation"),
         "enforcement_enabled": bool(
             MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED

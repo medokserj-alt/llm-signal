@@ -344,7 +344,17 @@ class TestScheduledSignalState(unittest.TestCase):
             self.assertFalse(decision["replacement_selected"])
 
     def test_managed_status_near_duplicate_updates_management(self) -> None:
-        for status in ("REDUCE", "PARTIALLY_REDUCED", "TP1_HIT_LIVE", "TP2_HIT_LIVE", "RUNNER_ACTIVE", "TRAIL_STOP"):
+        for status in (
+            "REDUCE",
+            "PARTIALLY_REDUCED",
+            "TP1_HIT_LIVE",
+            "TP2_HIT_LIVE",
+            "RUNNER_ACTIVE",
+            "RUNNER_ACTIVE_TO_TP3",
+            "EXTEND_RUNNER",
+            "TRAIL_STOP_ACTIVE",
+            "TRAIL_STOP",
+        ):
             with self.subTest(status=status):
                 decision = sr.evaluate_duplicate_publication(
                     self._candidate(),
@@ -657,6 +667,63 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertTrue(action["scheduled_state_guard_duplicate_runtime_eligible"])
         self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "enforce_duplicate_suppression")
         self.assertEqual(action["duplicate_enforcement_action"], "enforce_duplicate_suppression")
+
+    def test_state_guard_duplicate_runtime_does_not_suppress_opposite_direction_conflict(self) -> None:
+        c = cfg()
+        c.scheduled_state_guard_duplicate_enforcement_enabled = True
+        guard = {
+            "state_guard_decision": "CONFLICT_UPDATE",
+            "state_guard_recommended_publication_type": "CONFLICT_UPDATE",
+            "state_guard_duplicate_detected": False,
+            "state_guard_conflict_detected": True,
+            "state_guard_can_publish_full_signal": False,
+            "state_guard_primary_lifecycle_state": "ENTRY_LIVE",
+            "state_guard_entry_distance_pct": 0.1,
+            "state_guard_sl_distance_pct": 0.1,
+        }
+
+        action = sr.state_guard_duplicate_runtime_action(guard, c)
+
+        self.assertTrue(action["scheduled_state_guard_duplicate_enforcement_enabled"])
+        self.assertFalse(action["scheduled_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "none")
+
+    def test_state_guard_shadow_logs_reentry_diagnostics(self) -> None:
+        result = {
+            "signal_id": "20260614_123006",
+            "last_payload": {
+                "symbol": "BNB/USDT",
+                "direction": "long",
+                "entry_range": [610.0, 610.28],
+                "sl": 604.04,
+                "tp1": 616.4,
+                "tp2": 628.6,
+                "rr": 3.0,
+            },
+            "state_guard_status": "ok",
+            "state_guard_decision": "RE_ENTRY_SIGNAL",
+            "state_guard_can_publish_full_signal": True,
+            "state_guard_recommended_publication_type": "RE_ENTRY_SIGNAL",
+            "state_guard_reason": "previous_scenario_finalized_fresh_reentry",
+            "state_guard_primary_signal_id": "20260614_093003",
+            "state_guard_primary_lifecycle_state": "FINALIZE",
+            "state_guard_primary_position_status": "CLOSED",
+            "state_guard_previous_signal_id": "20260614_093003",
+            "state_guard_previous_outcome": "close_after_tp2",
+            "state_guard_previous_tp_reached": "TP2",
+            "state_guard_previous_runner_status": "closed",
+            "state_guard_reentry_signal": True,
+            "state_guard_reentry_allowed": True,
+            "state_guard_reentry_reason": "previous_tp_reached_and_fresh_pullback_reset",
+        }
+
+        row = sr.state_guard_shadow_log_row(datetime(2026, 6, 14, tzinfo=timezone.utc), "slot", result)
+
+        self.assertEqual(row["guard_decision"], "RE_ENTRY_SIGNAL")
+        self.assertEqual(row["previous_signal_id"], "20260614_093003")
+        self.assertEqual(row["previous_tp_reached"], "TP2")
+        self.assertTrue(row["reentry_signal"])
+        self.assertTrue(row["reentry_allowed"])
 
     def test_day_bias_diagnostics_flags_risk_off_long_as_counter_regime(self) -> None:
         payload = {"day_mid_context": {"day_bias": "risk-off"}}

@@ -593,6 +593,41 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertEqual(guard["manual_state_guard_enforcement_action"], "disabled")
         self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "disabled")
 
+    def test_manual_state_guard_shadow_records_reentry_diagnostics(self) -> None:
+        evaluation = {
+            "decision": "RE_ENTRY_SIGNAL",
+            "can_publish_full_signal": True,
+            "recommended_publication_type": "RE_ENTRY_SIGNAL",
+            "reason": "previous_scenario_finalized_fresh_reentry",
+            "primary_signal_id": "20260620_153003",
+            "primary_lifecycle_state": "FINALIZE",
+            "primary_position_status": "CLOSED",
+            "duplicate_detected": False,
+            "conflict_detected": False,
+            "replacement_candidate": False,
+            "entry_distance_pct": 0.4,
+            "sl_distance_pct": 0.5,
+            "secondary_signal_ids": [],
+            "previous_signal_id": "20260620_153003",
+            "previous_outcome": "close_after_tp2",
+            "previous_tp_reached": "TP2",
+            "previous_runner_status": "closed",
+            "reentry_signal": True,
+            "reentry_allowed": True,
+            "reentry_reason": "previous_tp_reached_and_fresh_pullback_reset",
+            "explanation": "re-entry",
+        }
+        result = self._run_manual_guard_publish(evaluation, enforcement=False)
+
+        self.assertTrue(result["ok"])
+        event = [e for e in result["signal_events"] if e["event"] == "telegram_publish"][0]
+        guard = event["manual_state_guard"]
+        self.assertEqual(guard["manual_state_guard_decision"], "RE_ENTRY_SIGNAL")
+        self.assertEqual(guard["manual_state_guard_previous_signal_id"], "20260620_153003")
+        self.assertEqual(guard["manual_state_guard_previous_tp_reached"], "TP2")
+        self.assertTrue(guard["manual_state_guard_reentry_allowed"])
+        self.assertEqual(result["shadow_rows"][0]["reentry_reason"], "previous_tp_reached_and_fresh_pullback_reset")
+
     def test_manual_duplicate_wait_confirm_enforcement_suppresses_full_publish(self) -> None:
         evaluation = {
             "decision": "SUPPRESS_DUPLICATE",
