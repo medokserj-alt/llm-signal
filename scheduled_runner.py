@@ -861,7 +861,14 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
             "Нужна AIA management decision: HOLD / REDUCE / CLOSE / TRAIL / RE_EVAL.\n\n"
             "Это не новый вход."
         )
-    title = "🔄 MANAGEMENT_UPDATE" if str(status).upper() in LIVE_POSITION_STATUSES else "🔄 ACTIVE SIGNAL UPDATE"
+    classification = str(decision.get("publication_type") or "").strip().upper()
+    if classification == "SUPPRESS_DUPLICATE":
+        return tg_bot.render_state_guard_classification_message(
+            {"decision": "SUPPRESS_DUPLICATE", "symbol": symbol, "direction": side},
+            symbol=symbol,
+        )
+    is_management = classification == "MANAGEMENT_UPDATE" or str(status).upper() in LIVE_POSITION_STATUSES
+    title = "🔄 MANAGEMENT_UPDATE" if is_management else "🔄 ACTIVE SIGNAL UPDATE"
     entry_line = "Вход уже активирован." if str(status).upper() in LIVE_POSITION_STATUSES else "Вход ещё не активирован."
     return (
         f"{title}\n\n"
@@ -877,7 +884,13 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
         "Старый setup остаётся актуальным.\n"
         "Новый сигнал не публикуем, чтобы не дублировать вход.\n"
         "AIA продолжает сопровождать активный сигнал.\n\n"
-        "Это не новый сигнал."
+        + (
+            "Это не новый вход. Уже есть активный/managed сценарий; сопровождаем текущую позицию, "
+            "не открываем независимый второй full signal."
+            if is_management
+            else "Это обновление активного сценария, не новый full signal. Старый сигнал остаётся основным, "
+            "новые уровни/контекст используются как update."
+        )
     )
 
 
@@ -1724,7 +1737,7 @@ async def generate_and_publish_signal(
             },
         }
         publication_type = decision["publication_type"]
-        if publication_type not in {"active_signal_update", "suppress_duplicate"}:
+        if publication_type not in {"active_signal_update", "management_update", "suppress_duplicate"}:
             publication_type = "active_signal_update"
             decision["publication_type"] = publication_type
         message = render_duplicate_update_message(decision, candidate)
@@ -1781,6 +1794,18 @@ async def generate_and_publish_signal(
     publish_text = parts[0]
     if duplicate_decision.get("publication_type") == "replace_wait_confirm":
         publish_text = render_replacement_prefix(duplicate_decision, candidate) + parts[0]
+    elif (
+        str(state_guard_shadow.get("state_guard_decision") or "").upper() == "RE_ENTRY_SIGNAL"
+        and state_guard_shadow.get("state_guard_reentry_allowed") is True
+    ):
+        publish_text = (
+            tg_bot.render_state_guard_classification_message(
+                {"decision": "RE_ENTRY_SIGNAL", "symbol": candidate.get("display_symbol"), "direction": candidate.get("direction")},
+                symbol=candidate.get("display_symbol"),
+            )
+            + "\n\n"
+            + parts[0]
+        )
 
     old_get_targets = tg_bot.get_main_publication_targets
     old_get_chat = tg_bot.get_main_publication_chat_id

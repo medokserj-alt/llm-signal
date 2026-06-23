@@ -104,6 +104,10 @@ MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED = os.getenv("MANUAL_STATE_GUARD_ENFORCEME
     "yes",
     "on",
 }
+MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED = os.getenv(
+    "MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT = os.getenv(
     "MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT",
     "false",
@@ -114,6 +118,12 @@ MANUAL_STATE_GUARD_MAX_AGE_MINUTES = max(
 )
 MANUAL_STATE_GUARD_STATE_PATH = Path(
     os.getenv("MANUAL_STATE_GUARD_STATE_PATH", os.getenv("STATE_GUARD_STATE_PATH", str(DEFAULT_MANUAL_STATE_GUARD_STATE_PATH)))
+)
+MANUAL_STATE_GUARD_DUPLICATE_ENTRY_DISTANCE_PCT = float(
+    os.getenv("MANUAL_STATE_GUARD_DUPLICATE_ENTRY_DISTANCE_PCT", "0.5") or "0.5"
+)
+MANUAL_STATE_GUARD_DUPLICATE_SL_DISTANCE_PCT = float(
+    os.getenv("MANUAL_STATE_GUARD_DUPLICATE_SL_DISTANCE_PCT", "1.0") or "1.0"
 )
 
 # ============== AIA (AI Agent) ==============
@@ -966,6 +976,10 @@ def _manual_state_guard_base(enabled: bool, status: str) -> dict:
         "manual_state_guard_reentry_signal": None,
         "manual_state_guard_reentry_allowed": None,
         "manual_state_guard_reentry_reason": None,
+        "manual_state_guard_duplicate_enforcement_enabled": MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED,
+        "manual_state_guard_duplicate_runtime_eligible": False,
+        "manual_state_guard_enforcement_action": "none",
+        "manual_state_guard_suppression_reason": None,
     }
 
 def _manual_state_guard_try_float(value) -> float | None:
@@ -1119,11 +1133,40 @@ def _evaluate_manual_state_guard(candidate: dict | None, *, now_utc: datetime) -
     )
     return out
 
-def _manual_state_guard_enforcement_action(result: dict) -> str:
-    if not MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED:
-        return "disabled"
-    if not MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT:
-        return "disabled"
+def _manual_state_guard_duplicate_runtime(result: dict) -> dict:
+    decision = str(result.get("manual_state_guard_decision") or "").strip().upper()
+    lifecycle = str(result.get("manual_state_guard_primary_lifecycle_state") or "").strip().upper()
+    position = str(result.get("manual_state_guard_primary_position_status") or "").strip().upper()
+    entry_distance = _manual_state_guard_try_float(result.get("manual_state_guard_entry_distance_pct"))
+    sl_distance = _manual_state_guard_try_float(result.get("manual_state_guard_sl_distance_pct"))
+    terminal = lifecycle in {"TERMINAL", "CLOSED", "SL_HIT_LIVE", "FINALIZE"} or position == "CLOSED"
+    eligible = (
+        result.get("manual_state_guard_status") == "ok"
+        and decision in {"MANAGEMENT_UPDATE", "ACTIVE_SIGNAL_UPDATE", "SUPPRESS_DUPLICATE"}
+        and result.get("manual_state_guard_can_publish_full_signal") is False
+        and result.get("manual_state_guard_duplicate_detected") is True
+        and bool(result.get("manual_state_guard_primary_signal_id"))
+        and not terminal
+        and entry_distance is not None
+        and entry_distance <= MANUAL_STATE_GUARD_DUPLICATE_ENTRY_DISTANCE_PCT
+        and sl_distance is not None
+        and sl_distance <= MANUAL_STATE_GUARD_DUPLICATE_SL_DISTANCE_PCT
+    )
+    action = "none"
+    reason = None
+    if eligible and MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED:
+        action = "convert_to_management_update" if decision == "MANAGEMENT_UPDATE" else "suppress_duplicate"
+        reason = str(result.get("manual_state_guard_reason") or "same_direction_duplicate_active_scenario")
+    return {
+        "manual_state_guard_duplicate_enforcement_enabled": MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED,
+        "manual_state_guard_duplicate_runtime_eligible": eligible,
+        "manual_state_guard_enforcement_action": action,
+        "manual_state_guard_suppression_reason": reason,
+    }
+
+def _manual_state_guard_legacy_wait_confirm_action(result: dict) -> str:
+    if not MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED or not MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT:
+        return "none"
     if result.get("manual_state_guard_status") != "ok":
         return "none"
     if result.get("manual_state_guard_can_publish_full_signal") is not False:
@@ -1139,6 +1182,45 @@ def _manual_state_guard_enforcement_action(result: dict) -> str:
     if result.get("manual_state_guard_replacement_candidate") is True:
         return "replace_wait_confirm"
     return "duplicate_wait_confirm_suppressed"
+
+def render_state_guard_classification_message(result: dict, *, symbol: str | None = None) -> str:
+    decision = str(
+        result.get("manual_state_guard_decision")
+        or result.get("state_guard_decision")
+        or result.get("decision")
+        or ""
+    ).strip().upper()
+    display_symbol = (
+        symbol
+        or result.get("symbol")
+        or result.get("display_symbol")
+        or "этому инструменту"
+    )
+    direction = str(result.get("direction") or "").strip().upper()
+    market = f"{display_symbol} {direction}".strip()
+    if decision == "MANAGEMENT_UPDATE":
+        return (
+            f"🔄 MANAGEMENT_UPDATE\n\nЭто не новый вход. По {market} уже есть активный/managed сценарий. "
+            "Новый сигнал классифицирован как management update: сопровождаем текущую позицию, "
+            "не открываем независимый второй full signal."
+        )
+    if decision == "ACTIVE_SIGNAL_UPDATE":
+        return (
+            "🔄 ACTIVE_SIGNAL_UPDATE\n\nЭто обновление активного сценария, не новый full signal. "
+            "Старый сигнал остаётся основным, новые уровни/контекст используются как update."
+        )
+    if decision == "RE_ENTRY_SIGNAL":
+        return (
+            "🔁 RE_ENTRY_SIGNAL\n\nЭто continuation re-entry после частичной фиксации предыдущего сценария. "
+            "Предыдущий сигнал уже взял TP1/TP2 или был закрыт/сокращён. Новый вход допустим только как "
+            "отдельная сделка после fresh pullback/reset, не как безусловный добор старой позиции."
+        )
+    if decision == "SUPPRESS_DUPLICATE":
+        return (
+            "⛔ SUPPRESS_DUPLICATE\n\nПохожий сценарий уже активен. Новый full signal подавлен, "
+            "чтобы не дублировать позицию."
+        )
+    return "Это не новый full signal."
 
 def _manual_state_guard_jsonl_row(
     *,
@@ -1177,10 +1259,13 @@ def _manual_state_guard_jsonl_row(
         "reentry_allowed": result.get("manual_state_guard_reentry_allowed"),
         "reentry_reason": result.get("manual_state_guard_reentry_reason"),
         "explanation": result.get("manual_state_guard_explanation"),
+        "entry_distance_pct": result.get("manual_state_guard_entry_distance_pct"),
+        "sl_distance_pct": result.get("manual_state_guard_sl_distance_pct"),
         "enforcement_enabled": bool(
-            MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED
-            and MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT
+            MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED
         ),
+        "duplicate_runtime_eligible": result.get("manual_state_guard_duplicate_runtime_eligible"),
+        "suppression_reason": result.get("manual_state_guard_suppression_reason"),
         "enforcement_action": enforcement_action,
     }
 
@@ -2089,9 +2174,13 @@ async def _publish_signal_result(
             created_at=published_at,
         )
         manual_state_guard = _evaluate_manual_state_guard(candidate, now_utc=now_utc)
-        enforcement_action = _manual_state_guard_enforcement_action(manual_state_guard)
-        manual_state_guard["manual_state_guard_enforcement_action"] = enforcement_action
-        manual_state_guard["manual_duplicate_suppressed"] = enforcement_action in {
+        manual_state_guard.update(_manual_state_guard_duplicate_runtime(manual_state_guard))
+        enforcement_action = manual_state_guard["manual_state_guard_enforcement_action"]
+        legacy_action = _manual_state_guard_legacy_wait_confirm_action(manual_state_guard)
+        effective_action = enforcement_action if enforcement_action != "none" else legacy_action
+        manual_state_guard["manual_duplicate_suppressed"] = effective_action in {
+            "suppress_duplicate",
+            "convert_to_management_update",
             "duplicate_wait_confirm_suppressed",
             "replace_wait_confirm",
         }
@@ -2102,10 +2191,30 @@ async def _publish_signal_result(
                 request_type=source,
                 candidate=candidate,
                 result=manual_state_guard,
-                enforcement_action=enforcement_action,
+                enforcement_action=effective_action,
             ),
         )
-        if enforcement_action in {"duplicate_wait_confirm_suppressed", "replace_wait_confirm"}:
+        if effective_action in {
+            "suppress_duplicate",
+            "convert_to_management_update",
+            "duplicate_wait_confirm_suppressed",
+            "replace_wait_confirm",
+        }:
+            guard_text = render_state_guard_classification_message(
+                {
+                    **manual_state_guard,
+                    "symbol": candidate.get("symbol") if isinstance(candidate, dict) else symbol,
+                    "direction": candidate.get("direction") if isinstance(candidate, dict) else None,
+                },
+                symbol=symbol,
+            )
+            delivered_chat_ids = await _deliver_publication_targets(
+                context,
+                uid,
+                guard_text,
+                delivery_kind=delivery_kind,
+                protect_content=False,
+            )
             _log_signal_publication(
                 event="telegram_publish_suppressed",
                 uid=uid,
@@ -2117,7 +2226,23 @@ async def _publish_signal_result(
                 delivery_kind=delivery_kind,
                 manual_state_guard=manual_state_guard,
             )
-            return False
+            return bool(delivered_chat_ids)
+        if (
+            str(manual_state_guard.get("manual_state_guard_decision") or "").upper() == "RE_ENTRY_SIGNAL"
+            and manual_state_guard.get("manual_state_guard_reentry_allowed") is True
+        ):
+            text = (
+                render_state_guard_classification_message(
+                    {
+                        **manual_state_guard,
+                        "symbol": candidate.get("symbol") if isinstance(candidate, dict) else symbol,
+                        "direction": candidate.get("direction") if isinstance(candidate, dict) else None,
+                    },
+                    symbol=symbol,
+                )
+                + "\n\n"
+                + text
+            )
     delivered_chat_ids = await _deliver_publication_targets(
         context,
         uid,

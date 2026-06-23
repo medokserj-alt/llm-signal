@@ -488,7 +488,10 @@ class TestTgBotRouting(unittest.TestCase):
             self.tg_bot.LOGS_DIR = tmp
             self.tg_bot.MANUAL_STATE_GUARD_SHADOW_ENABLED = True
             self.tg_bot.MANUAL_STATE_GUARD_ENFORCEMENT_ENABLED = enforcement
-            self.tg_bot.MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT = enforcement
+            self.tg_bot.MANUAL_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED = enforcement
+            self.tg_bot.MANUAL_STATE_GUARD_DUPLICATE_WAIT_CONFIRM_ENFORCEMENT = False
+            self.tg_bot.MANUAL_STATE_GUARD_DUPLICATE_ENTRY_DISTANCE_PCT = 0.5
+            self.tg_bot.MANUAL_STATE_GUARD_DUPLICATE_SL_DISTANCE_PCT = 1.0
             self.tg_bot.MANUAL_STATE_GUARD_STATE_PATH = state_path
             self.tg_bot.MANUAL_STATE_GUARD_MAX_AGE_MINUTES = 15
             self.tg_bot._read_last_signal_json = lambda *args, **kwargs: {
@@ -590,8 +593,9 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertEqual(guard["manual_state_guard_decision"], "SUPPRESS_DUPLICATE")
         self.assertFalse(guard["manual_state_guard_can_publish_full_signal"])
         self.assertTrue(guard["manual_state_guard_duplicate_detected"])
-        self.assertEqual(guard["manual_state_guard_enforcement_action"], "disabled")
-        self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "disabled")
+        self.assertTrue(guard["manual_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "none")
+        self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "none")
 
     def test_manual_state_guard_shadow_records_reentry_diagnostics(self) -> None:
         evaluation = {
@@ -647,15 +651,46 @@ class TestTgBotRouting(unittest.TestCase):
         }
         result = self._run_manual_guard_publish(evaluation, enforcement=True)
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["context"].bot.calls, [])
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["context"].bot.calls), 1)
+        self.assertIn("SUPPRESS_DUPLICATE", result["context"].bot.calls[0]["text"])
+        self.assertNotIn("BTC/USDT signal body", result["context"].bot.calls[0]["text"])
         self.assertEqual(result["aia_signal_calls"], [])
         event = result["signal_events"][0]
         self.assertEqual(event["event"], "telegram_publish_suppressed")
         guard = event["manual_state_guard"]
-        self.assertEqual(guard["manual_state_guard_enforcement_action"], "duplicate_wait_confirm_suppressed")
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "suppress_duplicate")
         self.assertTrue(guard["manual_duplicate_suppressed"])
-        self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "duplicate_wait_confirm_suppressed")
+        self.assertEqual(result["shadow_rows"][0]["enforcement_action"], "suppress_duplicate")
+
+    def test_manual_management_duplicate_enforcement_converts_full_signal_to_update(self) -> None:
+        evaluation = {
+            "decision": "MANAGEMENT_UPDATE",
+            "can_publish_full_signal": False,
+            "recommended_publication_type": "MANAGEMENT_UPDATE",
+            "reason": "active_same_direction_scenario_exists",
+            "primary_signal_id": "20260623_120000",
+            "primary_lifecycle_state": "ENTRY_LIVE",
+            "primary_position_status": "OPEN",
+            "duplicate_detected": True,
+            "conflict_detected": False,
+            "replacement_candidate": False,
+            "entry_distance_pct": 0.1,
+            "sl_distance_pct": 0.2,
+            "secondary_signal_ids": [],
+            "explanation": "managed duplicate",
+        }
+
+        result = self._run_manual_guard_publish(evaluation, enforcement=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["context"].bot.calls), 1)
+        self.assertIn("MANAGEMENT_UPDATE", result["context"].bot.calls[0]["text"])
+        self.assertIn("Это не новый вход", result["context"].bot.calls[0]["text"])
+        self.assertNotIn("BTC/USDT signal body", result["context"].bot.calls[0]["text"])
+        guard = result["signal_events"][0]["manual_state_guard"]
+        self.assertTrue(guard["manual_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "convert_to_management_update")
 
     def test_manual_state_guard_missing_state_continues_publication(self) -> None:
         result = self._run_manual_guard_publish(None, state_exists=False)
@@ -691,6 +726,50 @@ class TestTgBotRouting(unittest.TestCase):
         self.assertEqual(guard["manual_state_guard_decision"], "CONFLICT_UPDATE")
         self.assertTrue(guard["manual_state_guard_conflict_detected"])
         self.assertEqual(guard["manual_state_guard_enforcement_action"], "none")
+
+    def test_manual_enforcement_does_not_suppress_allowed_fresh_reentry(self) -> None:
+        evaluation = {
+            "decision": "RE_ENTRY_SIGNAL",
+            "can_publish_full_signal": True,
+            "recommended_publication_type": "RE_ENTRY_SIGNAL",
+            "reason": "previous_scenario_finalized_fresh_reentry",
+            "primary_signal_id": "20260620_153003",
+            "primary_lifecycle_state": "FINALIZE",
+            "primary_position_status": "CLOSED",
+            "duplicate_detected": False,
+            "conflict_detected": False,
+            "replacement_candidate": False,
+            "entry_distance_pct": 0.1,
+            "sl_distance_pct": 0.1,
+            "reentry_signal": True,
+            "reentry_allowed": True,
+            "reentry_reason": "previous_tp_reached_and_fresh_pullback_reset",
+        }
+
+        result = self._run_manual_guard_publish(evaluation, enforcement=True)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("RE_ENTRY_SIGNAL", result["context"].bot.calls[0]["text"])
+        self.assertIn("continuation re-entry", result["context"].bot.calls[0]["text"])
+        self.assertIn("BTC/USDT signal body", result["context"].bot.calls[0]["text"])
+        guard = [e for e in result["signal_events"] if e["event"] == "telegram_publish"][0]["manual_state_guard"]
+        self.assertFalse(guard["manual_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(guard["manual_state_guard_enforcement_action"], "none")
+
+    def test_guard_non_full_wording_contains_classification_text(self) -> None:
+        management = self.tg_bot.render_state_guard_classification_message(
+            {"decision": "MANAGEMENT_UPDATE", "symbol": "SOL/USDT", "direction": "long"}
+        )
+        active = self.tg_bot.render_state_guard_classification_message({"decision": "ACTIVE_SIGNAL_UPDATE"})
+        reentry = self.tg_bot.render_state_guard_classification_message({"decision": "RE_ENTRY_SIGNAL"})
+        suppressed = self.tg_bot.render_state_guard_classification_message({"decision": "SUPPRESS_DUPLICATE"})
+
+        self.assertIn("Это не новый вход", management)
+        self.assertIn("management update", management)
+        self.assertIn("обновление активного сценария", active)
+        self.assertIn("continuation re-entry", reentry)
+        self.assertIn("fresh pullback/reset", reentry)
+        self.assertIn("Новый full signal подавлен", suppressed)
 
     def test_single_mode_skips_separate_analysis_header_publish(self) -> None:
         result = self._run_symbol_publish(6308066297, symbol="SOL/USDT")
