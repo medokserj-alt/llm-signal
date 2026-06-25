@@ -141,6 +141,14 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_reentry_signal",
     "state_guard_reentry_allowed",
     "state_guard_reentry_reason",
+    "state_guard_entry_blocked",
+    "state_guard_entry_blocked_reason",
+    "state_guard_old_signal_id",
+    "state_guard_old_direction",
+    "state_guard_new_bias_direction",
+    "state_guard_human_decision_required",
+    "state_guard_old_setup_recommendation",
+    "state_guard_propose_reverse_signal",
     "active_same_direction_scenario_found",
     "active_same_direction_signal_id",
     "active_same_direction_status",
@@ -267,6 +275,62 @@ def append_jsonl(path: Path, row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def emit_opposite_bias_before_entry(
+    *,
+    now_utc: datetime,
+    old_signal_id: str,
+    old_direction: str | None,
+    candidate_signal_id: str | None,
+    new_direction: str | None,
+    symbol: str | None,
+    recommendation: str,
+    propose_reverse_signal: bool,
+) -> dict:
+    blocked_at = now_utc.isoformat().replace("+00:00", "Z")
+    event = {
+        "ts": blocked_at,
+        "signal_id": old_signal_id,
+        "symbol": symbol,
+        "direction": old_direction,
+        "status": "OPPOSITE_BIAS_BEFORE_ENTRY",
+        "action_kind": "notify_opposite_bias_before_entry",
+        "reason": "opposite_bias_before_entry",
+        "entry_blocked": True,
+        "entry_blocked_reason": "opposite_bias_before_entry",
+        "blocked_at": blocked_at,
+        "blocked_by_signal_id": candidate_signal_id,
+        "old_signal_id": old_signal_id,
+        "old_direction": old_direction,
+        "new_bias_direction": new_direction,
+        "human_decision_required": True,
+        "recommended_publication_type": "urgent_review",
+        "old_setup_recommendation": recommendation,
+        "propose_reverse_signal": bool(propose_reverse_signal),
+    }
+    logs_dir = Path(os.getenv("AIA_LOGS_DIR", "/root/llm-signal-ai-agent/logs"))
+    append_jsonl(logs_dir / f"agent_actions_{now_utc.strftime('%Y%m%d')}.jsonl", event)
+    state_path = logs_dir / "market_watch_state.json"
+    state = read_json(state_path)
+    signals = state.setdefault("signals", {})
+    current = signals.setdefault(old_signal_id, {})
+    current.update(
+        {
+            "entry_blocked": True,
+            "entry_blocked_reason": "opposite_bias_before_entry",
+            "blocked_at": blocked_at,
+            "blocked_by_signal_id": candidate_signal_id,
+            "human_decision_required": True,
+            "old_setup_recommendation": recommendation,
+            "new_bias_direction": new_direction,
+            "propose_reverse_signal": bool(propose_reverse_signal),
+            "in_position": False,
+        }
+    )
+    current.pop("entry_ts", None)
+    write_json_atomic(state_path, state)
+    return event
+
+
 def relpath(path: Path | None) -> str | None:
     if path is None:
         return None
@@ -343,6 +407,13 @@ def _entry_from_payload(payload: dict) -> float | None:
     if low is not None and high is not None:
         return (low + high) / 2.0
     return None
+
+
+def _strong_opposite_candidate(candidate: dict) -> bool:
+    score = _try_float(candidate.get("score") or candidate.get("confidence_score"))
+    if score is not None:
+        return score >= 0.75
+    return (_confidence_rank(candidate.get("confidence")) or 0) >= 3
 
 
 def _candidate_from_payload(payload: dict, signal_id: str | None = None) -> dict:
@@ -736,14 +807,32 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
         same_symbol.append(signal)
     opposite = next((s for s in same_symbol if s.get("direction") and s.get("direction") != direction), None)
     if opposite is not None:
+        opposite_status = str(opposite.get("status") or "").strip().upper()
+        pre_entry = (
+            opposite_status in {"WAIT_CONFIRM", "CONFIRM_LIVE", "SETUP_ARMED"}
+            and not bool(opposite.get("filled"))
+            and str(opposite.get("position_status") or "").strip().upper() in {"", "NONE"}
+        )
+        strong_opposite = _strong_opposite_candidate(candidate)
         out.update(
             {
                 "duplicate_in_work_signal_detected": True,
                 "duplicate_signal_id": opposite.get("signal_id"),
                 "duplicate_signal_status": opposite.get("status"),
-                "publication_type": "conflict_update",
-                "replacement_reason": "opposite_direction_in_work_signal",
+                "publication_type": "urgent_review" if pre_entry else "conflict_update",
+                "replacement_reason": (
+                    "opposite_bias_before_entry" if pre_entry else "opposite_direction_in_work_signal"
+                ),
                 "duplicate_signal": opposite,
+                "entry_blocked": pre_entry,
+                "entry_blocked_reason": "opposite_bias_before_entry" if pre_entry else None,
+                "human_decision_required": pre_entry,
+                "old_setup_recommendation": (
+                    "CANCEL_ARMED_SETUP" if pre_entry and strong_opposite else "WAIT_HUMAN_DECISION"
+                    if pre_entry
+                    else None
+                ),
+                "propose_reverse_signal": bool(pre_entry and strong_opposite),
             }
         )
         return out
@@ -850,6 +939,31 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
     side = str(candidate.get("direction") or old.get("direction") or "").upper()
     status = old.get("status") or decision.get("duplicate_signal_status") or "UNKNOWN"
     old_id = old.get("signal_id") or decision.get("duplicate_signal_id")
+    if decision.get("publication_type") == "urgent_review":
+        strong = bool(decision.get("propose_reverse_signal"))
+        if strong:
+            return (
+                "🚨 URGENT: old setup invalidated before entry\n\n"
+                f"{symbol} {str(old.get('direction') or '').upper()} был confirmed/armed, но вход ещё НЕ исполнен.\n\n"
+                f"Новый анализ показывает сильный противоположный {side} bias.\n"
+                "AIA считает старый setup невалидным.\n\n"
+                "Решение:\n"
+                "- старый setup поставить на стоп / отменить;\n"
+                "- не входить по старому entry;\n"
+                f"- рассмотреть новый {side} setup после подтверждения трейдера.\n\n"
+                "Это не автоматический reverse-entry."
+            )
+        return (
+            "⚠️ URGENT: opposite bias before entry\n\n"
+            f"{symbol} {str(old.get('direction') or '').upper()} уже confirmed/armed, но вход ещё НЕ исполнен.\n\n"
+            f"Новый scheduled scan видит противоположный {side} bias.\n\n"
+            "Решение AIA:\n"
+            "- старый entry поставить на паузу;\n"
+            "- не переводить старый setup в ENTRY_LIVE автоматически;\n"
+            "- трейдер должен принять решение: отменить старый setup / дождаться reprice / "
+            "разрешить старый вход / рассмотреть reverse setup.\n\n"
+            "Это не новый автоматический вход."
+        )
     if decision.get("publication_type") == "conflict_update":
         return (
             "🔄 RE_EVAL_ACTIVE_SIGNAL\n\n"
@@ -1043,6 +1157,14 @@ def _state_guard_base(enabled: bool, status: str) -> dict:
         "state_guard_reentry_signal": None,
         "state_guard_reentry_allowed": None,
         "state_guard_reentry_reason": None,
+        "state_guard_entry_blocked": None,
+        "state_guard_entry_blocked_reason": None,
+        "state_guard_old_signal_id": None,
+        "state_guard_old_direction": None,
+        "state_guard_new_bias_direction": None,
+        "state_guard_human_decision_required": None,
+        "state_guard_old_setup_recommendation": None,
+        "state_guard_propose_reverse_signal": None,
     }
 
 
@@ -1061,6 +1183,8 @@ def build_state_guard_candidate(candidate: dict, *, source: str = "scheduled", c
         "source": source,
         "created_at": created_at,
         "strategy_type": candidate.get("strategy_type"),
+        "confidence": candidate.get("confidence"),
+        "score": candidate.get("score") or candidate.get("confidence_score"),
     }
 
 
@@ -1147,6 +1271,14 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             "state_guard_reentry_signal": evaluation.get("reentry_signal"),
             "state_guard_reentry_allowed": evaluation.get("reentry_allowed"),
             "state_guard_reentry_reason": evaluation.get("reentry_reason"),
+            "state_guard_entry_blocked": evaluation.get("entry_blocked"),
+            "state_guard_entry_blocked_reason": evaluation.get("entry_blocked_reason"),
+            "state_guard_old_signal_id": evaluation.get("old_signal_id"),
+            "state_guard_old_direction": evaluation.get("old_direction"),
+            "state_guard_new_bias_direction": evaluation.get("new_bias_direction"),
+            "state_guard_human_decision_required": evaluation.get("human_decision_required"),
+            "state_guard_old_setup_recommendation": evaluation.get("old_setup_recommendation"),
+            "state_guard_propose_reverse_signal": evaluation.get("propose_reverse_signal"),
             "active_same_direction_scenario_found": evaluation.get("active_same_direction_scenario_found"),
             "active_same_direction_signal_id": evaluation.get("active_same_direction_signal_id")
             or evaluation.get("primary_signal_id"),
@@ -1274,6 +1406,14 @@ def state_guard_shadow_log_row(
         "reentry_signal": result.get("state_guard_reentry_signal"),
         "reentry_allowed": result.get("state_guard_reentry_allowed"),
         "reentry_reason": result.get("state_guard_reentry_reason"),
+        "entry_blocked": result.get("state_guard_entry_blocked"),
+        "entry_blocked_reason": result.get("state_guard_entry_blocked_reason"),
+        "old_signal_id": result.get("state_guard_old_signal_id"),
+        "old_direction": result.get("state_guard_old_direction"),
+        "new_bias_direction": result.get("state_guard_new_bias_direction"),
+        "human_decision_required": result.get("state_guard_human_decision_required"),
+        "old_setup_recommendation": result.get("state_guard_old_setup_recommendation"),
+        "propose_reverse_signal": result.get("state_guard_propose_reverse_signal"),
         "explanation": result.get("state_guard_explanation"),
     }
 
@@ -1721,6 +1861,64 @@ async def generate_and_publish_signal(
     state_guard_shadow = evaluate_state_guard_shadow(candidate, cfg)
     state_guard_runtime = state_guard_duplicate_runtime_action(state_guard_shadow, cfg)
     day_diagnostics = day_bias_diagnostics(payload, candidate, gate={})
+    if str(state_guard_shadow.get("state_guard_decision") or "").upper() == "OPPOSITE_BIAS_BEFORE_ENTRY":
+        decision = {
+            "publication_type": "urgent_review",
+            "duplicate_signal_id": state_guard_shadow.get("state_guard_old_signal_id")
+            or state_guard_shadow.get("state_guard_primary_signal_id"),
+            "duplicate_signal_status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
+            "replacement_reason": "opposite_bias_before_entry",
+            "entry_blocked": True,
+            "human_decision_required": True,
+            "old_setup_recommendation": state_guard_shadow.get("state_guard_old_setup_recommendation")
+            or "WAIT_HUMAN_DECISION",
+            "propose_reverse_signal": bool(state_guard_shadow.get("state_guard_propose_reverse_signal")),
+            "duplicate_signal": {
+                "signal_id": state_guard_shadow.get("state_guard_old_signal_id")
+                or state_guard_shadow.get("state_guard_primary_signal_id"),
+                "status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
+                "display_symbol": candidate.get("display_symbol"),
+                "direction": state_guard_shadow.get("state_guard_old_direction"),
+            },
+        }
+        if not dry_run and decision["duplicate_signal_id"]:
+            emit_opposite_bias_before_entry(
+                now_utc=now_utc or utc_now(),
+                old_signal_id=str(decision["duplicate_signal_id"]),
+                old_direction=state_guard_shadow.get("state_guard_old_direction"),
+                candidate_signal_id=signal_id,
+                new_direction=candidate.get("direction"),
+                symbol=candidate.get("display_symbol") or candidate.get("symbol"),
+                recommendation=decision["old_setup_recommendation"],
+                propose_reverse_signal=decision["propose_reverse_signal"],
+            )
+        message_ids = await publish_plain_message(cfg, render_duplicate_update_message(decision, candidate), dry_run=dry_run)
+        return {
+            "published": True,
+            "reason": "opposite_bias_before_entry",
+            "signal_id": None,
+            "candidate_signal_id": signal_id,
+            "artifact_path": relpath(Path(sig_html)),
+            "run_log": relpath(Path(run_log)) if run_log else None,
+            "last_payload": payload,
+            "message_ids": message_ids,
+            "publication_type": "urgent_review",
+            "duplicate_in_work_signal_detected": True,
+            "duplicate_signal_id": decision["duplicate_signal_id"],
+            "duplicate_signal_status": decision["duplicate_signal_status"],
+            "entry_blocked": True,
+            "human_decision_required": True,
+            "old_setup_recommendation": decision["old_setup_recommendation"],
+            "propose_reverse_signal": decision["propose_reverse_signal"],
+            "aia_forward_attempted": False,
+            "aia_forward_ok": False,
+            "aia_forward_error": None,
+            "aia_forward_mode": "skipped_pre_entry_opposite_bias",
+            "aia_forward_warning": None,
+            **state_guard_shadow,
+            **state_guard_runtime,
+            **day_diagnostics,
+        }
     if state_guard_runtime.get("scheduled_state_guard_duplicate_runtime_action") == "enforce_duplicate_suppression":
         decision = {
             "publication_type": str(
@@ -1768,7 +1966,19 @@ async def generate_and_publish_signal(
     duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state(now_utc), now_utc=now_utc)
     duplicate_result = {k: v for k, v in duplicate_decision.items() if k != "duplicate_signal"}
 
-    if duplicate_decision.get("publication_type") in {"active_signal_update", "conflict_update"}:
+    if duplicate_decision.get("publication_type") in {"active_signal_update", "conflict_update", "urgent_review"}:
+        if duplicate_decision.get("publication_type") == "urgent_review" and not dry_run:
+            old = duplicate_decision.get("duplicate_signal") or {}
+            emit_opposite_bias_before_entry(
+                now_utc=now_utc or utc_now(),
+                old_signal_id=str(duplicate_decision.get("duplicate_signal_id")),
+                old_direction=old.get("direction"),
+                candidate_signal_id=signal_id,
+                new_direction=candidate.get("direction"),
+                symbol=candidate.get("display_symbol") or candidate.get("symbol"),
+                recommendation=duplicate_decision.get("old_setup_recommendation") or "WAIT_HUMAN_DECISION",
+                propose_reverse_signal=bool(duplicate_decision.get("propose_reverse_signal")),
+            )
         message = render_duplicate_update_message(duplicate_decision, candidate)
         message_ids = await publish_plain_message(cfg, message, dry_run=dry_run)
         return {

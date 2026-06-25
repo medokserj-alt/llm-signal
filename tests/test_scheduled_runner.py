@@ -480,8 +480,32 @@ class TestScheduledSignalState(unittest.TestCase):
         candidate = self._candidate(direction="short")
         old = self._old("CONFIRM_LIVE", ts="2026-06-17T06:30:00Z", filled=False, position_status="")
         decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
-        self.assertEqual(decision["publication_type"], "conflict_update")
+        self.assertEqual(decision["publication_type"], "urgent_review")
+        self.assertTrue(decision["entry_blocked"])
+        self.assertTrue(decision["human_decision_required"])
         self.assertFalse(decision["stale_active_signal_ignored"])
+
+    def test_pre_entry_opposite_bias_message_is_urgent_and_not_auto_reverse(self) -> None:
+        candidate = self._candidate(direction="short", confidence="low")
+        old = self._old("SETUP_ARMED", direction="long", filled=False, position_status="NONE")
+        decision = sr.evaluate_duplicate_publication(candidate, [old])
+        message = sr.render_duplicate_update_message(decision, candidate)
+
+        self.assertEqual(decision["publication_type"], "urgent_review")
+        self.assertFalse(decision["propose_reverse_signal"])
+        self.assertIn("opposite bias before entry", message)
+        self.assertIn("вход ещё НЕ исполнен", message)
+        self.assertIn("Это не новый автоматический вход", message)
+
+    def test_strong_pre_entry_opposite_bias_proposes_but_does_not_publish_reverse(self) -> None:
+        candidate = self._candidate(direction="short", confidence="high")
+        old = self._old("CONFIRM_LIVE", direction="long", filled=False, position_status="NONE")
+        decision = sr.evaluate_duplicate_publication(candidate, [old])
+
+        self.assertEqual(decision["publication_type"], "urgent_review")
+        self.assertTrue(decision["propose_reverse_signal"])
+        self.assertEqual(decision["old_setup_recommendation"], "CANCEL_ARMED_SETUP")
+        self.assertNotEqual(decision["publication_type"], "full_signal")
 
     def test_old_entry_live_hold_open_position_still_conflict_updates(self) -> None:
         now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
@@ -491,6 +515,7 @@ class TestScheduledSignalState(unittest.TestCase):
                 old = self._old(status, ts="2026-06-13T07:45:10Z", position_status="OPEN")
                 decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
                 self.assertEqual(decision["publication_type"], "conflict_update")
+                self.assertFalse(decision.get("entry_blocked", False))
                 self.assertFalse(decision["stale_active_signal_ignored"])
 
     def test_old_wait_confirm_older_than_fallback_ttl_is_ignored(self) -> None:
