@@ -1406,6 +1406,8 @@ def _build_aia_event_risk_payload(d: dict) -> dict:
         "generated_at",
         "timestamp_utc",
         "event_risk_context_timestamp_utc",
+        "upcoming_events",
+        "scheduled_macro_events",
     ):
         if out.get(key) is None and key in d and d.get(key) is not None:
             out[key] = copy.deepcopy(d.get(key))
@@ -2036,6 +2038,16 @@ def _build_signal_json_v1(
     event_risk = _build_aia_event_risk_payload(d)
     if event_risk:
         out["event_risk"] = event_risk
+    for key in (
+        "macro_event_context",
+        "macro_event_guard",
+        "macro_event_diagnostics",
+        "scheduled_macro_events",
+        "upcoming_events",
+    ):
+        value = d.get(key)
+        if value not in (None, "", [], {}):
+            out[key] = copy.deepcopy(value)
     if meta is not None:
         out["meta"] = meta
         if meta.get("entry_type") == "wait_confirm":

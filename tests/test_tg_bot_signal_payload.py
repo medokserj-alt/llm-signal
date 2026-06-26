@@ -243,6 +243,59 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertEqual(event["event_risk_context_timestamp_utc"], "2026-06-09T19:30:00Z")
         self.assertEqual(event["source"], "signal_core")
 
+    def test_build_signal_json_preserves_macro_event_context_for_aia(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        macro_context = {
+            "event_name": "US GDP + PCE",
+            "event_time_utc": "2026-06-25T12:30:00Z",
+            "event_time_msk": "25.06.2026, 15:30",
+            "phase": "post_event",
+            "post_event_window_active": True,
+            "post_event_reprice_required": True,
+            "post_event_classification": "not_classified",
+            "source": "macro_event_guard",
+        }
+        scheduled_events = [
+            {
+                "event_id": "us_gdp_pce_20260625_1530",
+                "event_name": "US GDP + PCE",
+                "impact": "high",
+                "event_time_utc": "2026-06-25T12:30:00Z",
+                "event_time_msk": "25.06.2026, 15:30",
+                "pre_blackout_minutes": 90,
+                "post_analysis_required": True,
+            }
+        ]
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "long",
+            "entry_range": [61356.23, 61584.1],
+            "sl": 60855.47,
+            "tp1": 62200.0,
+            "tp2": 62800.0,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "event_risk": {"event_risk_level": "high", "macro_risk_summary": "GDP + PCE event window"},
+            "macro_event_context": macro_context,
+            "macro_event_guard": {"active": True, "phase": "awaiting_reprice", "reason": "post_event_reprice_required"},
+            "scheduled_macro_events": scheduled_events,
+            "upcoming_events": scheduled_events,
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="20260625_123003",
+            published_at="2026-06-25T09:30:03Z",
+            channel_id=-1001234567890,
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out["macro_event_context"], macro_context)
+        self.assertEqual(out["scheduled_macro_events"], scheduled_events)
+        self.assertEqual(out["upcoming_events"], scheduled_events)
+        self.assertEqual(out["event_risk"]["scheduled_macro_events"], scheduled_events)
+        self.assertEqual(out["event_risk"]["upcoming_events"], scheduled_events)
+
     def test_unknown_event_risk_level_is_not_collapsed_to_low(self) -> None:
         tg_bot = _load_tg_bot_module()
 
