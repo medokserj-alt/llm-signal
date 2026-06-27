@@ -571,6 +571,103 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertIn("вход ещё НЕ исполнен", message)
         self.assertIn("Это не новый автоматический вход", message)
 
+    def test_duplicate_management_message_includes_severe_headline_risk_advisory(self) -> None:
+        candidate = self._candidate(symbol="BTC/USDT", direction="long")
+        decision = {
+            "publication_type": "management_update",
+            "duplicate_signal_id": "20260627_183004",
+            "duplicate_signal_status": "TIMEOUT_LIVE",
+            "event_risk_level": "severe",
+            "event_bias": "risk_off",
+            "dominant_critical_topic": "strategic_shipping_energy_chokepoint",
+            "duplicate_signal": {
+                "signal_id": "20260627_183004",
+                "status": "TIMEOUT_LIVE",
+                "display_symbol": "BTC/USDT",
+                "direction": "long",
+            },
+        }
+
+        message = sr.render_duplicate_update_message(decision, candidate)
+
+        self.assertIn("MANAGEMENT_UPDATE", message)
+        self.assertIn("Новый сигнал не публикуем", message)
+        self.assertIn("HEADLINE RISK UPDATE", message)
+        self.assertIn("event_risk_level: severe", message)
+        self.assertIn("event_bias: risk_off", message)
+        self.assertIn("strategic_shipping_energy_chokepoint", message)
+        self.assertIn("fresh management re-check", message)
+
+    def test_duplicate_management_message_omits_headline_advisory_for_low_risk(self) -> None:
+        candidate = self._candidate(symbol="BTC/USDT", direction="long")
+        decision = {
+            "publication_type": "management_update",
+            "duplicate_signal_id": "20260627_183004",
+            "duplicate_signal_status": "TIMEOUT_LIVE",
+            "event_risk_level": "low",
+            "event_bias": "neutral",
+            "duplicate_signal": {
+                "signal_id": "20260627_183004",
+                "status": "TIMEOUT_LIVE",
+                "display_symbol": "BTC/USDT",
+                "direction": "long",
+            },
+        }
+
+        message = sr.render_duplicate_update_message(decision, candidate)
+
+        self.assertIn("MANAGEMENT_UPDATE", message)
+        self.assertNotIn("HEADLINE RISK UPDATE", message)
+
+    def test_state_guard_duplicate_suppression_passes_gate_risk_to_management_render_only(self) -> None:
+        import tg_bot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html = Path(tmpdir) / "signal_20260628_003001.html"
+            log = Path(tmpdir) / "signal_20260628_003001.log"
+            payload = {"symbol": "BTC/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+            messages = []
+
+            async def fake_publish_plain(_cfg, message, *, dry_run=False):
+                messages.append(message)
+                return [123]
+
+            c = cfg(Path(tmpdir))
+            gate = {
+                "event_risk_level": "severe",
+                "event_bias": "risk_off",
+                "dominant_critical_topic": "strategic_shipping_energy_chokepoint",
+            }
+            guard = {
+                "state_guard_status": "ok",
+                "state_guard_decision": "MANAGEMENT_UPDATE",
+                "state_guard_recommended_publication_type": "MANAGEMENT_UPDATE",
+                "state_guard_primary_signal_id": "20260627_183004",
+                "state_guard_primary_lifecycle_state": "TIMEOUT_LIVE",
+                "state_guard_reason": "same_trade_idea_already_live",
+            }
+            runtime = {"scheduled_state_guard_duplicate_runtime_action": "enforce_duplicate_suppression"}
+            with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                "scheduled_runner.read_last_signal_payload", return_value=payload
+            ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
+                tg_bot, "html_file_to_tg_text", return_value=["signal text"]
+            ), patch.object(
+                tg_bot, "_infer_signal_id", return_value="20260628_003001"
+            ), patch(
+                "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
+            ), patch(
+                "scheduled_runner.state_guard_duplicate_runtime_action", return_value=runtime
+            ), patch(
+                "scheduled_runner.publish_plain_message", fake_publish_plain
+            ):
+                result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False, gate=gate))
+
+        self.assertEqual(result["publication_type"], "management_update")
+        self.assertEqual(result["aia_forward_mode"], "skipped_state_guard_duplicate")
+        self.assertFalse(result["aia_forward_attempted"])
+        self.assertIn("HEADLINE RISK UPDATE", messages[0])
+        self.assertIn("strategic_shipping_energy_chokepoint", messages[0])
+
     def test_strong_pre_entry_opposite_bias_proposes_but_does_not_publish_reverse(self) -> None:
         candidate = self._candidate(direction="short", confidence="high")
         old = self._old("CONFIRM_LIVE", direction="long", filled=False, position_status="NONE")
@@ -1010,7 +1107,13 @@ class TestScheduledSignalState(unittest.TestCase):
             ) as publish:
                 now = datetime(2026, 6, 5, 9, 30, tzinfo=timezone.utc)
                 asyncio.run(sr.run_signal_slot(now, c, state, "20260605_1230", slot_time, 1, dry_run=True))
-                publish.assert_called_with("aggressive", c, dry_run=True, now_utc=now)
+                publish.assert_called_with(
+                    "aggressive",
+                    c,
+                    dry_run=True,
+                    now_utc=now,
+                    gate=sr.evaluate_aia_gate({"status": "AVOID", "preferred_mode": "conservative"}, c),
+                )
                 self.assertEqual(state["slots"]["20260605_1230"]["status"], "deferred")
                 asyncio.run(sr.run_signal_slot(datetime(2026, 6, 5, 10, 30, tzinfo=timezone.utc), c, state, "20260605_1230", slot_time, 2, dry_run=True))
                 self.assertEqual(state["slots"]["20260605_1230"]["status"], "cancelled")

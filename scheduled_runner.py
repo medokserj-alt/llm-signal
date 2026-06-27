@@ -939,6 +939,74 @@ def _msk_label_from_signal_id(signal_id: str | None) -> str:
     return "ранее"
 
 
+def _first_nonempty(*values):
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _topic_label(value) -> str:
+    if isinstance(value, dict):
+        return str(value.get("topic_id") or value.get("topic") or value.get("name") or "").strip()
+    if isinstance(value, list):
+        for item in value:
+            label = _topic_label(item)
+            if label:
+                return label
+        return ""
+    return str(value or "").strip()
+
+
+def _event_risk_field(decision: dict, candidate: dict, key: str):
+    event_risk = candidate.get("event_risk") if isinstance(candidate.get("event_risk"), dict) else {}
+    return _first_nonempty(decision.get(key), candidate.get(key), event_risk.get(key))
+
+
+def _headline_risk_advisory(decision: dict, candidate: dict) -> str:
+    old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
+    status = str(old.get("status") or decision.get("duplicate_signal_status") or "").upper()
+    publication_type = str(decision.get("publication_type") or "").strip().lower()
+    if publication_type != "management_update" and status not in LIVE_POSITION_STATUSES:
+        return ""
+
+    level = str(_event_risk_field(decision, candidate, "event_risk_level") or "").strip().lower()
+    if level not in {"high", "severe", "critical"}:
+        return ""
+
+    bias = str(_event_risk_field(decision, candidate, "event_bias") or "").strip().lower()
+    topic = _topic_label(_event_risk_field(decision, candidate, "dominant_critical_topic"))
+    if not topic:
+        topic = _topic_label(_event_risk_field(decision, candidate, "critical_topics"))
+    side = str(candidate.get("direction") or old.get("direction") or "").strip().lower()
+    conflicts_active_side = direction_conflicts_event_bias(side, bias)
+    if not topic and not conflicts_active_side:
+        return ""
+
+    lines = [
+        "",
+        "",
+        "⚠️ HEADLINE RISK UPDATE",
+        "",
+        "Duplicate full signal remains suppressed, but fresh context shows elevated headline pressure.",
+        f"- event_risk_level: {level}",
+    ]
+    if bias:
+        lines.append(f"- event_bias: {bias}")
+    if topic:
+        lines.append(f"- topic: {topic}")
+    if conflicts_active_side:
+        lines.append("- active side exposure: current direction conflicts with headline-risk bias")
+    lines.extend(
+        [
+            "",
+            "Continuation quality is downgraded while this risk is active.",
+            "Do not add exposure automatically; fresh management re-check is required before treating this as normal continuation.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
     old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
     symbol = candidate.get("display_symbol") or old.get("display_symbol") or _display_symbol(candidate.get("symbol"))
@@ -990,7 +1058,7 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
     is_management = classification == "MANAGEMENT_UPDATE" or str(status).upper() in LIVE_POSITION_STATUSES
     title = "🔄 MANAGEMENT_UPDATE" if is_management else "🔄 ACTIVE SIGNAL UPDATE"
     entry_line = "Вход уже активирован." if str(status).upper() in LIVE_POSITION_STATUSES else "Вход ещё не активирован."
-    return (
+    message = (
         f"{title}\n\n"
         f"{symbol} {side} уже в работе.\n"
         f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
@@ -1012,6 +1080,7 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
             "новые уровни/контекст используются как update."
         )
     )
+    return message + _headline_risk_advisory(decision, candidate)
 
 
 def render_replacement_prefix(decision: dict, candidate: dict) -> str:
@@ -1824,9 +1893,11 @@ async def generate_and_publish_signal(
     *,
     dry_run: bool = False,
     now_utc: datetime | None = None,
+    gate: dict | None = None,
 ) -> dict:
     import tg_bot
 
+    gate_context = gate if isinstance(gate, dict) else {}
     duplicate_decision = {"publication_type": "full_signal", "duplicate_in_work_signal_detected": False}
     env = {"FORCE_MODE": selected_mode, "SIGNAL_SKIP_AIA_SEND": "1"}
     proc = run_command(["bash", "-lc", "./signal full"], env=env, timeout=1200, dry_run=dry_run)
@@ -1940,6 +2011,9 @@ async def generate_and_publish_signal(
                 "direction": candidate.get("direction"),
             },
         }
+        for key in ("event_risk_level", "event_bias", "dominant_critical_topic", "critical_topics", "confirm_policy"):
+            if gate_context.get(key) not in (None, "", [], {}):
+                decision[key] = gate_context.get(key)
         publication_type = decision["publication_type"]
         if publication_type not in {"active_signal_update", "management_update", "suppress_duplicate"}:
             publication_type = "active_signal_update"
@@ -2254,7 +2328,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         return
 
     try:
-        result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run, now_utc=now_utc)
+        result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run, now_utc=now_utc, gate=gate)
         state_guard_shadow_available = "state_guard_status" in result
         if result.get("published"):
             publication_type = str(result.get("publication_type") or "full_signal")
