@@ -182,7 +182,10 @@ def scheduled_active_pending_max_age_hours() -> int:
 
 
 def scheduled_wait_confirm_fallback_max_age_hours() -> int:
-    return max(1, parse_int_env("SCHEDULED_WAIT_CONFIRM_FALLBACK_MAX_AGE_HOURS", 2))
+    # Keep scheduled duplicate-state filtering aligned with the AIA wait-confirm
+    # deadline cap. Historical rows may miss confirm_timeout_minutes, so the
+    # fallback must not expire a pending setup earlier than AIA lifecycle does.
+    return max(1, parse_int_env("SCHEDULED_WAIT_CONFIRM_FALLBACK_MAX_AGE_HOURS", 6))
 
 
 def scheduled_post_event_reprice_max_age_minutes() -> int:
@@ -477,6 +480,9 @@ def _strategy_compatible(old: dict, new: dict) -> bool:
         return False
     old_mode = str(old.get("mode") or "").strip().lower()
     new_mode = str(new.get("mode") or "").strip().lower()
+    execution_modes = {"aggressive", "neutral", "conservative"}
+    if {old_strategy, new_strategy} == {"wait_confirm"} and old_mode in execution_modes and new_mode in execution_modes:
+        return True
     return not (old_mode and new_mode and old_mode != new_mode)
 
 

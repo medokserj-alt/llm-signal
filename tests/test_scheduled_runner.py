@@ -407,6 +407,80 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertAlmostEqual(decision["entry_distance_pct"], 0.09767, places=4)
         self.assertAlmostEqual(decision["sl_distance_pct"], 0.09866, places=4)
 
+    def test_wait_confirm_before_aia_360m_deadline_is_not_ignored(self) -> None:
+        now = datetime(2026, 6, 27, 9, 30, tzinfo=timezone.utc)
+        candidate = sr._candidate_from_payload(
+            {
+                "symbol": "SOL/USDT",
+                "direction": "long",
+                "entry_price": 71.62,
+                "sl": 70.90,
+                "tp1": 72.34,
+                "tp2": 73.91,
+                "mode": "aggressive",
+                "entry_mode": "wait_confirm",
+                "holding_horizon": "intraday_to_1_2d",
+            },
+            signal_id="20260627_123002",
+        )
+        old = self._old(
+            "WAIT_CONFIRM",
+            signal_id="20260627_093004",
+            symbol="SOLUSDT",
+            display_symbol="SOL/USDT",
+            entry_price=71.60,
+            sl=70.88,
+            tp1=72.55,
+            tp2=73.91,
+            ts="2026-06-27T06:33:39Z",
+            filled=False,
+            position_status="",
+            rr=3.2,
+        )
+
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+
+        self.assertIn(decision["publication_type"], {"active_signal_update", "replace_wait_confirm"})
+        self.assertTrue(decision["duplicate_in_work_signal_detected"])
+        self.assertEqual(decision["duplicate_signal_id"], "20260627_093004")
+        self.assertFalse(decision["stale_active_signal_ignored"])
+        self.assertLess(decision["entry_distance_pct"], 0.05)
+        self.assertLess(decision["sl_distance_pct"], 0.05)
+
+    def test_wait_confirm_after_aia_360m_deadline_can_be_ignored(self) -> None:
+        now = datetime(2026, 6, 27, 12, 34, tzinfo=timezone.utc)
+        candidate = sr._candidate_from_payload(
+            {
+                "symbol": "SOL/USDT",
+                "direction": "long",
+                "entry_price": 71.62,
+                "sl": 70.90,
+                "tp1": 72.34,
+                "tp2": 73.91,
+                "mode": "aggressive",
+                "entry_mode": "wait_confirm",
+                "holding_horizon": "intraday_to_1_2d",
+            },
+            signal_id="20260627_153002",
+        )
+        old = self._old(
+            "WAIT_CONFIRM",
+            signal_id="20260627_093004",
+            symbol="SOLUSDT",
+            display_symbol="SOL/USDT",
+            entry_price=71.60,
+            sl=70.88,
+            ts="2026-06-27T06:33:39Z",
+            filled=False,
+            position_status="",
+        )
+
+        decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
+
+        self.assertEqual(decision["publication_type"], "full_signal")
+        self.assertTrue(decision["stale_active_signal_ignored"])
+        self.assertEqual(decision["stale_active_signal_reason"], "pending_state_ttl_expired")
+
     def test_opposite_direction_existing_signal_conflict_update(self) -> None:
         candidate = self._candidate(direction="short")
         decision = sr.evaluate_duplicate_publication(candidate, [self._old("HOLD")])
@@ -521,7 +595,7 @@ class TestScheduledSignalState(unittest.TestCase):
     def test_old_wait_confirm_older_than_fallback_ttl_is_ignored(self) -> None:
         now = datetime(2026, 6, 17, 9, 30, tzinfo=timezone.utc)
         candidate = self._candidate(direction="short")
-        old = self._old("WAIT_CONFIRM", ts="2026-06-17T06:00:00Z", filled=False, position_status="")
+        old = self._old("WAIT_CONFIRM", ts="2026-06-17T03:00:00Z", filled=False, position_status="")
         decision = sr.evaluate_duplicate_publication(candidate, [old], now_utc=now)
         self.assertEqual(decision["publication_type"], "full_signal")
         self.assertTrue(decision["stale_active_signal_ignored"])
