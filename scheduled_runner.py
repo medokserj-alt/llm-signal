@@ -1039,15 +1039,51 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
             "Это не новый автоматический вход."
         )
     if decision.get("publication_type") == "conflict_update":
+        final_action = str(
+            decision.get("final_management_action")
+            or decision.get("management_action")
+            or decision.get("action")
+            or ""
+        ).strip().upper()
+        if final_action:
+            action_label = str(decision.get("action_label") or "").strip()
+            action_reason = str(
+                decision.get("action_reason")
+                or decision.get("reason_summary")
+                or decision.get("short_comment")
+                or ""
+            ).strip()
+            action_confidence = decision.get("action_confidence", decision.get("confidence"))
+            next_check = decision.get("next_check", decision.get("next_check_minutes"))
+            urgency = str(decision.get("urgency") or "").strip()
+            meta_parts = []
+            if action_confidence not in (None, ""):
+                meta_parts.append(f"confidence={action_confidence}")
+            if next_check not in (None, ""):
+                meta_parts.append(f"next_check={next_check}m")
+            if urgency:
+                meta_parts.append(f"urgency={urgency}")
+            meta_line = f"\n{' | '.join(meta_parts)}" if meta_parts else ""
+            label_line = f" — {action_label}" if action_label else ""
+            reason_block = f"\n\nПочему:\n{action_reason}" if action_reason else ""
+            return (
+                f"🔄 RE_EVAL_ACTIVE_SIGNAL → AIA: {final_action}\n\n"
+                f"{symbol} уже в работе, но новый scheduled scan видит противоположный bias.\n\n"
+                f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+                f"Статус AIA: {status}.\n\n"
+                "Решение AIA:\n"
+                f"{final_action}{label_line}.{reason_block}{meta_line}\n\n"
+                "Это не новый вход. Новый противоположный сигнал не публикуем."
+            )
         return (
             "🔄 RE_EVAL_ACTIVE_SIGNAL\n\n"
             f"{symbol} уже в работе, но новый scheduled scan видит противоположный bias.\n"
             f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
             f"Статус AIA: {status}.\n\n"
-            "Решение:\n"
-            "Новый противоположный сигнал не публикуем автоматически.\n"
-            "Нужна AIA management decision: HOLD / REDUCE / CLOSE / TRAIL / RE_EVAL.\n\n"
-            "Это не новый вход."
+            "Статус:\n"
+            "AIA management decision запрошен.\n"
+            "Ждём финальное решение: HOLD / REDUCE / CLOSE_NOW / TRAIL.\n\n"
+            "Это не новый вход. Новый противоположный сигнал не публикуем."
         )
     classification = str(decision.get("publication_type") or "").strip().upper()
     if classification == "SUPPRESS_DUPLICATE":

@@ -571,6 +571,75 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertIn("вход ещё НЕ исполнен", message)
         self.assertIn("Это не новый автоматический вход", message)
 
+    def test_active_opposite_bias_without_aia_decision_renders_pending(self) -> None:
+        candidate = self._candidate(symbol="SOL/USDT", direction="short")
+        decision = {
+            "publication_type": "conflict_update",
+            "duplicate_signal_id": "20260628_183003",
+            "duplicate_signal_status": "ENTRY_LIVE",
+            "duplicate_signal": {
+                "signal_id": "20260628_183003",
+                "status": "ENTRY_LIVE",
+                "display_symbol": "SOL/USDT",
+                "direction": "long",
+            },
+        }
+
+        message = sr.render_duplicate_update_message(decision, candidate)
+
+        self.assertIn("🔄 RE_EVAL_ACTIVE_SIGNAL", message)
+        self.assertIn("AIA management decision запрошен", message)
+        self.assertIn("Ждём финальное решение", message)
+        self.assertNotIn("Нужна AIA management decision", message)
+
+    def test_active_opposite_bias_with_reduce_renders_resolved_aia_action(self) -> None:
+        candidate = self._candidate(symbol="SOL/USDT", direction="short")
+        decision = {
+            "publication_type": "conflict_update",
+            "duplicate_signal_id": "20260628_183003",
+            "duplicate_signal_status": "ENTRY_LIVE",
+            "final_management_action": "REDUCE",
+            "action_label": "сократить риск частично",
+            "action_reason": "headline/event risk высокий; asset flow смешанный.",
+            "action_confidence": 0.66,
+            "next_check": 15,
+            "urgency": "medium",
+            "duplicate_signal": {
+                "signal_id": "20260628_183003",
+                "status": "ENTRY_LIVE",
+                "display_symbol": "SOL/USDT",
+                "direction": "long",
+            },
+        }
+
+        message = sr.render_duplicate_update_message(decision, candidate)
+
+        self.assertIn("🔄 RE_EVAL_ACTIVE_SIGNAL → AIA: REDUCE", message)
+        self.assertIn("Решение AIA:", message)
+        self.assertIn("REDUCE — сократить риск частично", message)
+        self.assertIn("headline/event risk высокий", message)
+
+    def test_active_opposite_bias_with_close_now_renders_resolved_aia_action(self) -> None:
+        candidate = self._candidate(symbol="SOL/USDT", direction="short")
+        decision = {
+            "publication_type": "conflict_update",
+            "duplicate_signal_id": "20260628_183003",
+            "duplicate_signal_status": "ENTRY_LIVE",
+            "management_action": "CLOSE_NOW",
+            "action_reason": "структура сломана / зона инвалидации достигнута.",
+            "duplicate_signal": {
+                "signal_id": "20260628_183003",
+                "status": "ENTRY_LIVE",
+                "display_symbol": "SOL/USDT",
+                "direction": "long",
+            },
+        }
+
+        message = sr.render_duplicate_update_message(decision, candidate)
+
+        self.assertIn("🔄 RE_EVAL_ACTIVE_SIGNAL → AIA: CLOSE_NOW", message)
+        self.assertIn("структура сломана", message)
+
     def test_duplicate_management_message_includes_severe_headline_risk_advisory(self) -> None:
         candidate = self._candidate(symbol="BTC/USDT", direction="long")
         decision = {
