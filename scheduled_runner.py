@@ -124,6 +124,11 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_primary_signal_id",
     "state_guard_primary_lifecycle_state",
     "state_guard_primary_position_status",
+    "state_guard_primary_entry",
+    "state_guard_primary_sl",
+    "state_guard_primary_tp1",
+    "state_guard_primary_tp2",
+    "state_guard_primary_tp3",
     "state_guard_active_same_direction_scenario_found",
     "state_guard_active_same_direction_signal_id",
     "state_guard_active_same_direction_status",
@@ -481,9 +486,68 @@ def _strategy_compatible(old: dict, new: dict) -> bool:
     old_mode = str(old.get("mode") or "").strip().lower()
     new_mode = str(new.get("mode") or "").strip().lower()
     execution_modes = {"aggressive", "neutral", "conservative"}
-    if {old_strategy, new_strategy} == {"wait_confirm"} and old_mode in execution_modes and new_mode in execution_modes:
+    if old_mode in execution_modes and new_mode in execution_modes:
         return True
     return not (old_mode and new_mode and old_mode != new_mode)
+
+
+def _primary_sort_key(signal: dict) -> tuple[int, float, str]:
+    status = str(signal.get("status") or "").strip().upper()
+    priority = 0
+    if status in LIVE_POSITION_STATUSES:
+        priority = 4
+    elif status in {"CONFIRM_LIVE", "SETUP_ARMED"}:
+        priority = 3
+    elif status in {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE"}:
+        priority = 2
+    elif status in IN_WORK_SIGNAL_STATUSES:
+        priority = 1
+    event_time = _signal_event_time(signal)
+    event_ts = event_time.timestamp() if event_time is not None else float("-inf")
+    return (priority, event_ts, str(signal.get("signal_id") or ""))
+
+
+def _tp_ladder_validation(
+    direction: str | None,
+    entry: float | None,
+    tp1: float | None,
+    tp2: float | None,
+    tp3: float | None,
+) -> dict:
+    direction = _normalize_direction(direction)
+    warnings: list[str] = []
+    invalid = False
+    duplicate_targets = False
+
+    def _append(condition: bool, label: str) -> None:
+        nonlocal invalid
+        if condition:
+            warnings.append(label)
+            invalid = True
+
+    if direction == "long":
+        _append(entry is not None and tp1 is not None and tp1 <= entry, "tp1_not_above_entry")
+        _append(tp1 is not None and tp2 is not None and tp2 < tp1, "tp2_below_tp1")
+        _append(tp2 is not None and tp3 is not None and tp3 < tp2, "tp3_below_tp2")
+    elif direction == "short":
+        _append(entry is not None and tp1 is not None and tp1 >= entry, "tp1_not_below_entry")
+        _append(tp1 is not None and tp2 is not None and tp2 > tp1, "tp2_above_tp1")
+        _append(tp2 is not None and tp3 is not None and tp3 > tp2, "tp3_above_tp2")
+
+    if tp1 is not None and tp2 is not None and tp1 == tp2:
+        warnings.append("tp1_equals_tp2")
+        duplicate_targets = True
+        invalid = True
+    if tp2 is not None and tp3 is not None and tp2 == tp3:
+        warnings.append("tp2_equals_tp3")
+        duplicate_targets = True
+        invalid = True
+
+    return {
+        "invalid_tp_ladder": invalid,
+        "duplicate_tp_targets": duplicate_targets,
+        "tp_ladder_warnings": warnings,
+    }
 
 
 def _horizon_compatible(old: dict, new: dict) -> bool:
@@ -846,6 +910,7 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
     entry_threshold = _try_float(os.getenv("SCHEDULED_DUPLICATE_ENTRY_DISTANCE_PCT")) or 0.5
     sl_threshold = _try_float(os.getenv("SCHEDULED_DUPLICATE_SL_DISTANCE_PCT")) or 1.0
     related: list[tuple[float, dict, float | None, float | None, bool]] = []
+    same_direction_candidates: list[tuple[dict, float | None, float | None, bool]] = []
     for old in same_symbol:
         if old.get("direction") != direction:
             continue
@@ -853,6 +918,8 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
         sl_distance = _distance_pct(old.get("sl"), candidate.get("sl"))
         strategy_ok = _strategy_compatible(old, candidate)
         horizon_ok = _horizon_compatible(old, candidate)
+        if strategy_ok and horizon_ok:
+            same_direction_candidates.append((old, entry_distance, sl_distance, strategy_ok))
         if (
             entry_distance is not None
             and entry_distance <= entry_threshold
@@ -862,6 +929,40 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
         ):
             related.append((entry_distance, old, entry_distance, sl_distance, strategy_ok))
 
+    if not related and same_direction_candidates:
+        old, entry_distance, sl_distance, strategy_ok = max(
+            same_direction_candidates,
+            key=lambda item: _primary_sort_key(item[0]),
+        )
+        rr_old = _rr_for_signal(old)
+        rr_new = _rr_for_signal(candidate)
+        out.update(
+            {
+                "duplicate_in_work_signal_detected": True,
+                "duplicate_signal_id": old.get("signal_id"),
+                "duplicate_signal_status": old.get("status"),
+                "publication_type": "active_signal_update",
+                "replacement_reason": "same_symbol_direction_in_work_material_reprice",
+                "replaced_signal_id": None,
+                "old_entry": old.get("entry_price"),
+                "old_sl": old.get("sl"),
+                "entry_distance_pct": round(entry_distance, 6) if entry_distance is not None else None,
+                "sl_distance_pct": round(sl_distance, 6) if sl_distance is not None else None,
+                "rr_old": rr_old,
+                "rr_new": rr_new,
+                "confidence_old": old.get("confidence"),
+                "strategy_same_or_compatible": strategy_ok,
+                "duplicate_signal": old,
+            }
+        )
+        status = str(old.get("status") or "").upper()
+        if status in LIVE_POSITION_STATUSES:
+            out["replacement_reason"] = "existing_signal_live_or_management"
+        elif status in {"CONFIRM_LIVE", "SETUP_ARMED"}:
+            out["replacement_reason"] = "existing_signal_confirmed_or_armed"
+        elif status in WAIT_REPLACEABLE_STATUSES:
+            out["replacement_reason"] = "wait_confirm_exists_material_reprice"
+        return out
     if not related:
         return out
 
@@ -1007,6 +1108,36 @@ def _headline_risk_advisory(decision: dict, candidate: dict) -> str:
     return "\n".join(lines)
 
 
+def _state_guard_update_lineage(state_guard: dict, candidate: dict, publication_type: str) -> dict:
+    previous_signal_id = state_guard.get("state_guard_primary_signal_id")
+    previous_state = str(state_guard.get("state_guard_primary_lifecycle_state") or "").strip().upper() or None
+    previous_entry = _try_float(state_guard.get("state_guard_primary_entry"))
+    new_entry = _try_float(candidate.get("entry_price"))
+    entry_distance = _distance_pct(previous_entry, new_entry)
+    pending_states = {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE", "CONFIRM_LIVE", "SETUP_ARMED"}
+    is_pending = previous_state in pending_states
+    material_reprice = entry_distance is not None and entry_distance >= 0.5
+    classification = "management_update" if publication_type == "management_update" else "active_signal_refresh"
+    replacement_reason = str(state_guard.get("state_guard_reason") or "active_scenario_exists")
+    if is_pending and material_reprice:
+        classification = "reprice_review_pending_setup"
+        replacement_reason = "pending_setup_reprice_review_required"
+    elif is_pending:
+        classification = "refresh_pending_setup"
+
+    return {
+        "related_signal_id": previous_signal_id,
+        "refresh_of_signal_id": previous_signal_id if publication_type == "active_signal_update" else None,
+        "replaces_signal_id": None,
+        "previous_entry": previous_entry,
+        "new_entry": new_entry,
+        "previous_lifecycle_state": previous_state,
+        "replacement_reason": replacement_reason,
+        "pending_update_classification": classification,
+        "entry_distance_pct": round(entry_distance, 6) if entry_distance is not None else None,
+    }
+
+
 def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
     old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
     symbol = candidate.get("display_symbol") or old.get("display_symbol") or _display_symbol(candidate.get("symbol"))
@@ -1092,6 +1223,29 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
             symbol=symbol,
         )
     is_management = classification == "MANAGEMENT_UPDATE" or str(status).upper() in LIVE_POSITION_STATUSES
+    pending_update_classification = str(decision.get("pending_update_classification") or "").strip().lower()
+    if not is_management and pending_update_classification in {"refresh_pending_setup", "reprice_review_pending_setup"}:
+        title = "🔁 ACTIVE SETUP UPDATE"
+        previous_entry = decision.get("previous_entry", old.get("entry_price"))
+        new_entry = decision.get("new_entry", candidate.get("entry_price"))
+        review_line = (
+            "Если старый откат уже неактуален, AIA должна явно отменить старый setup и заменить его новым."
+            if pending_update_classification == "reprice_review_pending_setup"
+            else "Старый setup остаётся основным, а новый расчёт рассматривается как update, не как второй независимый вход."
+        )
+        return (
+            f"{title}\n\n"
+            f"{symbol} {side} уже есть в работе как {status}.\n"
+            f"Предыдущий сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+            "Entry ещё не исполнен.\n\n"
+            f"Новый scheduled scan снова выбрал {symbol} {side}.\n"
+            "Это не новый независимый вход.\n\n"
+            "Решение:\n"
+            "Обновляем/пересматриваем pending setup через AIA.\n"
+            f"Старый entry: {previous_entry}\n"
+            f"Новый расчётный entry: {new_entry}\n\n"
+            f"{review_line}"
+        ) + _headline_risk_advisory(decision, candidate)
     title = "🔄 MANAGEMENT_UPDATE" if is_management else "🔄 ACTIVE SIGNAL UPDATE"
     entry_line = "Вход уже активирован." if str(status).upper() in LIVE_POSITION_STATUSES else "Вход ещё не активирован."
     message = (
@@ -1398,23 +1552,36 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             "duplicate_detected": evaluation.get("duplicate_detected"),
         }
     )
+    primary_signal_id = out.get("state_guard_primary_signal_id")
+    if primary_signal_id:
+        primary_trade = ((state.get("trades") or {}).get(str(primary_signal_id)) or {})
+        snapshot = primary_trade.get("trade_plan_snapshot") or primary_trade.get("signal_snapshot") or {}
+        out.update(
+            {
+                "state_guard_primary_entry": _try_float(snapshot.get("entry")),
+                "state_guard_primary_sl": _try_float(snapshot.get("sl")),
+                "state_guard_primary_tp1": _try_float(snapshot.get("tp1")),
+                "state_guard_primary_tp2": _try_float(snapshot.get("tp2")),
+                "state_guard_primary_tp3": _try_float(snapshot.get("tp3")),
+            }
+        )
     return out
 
 
 def state_guard_duplicate_runtime_action(state_guard: dict, cfg: SchedulerConfig) -> dict:
     duplicate_decision = str(state_guard.get("state_guard_decision") or "").strip().upper()
     recommended = str(state_guard.get("state_guard_recommended_publication_type") or "").strip().upper()
-    duplicate_detected = bool(state_guard.get("state_guard_duplicate_detected"))
     can_publish = state_guard.get("state_guard_can_publish_full_signal")
     active_status = str(state_guard.get("state_guard_primary_lifecycle_state") or "").strip().upper()
-    entry_distance = _try_float(state_guard.get("state_guard_entry_distance_pct"))
-    sl_distance = _try_float(state_guard.get("state_guard_sl_distance_pct"))
+    same_direction_active = bool(
+        state_guard.get("state_guard_active_same_direction_scenario_found")
+        or state_guard.get("active_same_direction_scenario_found")
+        or state_guard.get("state_guard_primary_signal_id")
+    )
     eligible = (
-        duplicate_detected
+        same_direction_active
         and can_publish is False
         and active_status in ACTIVE_SAME_DIRECTION_DUPLICATE_BLOCKING_STATUSES
-        and (entry_distance is None or entry_distance <= 0.5)
-        and (sl_distance is None or sl_distance <= 1.0)
         and (
             duplicate_decision in {"ACTIVE_SIGNAL_UPDATE", "MANAGEMENT_UPDATE", "SUPPRESS_DUPLICATE"}
             or recommended in {"ACTIVE_SIGNAL_UPDATE", "MANAGEMENT_UPDATE", "SUPPRESS_DUPLICATE"}
@@ -1507,6 +1674,11 @@ def state_guard_shadow_log_row(
         "primary_signal_id": result.get("state_guard_primary_signal_id"),
         "primary_lifecycle_state": result.get("state_guard_primary_lifecycle_state"),
         "primary_position_status": result.get("state_guard_primary_position_status"),
+        "primary_entry": result.get("state_guard_primary_entry"),
+        "primary_sl": result.get("state_guard_primary_sl"),
+        "primary_tp1": result.get("state_guard_primary_tp1"),
+        "primary_tp2": result.get("state_guard_primary_tp2"),
+        "primary_tp3": result.get("state_guard_primary_tp3"),
         "duplicate_detected": result.get("state_guard_duplicate_detected"),
         "conflict_detected": result.get("state_guard_conflict_detected"),
         "replacement_candidate": result.get("state_guard_replacement_candidate"),
@@ -1971,6 +2143,13 @@ async def generate_and_publish_signal(
     published_at = datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
     candidate = _candidate_from_payload(payload, signal_id=signal_id)
+    tp_validation = _tp_ladder_validation(
+        candidate.get("direction"),
+        candidate.get("entry_price"),
+        candidate.get("tp1"),
+        candidate.get("tp2"),
+        candidate.get("tp3"),
+    )
     state_guard_shadow = evaluate_state_guard_shadow(candidate, cfg)
     state_guard_runtime = state_guard_duplicate_runtime_action(state_guard_shadow, cfg)
     day_diagnostics = day_bias_diagnostics(payload, candidate, gate={})
@@ -2033,27 +2212,32 @@ async def generate_and_publish_signal(
             **day_diagnostics,
         }
     if state_guard_runtime.get("scheduled_state_guard_duplicate_runtime_action") == "enforce_duplicate_suppression":
+        publication_type = str(
+            state_guard_shadow.get("state_guard_recommended_publication_type") or "active_signal_update"
+        ).strip().lower()
+        if publication_type not in {"active_signal_update", "management_update", "suppress_duplicate"}:
+            publication_type = "active_signal_update"
+        lineage = _state_guard_update_lineage(state_guard_shadow, candidate, publication_type)
         decision = {
-            "publication_type": str(
-                state_guard_shadow.get("state_guard_recommended_publication_type") or "active_signal_update"
-            ).strip().lower(),
+            "publication_type": publication_type,
             "duplicate_signal_id": state_guard_shadow.get("state_guard_primary_signal_id"),
             "duplicate_signal_status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
-            "replacement_reason": state_guard_shadow.get("state_guard_reason") or "state_guard_duplicate_active_scenario",
+            "replacement_reason": lineage.get("replacement_reason")
+            or state_guard_shadow.get("state_guard_reason")
+            or "state_guard_duplicate_active_scenario",
             "duplicate_signal": {
                 "signal_id": state_guard_shadow.get("state_guard_primary_signal_id"),
                 "status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
                 "display_symbol": candidate.get("display_symbol"),
                 "direction": candidate.get("direction"),
+                "entry_price": state_guard_shadow.get("state_guard_primary_entry"),
+                "sl": state_guard_shadow.get("state_guard_primary_sl"),
             },
+            **lineage,
         }
         for key in ("event_risk_level", "event_bias", "dominant_critical_topic", "critical_topics", "confirm_policy"):
             if gate_context.get(key) not in (None, "", [], {}):
                 decision[key] = gate_context.get(key)
-        publication_type = decision["publication_type"]
-        if publication_type not in {"active_signal_update", "management_update", "suppress_duplicate"}:
-            publication_type = "active_signal_update"
-            decision["publication_type"] = publication_type
         message = render_duplicate_update_message(decision, candidate)
         message_ids = await publish_plain_message(cfg, message, dry_run=dry_run)
         return {
@@ -2070,6 +2254,8 @@ async def generate_and_publish_signal(
             "duplicate_signal_id": decision["duplicate_signal_id"],
             "duplicate_signal_status": decision["duplicate_signal_status"],
             "replacement_reason": decision["replacement_reason"],
+            **lineage,
+            **tp_validation,
             "aia_forward_attempted": False,
             "aia_forward_ok": False,
             "aia_forward_error": None,
@@ -2111,6 +2297,7 @@ async def generate_and_publish_signal(
             "aia_forward_error": None,
             "aia_forward_mode": "skipped_duplicate_update",
             "aia_forward_warning": None,
+            **tp_validation,
             **state_guard_shadow,
             **state_guard_runtime,
             **day_diagnostics,
@@ -2165,6 +2352,16 @@ async def generate_and_publish_signal(
         "aia_forward_mode": "awaited_scheduled",
     }
     if ok:
+        if tp_validation["invalid_tp_ladder"]:
+            LOGGER.warning(
+                "tp ladder validation warning",
+                extra={
+                    "signal_id": signal_id,
+                    "symbol": candidate.get("display_symbol"),
+                    "direction": candidate.get("direction"),
+                    "tp_ladder_warnings": tp_validation["tp_ladder_warnings"],
+                },
+            )
         try:
             tg_bot._AIA_UID_CONTEXT = SCHEDULER_UID
         except Exception:
@@ -2196,6 +2393,7 @@ async def generate_and_publish_signal(
         "last_payload": payload,
         **aia_forward,
         "aia_forward_warning": "aia_forward_failed" if ok and not aia_forward.get("aia_forward_ok") else None,
+        **tp_validation,
         **state_guard_shadow,
         **state_guard_runtime,
         **day_diagnostics,
@@ -2400,6 +2598,13 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "publication_type",
                 "replacement_selected",
                 "replacement_reason",
+                "related_signal_id",
+                "refresh_of_signal_id",
+                "replaces_signal_id",
+                "previous_entry",
+                "new_entry",
+                "previous_lifecycle_state",
+                "pending_update_classification",
                 "replaced_signal_id",
                 "replacing_signal_id",
                 "old_entry",
@@ -2432,6 +2637,9 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "counter_regime_signal",
                 "counter_regime_allowed_reason",
                 "market_override_detected",
+                "invalid_tp_ladder",
+                "duplicate_tp_targets",
+                "tp_ladder_warnings",
             ):
                 row[key] = result.get(key)
             for key in STATE_GUARD_DECISION_LOG_FIELDS:

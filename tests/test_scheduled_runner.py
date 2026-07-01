@@ -337,6 +337,26 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertEqual(decision["publication_type"], "active_signal_update")
         self.assertFalse(decision["replacement_selected"])
 
+    def test_confirm_live_material_reprice_still_blocks_independent_full_signal(self) -> None:
+        candidate = self._candidate(entry_price=626.8, sl=620.03, rr=3.4)
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old("CONFIRM_LIVE", filled=False, position_status="NONE")])
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertEqual(decision["duplicate_signal_status"], "CONFIRM_LIVE")
+        self.assertEqual(decision["replacement_reason"], "existing_signal_confirmed_or_armed")
+
+    def test_setup_armed_material_reprice_still_blocks_independent_full_signal(self) -> None:
+        candidate = self._candidate(entry_price=626.8, sl=620.03, rr=3.4)
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old("SETUP_ARMED", filled=False, position_status="NONE")])
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertEqual(decision["duplicate_signal_status"], "SETUP_ARMED")
+        self.assertEqual(decision["replacement_reason"], "existing_signal_confirmed_or_armed")
+
+    def test_execution_modes_are_compatible_for_same_direction_duplicate_detection(self) -> None:
+        candidate = self._candidate(mode="aggressive", entry_price=610.14, sl=604.04)
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old(mode="neutral", rr=3.1)])
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertTrue(decision["strategy_same_or_compatible"])
+
     def test_entry_live_or_hold_near_duplicate_updates_management(self) -> None:
         for status in ("ENTRY_LIVE", "HOLD"):
             decision = sr.evaluate_duplicate_publication(self._candidate(), [self._old(status)])
@@ -901,6 +921,8 @@ class TestScheduledSignalState(unittest.TestCase):
             "state_guard_decision": "ACTIVE_SIGNAL_UPDATE",
             "state_guard_recommended_publication_type": "ACTIVE_SIGNAL_UPDATE",
             "state_guard_duplicate_detected": True,
+            "state_guard_active_same_direction_scenario_found": True,
+            "state_guard_primary_signal_id": "20260614_093003",
             "state_guard_can_publish_full_signal": False,
             "state_guard_primary_lifecycle_state": "SETUP_ARMED",
             "state_guard_entry_distance_pct": 0.062956,
@@ -920,6 +942,8 @@ class TestScheduledSignalState(unittest.TestCase):
             "state_guard_decision": "MANAGEMENT_UPDATE",
             "state_guard_recommended_publication_type": "MANAGEMENT_UPDATE",
             "state_guard_duplicate_detected": True,
+            "state_guard_active_same_direction_scenario_found": True,
+            "state_guard_primary_signal_id": "20260614_093003",
             "state_guard_can_publish_full_signal": False,
             "state_guard_primary_lifecycle_state": "TP2_HIT_LIVE",
             "state_guard_entry_distance_pct": 0.062956,
@@ -932,6 +956,33 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertTrue(action["scheduled_state_guard_duplicate_runtime_eligible"])
         self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "enforce_duplicate_suppression")
         self.assertEqual(action["duplicate_enforcement_action"], "enforce_duplicate_suppression")
+
+    def test_state_guard_duplicate_runtime_suppresses_armed_setup_even_without_near_duplicate_flag(self) -> None:
+        c = cfg()
+        c.scheduled_state_guard_duplicate_enforcement_enabled = True
+        guard = {
+            "state_guard_decision": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_recommended_publication_type": "ACTIVE_SIGNAL_UPDATE",
+            "state_guard_duplicate_detected": False,
+            "state_guard_active_same_direction_scenario_found": True,
+            "state_guard_can_publish_full_signal": False,
+            "state_guard_primary_signal_id": "20260701_163003",
+            "state_guard_primary_lifecycle_state": "CONFIRM_LIVE",
+            "state_guard_entry_distance_pct": 2.591504,
+            "state_guard_sl_distance_pct": 2.521575,
+        }
+
+        action = sr.state_guard_duplicate_runtime_action(guard, c)
+
+        self.assertTrue(action["scheduled_state_guard_duplicate_runtime_eligible"])
+        self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "enforce_duplicate_suppression")
+
+    def test_tp_ladder_validation_flags_duplicate_targets(self) -> None:
+        validation = sr._tp_ladder_validation("long", 76.93, 78.88, 78.88, None)
+
+        self.assertTrue(validation["invalid_tp_ladder"])
+        self.assertTrue(validation["duplicate_tp_targets"])
+        self.assertIn("tp1_equals_tp2", validation["tp_ladder_warnings"])
 
     def test_state_guard_duplicate_runtime_does_not_suppress_opposite_direction_conflict(self) -> None:
         c = cfg()
