@@ -160,6 +160,10 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "duplicate_detected",
     "duplicate_enforcement_enabled",
     "duplicate_enforcement_action",
+    "state_guard_manual_override_enabled",
+    "state_guard_manual_override_used",
+    "state_guard_manual_override_reason",
+    "state_guard_manual_override_source",
 )
 
 
@@ -1138,6 +1142,104 @@ def _state_guard_update_lineage(state_guard: dict, candidate: dict, publication_
     }
 
 
+def _recommended_non_full_publication_type(state_guard: dict) -> str:
+    decision = str(state_guard.get("state_guard_decision") or "").strip().upper()
+    recommended = str(state_guard.get("state_guard_recommended_publication_type") or "").strip().upper()
+    primary_state = str(state_guard.get("state_guard_primary_lifecycle_state") or "").strip().upper()
+    previous_runner_status = str(state_guard.get("state_guard_previous_runner_status") or "").strip().lower()
+    reason = str(state_guard.get("state_guard_reason") or "").strip().lower()
+    allowed = {
+        "MANAGEMENT_UPDATE",
+        "ACTIVE_SIGNAL_UPDATE",
+        "RUNNER_MANAGEMENT_UPDATE",
+        "REPRICE_UPDATE",
+        "CANCEL_AND_REPLACE",
+        "RE_ENTRY_SIGNAL",
+        "ADD_ON_REVIEW",
+        "SUPPRESS_DUPLICATE",
+    }
+    for candidate in (recommended, decision):
+        if candidate in allowed:
+            return candidate
+    if decision == "SUPPRESS_DUPLICATE":
+        return "SUPPRESS_DUPLICATE"
+    if primary_state in LIVE_POSITION_STATUSES:
+        if "RUNNER" in primary_state or previous_runner_status == "active":
+            return "RUNNER_MANAGEMENT_UPDATE"
+        return "MANAGEMENT_UPDATE"
+    if primary_state in {"WAIT_CONFIRM", "WAIT_POST_EVENT_REPRICE", "CONFIRM_LIVE", "SETUP_ARMED"}:
+        if "reprice" in reason:
+            return "REPRICE_UPDATE"
+        return "ACTIVE_SIGNAL_UPDATE"
+    if "reprice" in reason:
+        return "REPRICE_UPDATE"
+    return "ACTIVE_SIGNAL_UPDATE"
+
+
+def build_state_guard_enforcement_decision(state_guard: dict, candidate: dict, cfg: SchedulerConfig) -> dict:
+    status = str(state_guard.get("state_guard_status") or "").strip().lower()
+    can_publish = state_guard.get("state_guard_can_publish_full_signal")
+    override_enabled = bool(cfg.scheduled_state_guard_manual_override_enabled)
+    override_reason = str(cfg.scheduled_state_guard_manual_override_reason or "").strip()
+    override_used = status == "ok" and can_publish is False and override_enabled and bool(override_reason)
+    override_source = "config:SCHEDULED_STATE_GUARD_MANUAL_OVERRIDE_*" if override_used else None
+
+    result = {
+        "state_guard_manual_override_enabled": override_enabled,
+        "state_guard_manual_override_used": override_used,
+        "state_guard_manual_override_reason": override_reason or None,
+        "state_guard_manual_override_source": override_source,
+    }
+    if status != "ok" or can_publish is not False:
+        result.update(
+            {
+                "state_guard_runtime_blocked_full_signal": False,
+                "scheduled_state_guard_enforcement_action": "none",
+                "scheduled_state_guard_duplicate_runtime_action": "none",
+            }
+        )
+        return result
+
+    if override_used:
+        result.update(
+            {
+                "state_guard_runtime_blocked_full_signal": False,
+                "scheduled_state_guard_enforcement_action": "manual_override_allow_full_signal",
+                "scheduled_state_guard_duplicate_runtime_action": "manual_override_allow_full_signal",
+            }
+        )
+        return result
+
+    publication_type = _recommended_non_full_publication_type(state_guard)
+    if publication_type == "RE_ENTRY_SIGNAL" and state_guard.get("state_guard_reentry_allowed") is not True:
+        publication_type = "SUPPRESS_DUPLICATE"
+    publication_type = publication_type.lower()
+    lineage = _state_guard_update_lineage(state_guard, candidate, publication_type)
+    result.update(
+        {
+            "state_guard_runtime_blocked_full_signal": True,
+            "scheduled_state_guard_enforcement_action": "enforce_non_full_signal",
+            "scheduled_state_guard_duplicate_runtime_action": "enforce_non_full_signal",
+            "publication_type": publication_type,
+            "duplicate_signal_id": state_guard.get("state_guard_primary_signal_id"),
+            "duplicate_signal_status": state_guard.get("state_guard_primary_lifecycle_state"),
+            "replacement_reason": lineage.get("replacement_reason")
+            or state_guard.get("state_guard_reason")
+            or "state_guard_blocked_full_signal",
+            "duplicate_signal": {
+                "signal_id": state_guard.get("state_guard_primary_signal_id"),
+                "status": state_guard.get("state_guard_primary_lifecycle_state"),
+                "display_symbol": candidate.get("display_symbol"),
+                "direction": candidate.get("direction"),
+                "entry_price": state_guard.get("state_guard_primary_entry"),
+                "sl": state_guard.get("state_guard_primary_sl"),
+            },
+            **lineage,
+        }
+    )
+    return result
+
+
 def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
     old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
     symbol = candidate.get("display_symbol") or old.get("display_symbol") or _display_symbol(candidate.get("symbol"))
@@ -1218,10 +1320,25 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
         )
     classification = str(decision.get("publication_type") or "").strip().upper()
     if classification == "SUPPRESS_DUPLICATE":
-        return tg_bot.render_state_guard_classification_message(
-            {"decision": "SUPPRESS_DUPLICATE", "symbol": symbol, "direction": side},
-            symbol=symbol,
+        return (
+            "🔄 MANAGEMENT_UPDATE / SUPPRESS_DUPLICATE\n\n"
+            f"{symbol} {side} уже имеет активный/связанный сценарий.\n"
+            f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+            f"Статус AIA: {status}.\n\n"
+            f"Новый scheduled scan снова выбрал {symbol} {side}.\n"
+            "Новый full_signal не публикуем."
         )
+    if classification == "RUNNER_MANAGEMENT_UPDATE":
+        return (
+            "🔄 RUNNER MANAGEMENT UPDATE\n\n"
+            f"{symbol} {side} уже сопровождается активным runner.\n"
+            f"Активный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.\n"
+            f"Статус AIA: {status}.\n\n"
+            f"Новый scheduled scan снова выбрал {symbol} {side}.\n"
+            "Это не новый independent full signal.\n\n"
+            "Решение:\n"
+            "AIA продолжает сопровождение existing runner / add-on review only."
+        ) + _headline_risk_advisory(decision, candidate)
     is_management = classification == "MANAGEMENT_UPDATE" or str(status).upper() in LIVE_POSITION_STATUSES
     pending_update_classification = str(decision.get("pending_update_classification") or "").strip().lower()
     if not is_management and pending_update_classification in {"refresh_pending_setup", "reprice_review_pending_setup"}:
@@ -1347,6 +1464,8 @@ class SchedulerConfig:
     state_guard_state_path: Path = DEFAULT_STATE_GUARD_STATE_PATH
     state_guard_max_age_minutes: int = 15
     scheduled_state_guard_duplicate_enforcement_enabled: bool = False
+    scheduled_state_guard_manual_override_enabled: bool = False
+    scheduled_state_guard_manual_override_reason: str = ""
 
     @classmethod
     def from_env(cls) -> "SchedulerConfig":
@@ -1382,6 +1501,13 @@ class SchedulerConfig:
                 "SCHEDULED_STATE_GUARD_DUPLICATE_ENFORCEMENT_ENABLED",
                 False,
             ),
+            scheduled_state_guard_manual_override_enabled=parse_bool_env(
+                "SCHEDULED_STATE_GUARD_MANUAL_OVERRIDE_ENABLED",
+                False,
+            ),
+            scheduled_state_guard_manual_override_reason=str(
+                os.getenv("SCHEDULED_STATE_GUARD_MANUAL_OVERRIDE_REASON", "")
+            ).strip(),
         )
 
 
@@ -2152,6 +2278,7 @@ async def generate_and_publish_signal(
     )
     state_guard_shadow = evaluate_state_guard_shadow(candidate, cfg)
     state_guard_runtime = state_guard_duplicate_runtime_action(state_guard_shadow, cfg)
+    state_guard_enforcement = build_state_guard_enforcement_decision(state_guard_shadow, candidate, cfg)
     day_diagnostics = day_bias_diagnostics(payload, candidate, gate={})
     if str(state_guard_shadow.get("state_guard_decision") or "").upper() == "OPPOSITE_BIAS_BEFORE_ENTRY":
         decision = {
@@ -2209,31 +2336,25 @@ async def generate_and_publish_signal(
             "aia_forward_warning": None,
             **state_guard_shadow,
             **state_guard_runtime,
+            **state_guard_enforcement,
             **day_diagnostics,
         }
-    if state_guard_runtime.get("scheduled_state_guard_duplicate_runtime_action") == "enforce_duplicate_suppression":
-        publication_type = str(
-            state_guard_shadow.get("state_guard_recommended_publication_type") or "active_signal_update"
-        ).strip().lower()
-        if publication_type not in {"active_signal_update", "management_update", "suppress_duplicate"}:
-            publication_type = "active_signal_update"
-        lineage = _state_guard_update_lineage(state_guard_shadow, candidate, publication_type)
+    if state_guard_enforcement.get("state_guard_runtime_blocked_full_signal"):
+        publication_type = str(state_guard_enforcement.get("publication_type") or "active_signal_update").strip().lower()
         decision = {
             "publication_type": publication_type,
-            "duplicate_signal_id": state_guard_shadow.get("state_guard_primary_signal_id"),
-            "duplicate_signal_status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
-            "replacement_reason": lineage.get("replacement_reason")
-            or state_guard_shadow.get("state_guard_reason")
-            or "state_guard_duplicate_active_scenario",
-            "duplicate_signal": {
-                "signal_id": state_guard_shadow.get("state_guard_primary_signal_id"),
-                "status": state_guard_shadow.get("state_guard_primary_lifecycle_state"),
-                "display_symbol": candidate.get("display_symbol"),
-                "direction": candidate.get("direction"),
-                "entry_price": state_guard_shadow.get("state_guard_primary_entry"),
-                "sl": state_guard_shadow.get("state_guard_primary_sl"),
-            },
-            **lineage,
+            "duplicate_signal_id": state_guard_enforcement.get("duplicate_signal_id"),
+            "duplicate_signal_status": state_guard_enforcement.get("duplicate_signal_status"),
+            "replacement_reason": state_guard_enforcement.get("replacement_reason"),
+            "duplicate_signal": state_guard_enforcement.get("duplicate_signal"),
+            "related_signal_id": state_guard_enforcement.get("related_signal_id"),
+            "refresh_of_signal_id": state_guard_enforcement.get("refresh_of_signal_id"),
+            "replaces_signal_id": state_guard_enforcement.get("replaces_signal_id"),
+            "previous_entry": state_guard_enforcement.get("previous_entry"),
+            "new_entry": state_guard_enforcement.get("new_entry"),
+            "previous_lifecycle_state": state_guard_enforcement.get("previous_lifecycle_state"),
+            "pending_update_classification": state_guard_enforcement.get("pending_update_classification"),
+            "entry_distance_pct": state_guard_enforcement.get("entry_distance_pct"),
         }
         for key in ("event_risk_level", "event_bias", "dominant_critical_topic", "critical_topics", "confirm_policy"):
             if gate_context.get(key) not in (None, "", [], {}):
@@ -2254,15 +2375,15 @@ async def generate_and_publish_signal(
             "duplicate_signal_id": decision["duplicate_signal_id"],
             "duplicate_signal_status": decision["duplicate_signal_status"],
             "replacement_reason": decision["replacement_reason"],
-            **lineage,
             **tp_validation,
             "aia_forward_attempted": False,
             "aia_forward_ok": False,
             "aia_forward_error": None,
-            "aia_forward_mode": "skipped_state_guard_duplicate",
+            "aia_forward_mode": "skipped_state_guard_enforcement",
             "aia_forward_warning": None,
             **state_guard_shadow,
             **state_guard_runtime,
+            **state_guard_enforcement,
             **day_diagnostics,
         }
     duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state(now_utc), now_utc=now_utc)
@@ -2300,6 +2421,7 @@ async def generate_and_publish_signal(
             **tp_validation,
             **state_guard_shadow,
             **state_guard_runtime,
+            **state_guard_enforcement,
             **day_diagnostics,
             **duplicate_result,
         }
@@ -2396,6 +2518,7 @@ async def generate_and_publish_signal(
         **tp_validation,
         **state_guard_shadow,
         **state_guard_runtime,
+        **state_guard_enforcement,
         **day_diagnostics,
         **duplicate_result,
     }

@@ -734,8 +734,8 @@ class TestScheduledSignalState(unittest.TestCase):
                 "state_guard_primary_signal_id": "20260627_183004",
                 "state_guard_primary_lifecycle_state": "TIMEOUT_LIVE",
                 "state_guard_reason": "same_trade_idea_already_live",
+                "state_guard_can_publish_full_signal": False,
             }
-            runtime = {"scheduled_state_guard_duplicate_runtime_action": "enforce_duplicate_suppression"}
             with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
                 "scheduled_runner.read_last_signal_payload", return_value=payload
             ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
@@ -745,14 +745,12 @@ class TestScheduledSignalState(unittest.TestCase):
             ), patch(
                 "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
             ), patch(
-                "scheduled_runner.state_guard_duplicate_runtime_action", return_value=runtime
-            ), patch(
                 "scheduled_runner.publish_plain_message", fake_publish_plain
             ):
                 result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False, gate=gate))
 
         self.assertEqual(result["publication_type"], "management_update")
-        self.assertEqual(result["aia_forward_mode"], "skipped_state_guard_duplicate")
+        self.assertEqual(result["aia_forward_mode"], "skipped_state_guard_enforcement")
         self.assertFalse(result["aia_forward_attempted"])
         self.assertIn("HEADLINE RISK UPDATE", messages[0])
         self.assertIn("strategic_shipping_energy_chokepoint", messages[0])
@@ -1003,6 +1001,217 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertTrue(action["scheduled_state_guard_duplicate_enforcement_enabled"])
         self.assertFalse(action["scheduled_state_guard_duplicate_runtime_eligible"])
         self.assertEqual(action["scheduled_state_guard_duplicate_runtime_action"], "none")
+
+    def test_state_guard_enforcement_blocks_full_signal_and_publishes_management_update(self) -> None:
+        import tg_bot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html = Path(tmpdir) / "signal_20260606_153001.html"
+            log = Path(tmpdir) / "signal_20260606_153001.log"
+            payload = {"symbol": "SOL/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+            messages = []
+
+            async def fake_publish_plain(_cfg, message, *, dry_run=False):
+                messages.append(message)
+                return [123]
+
+            async def should_not_publish(*args, **kwargs):
+                raise AssertionError("full_signal publish path must not be used")
+
+            c = cfg(Path(tmpdir))
+            guard = {
+                "state_guard_status": "ok",
+                "state_guard_decision": "MANAGEMENT_UPDATE",
+                "state_guard_recommended_publication_type": "MANAGEMENT_UPDATE",
+                "state_guard_primary_signal_id": "20260701_183003",
+                "state_guard_primary_lifecycle_state": "TP2_HIT_LIVE",
+                "state_guard_reason": "same_trade_idea_already_live",
+                "state_guard_can_publish_full_signal": False,
+                "state_guard_primary_entry": 76.8,
+                "state_guard_primary_sl": 76.03,
+            }
+            with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                "scheduled_runner.read_last_signal_payload", return_value=payload
+            ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
+                tg_bot, "html_file_to_tg_text", return_value=["signal text"]
+            ), patch.object(
+                tg_bot, "_infer_signal_id", return_value="20260606_153001"
+            ), patch(
+                "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
+            ), patch(
+                "scheduled_runner.publish_plain_message", fake_publish_plain
+            ), patch.object(
+                tg_bot, "_publish_signal_result", should_not_publish
+            ):
+                result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
+
+            self.assertTrue(result["published"])
+            self.assertEqual(result["publication_type"], "management_update")
+            self.assertEqual(result["scheduled_state_guard_enforcement_action"], "enforce_non_full_signal")
+            self.assertFalse(result["state_guard_manual_override_used"])
+            self.assertIn("Новый сигнал не публикуем", messages[0])
+
+    def test_state_guard_enforcement_suppress_duplicate_never_emits_full_signal(self) -> None:
+        import tg_bot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html = Path(tmpdir) / "signal_20260606_153001.html"
+            log = Path(tmpdir) / "signal_20260606_153001.log"
+            payload = {"symbol": "SOL/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+            messages = []
+
+            async def fake_publish_plain(_cfg, message, *, dry_run=False):
+                messages.append(message)
+                return [123]
+
+            async def should_not_publish(*args, **kwargs):
+                raise AssertionError("full_signal publish path must not be used")
+
+            c = cfg(Path(tmpdir))
+            guard = {
+                "state_guard_status": "ok",
+                "state_guard_decision": "SUPPRESS_DUPLICATE",
+                "state_guard_recommended_publication_type": "SUPPRESS_DUPLICATE",
+                "state_guard_primary_signal_id": "20260701_183003",
+                "state_guard_primary_lifecycle_state": "TERMINAL",
+                "state_guard_reason": "reentry_requires_fresh_reset",
+                "state_guard_can_publish_full_signal": False,
+            }
+            with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                "scheduled_runner.read_last_signal_payload", return_value=payload
+            ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
+                tg_bot, "html_file_to_tg_text", return_value=["signal text"]
+            ), patch.object(
+                tg_bot, "_infer_signal_id", return_value="20260606_153001"
+            ), patch(
+                "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
+            ), patch(
+                "scheduled_runner.publish_plain_message", fake_publish_plain
+            ), patch.object(
+                tg_bot, "_publish_signal_result", should_not_publish
+            ):
+                result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
+
+            self.assertEqual(result["publication_type"], "suppress_duplicate")
+            self.assertEqual(result["scheduled_state_guard_enforcement_action"], "enforce_non_full_signal")
+            self.assertIn("SUPPRESS_DUPLICATE", messages[0])
+            self.assertIn("Новый full_signal не публикуем", messages[0])
+
+    def test_state_guard_enforcement_reentry_not_allowed_prevents_reentry_signal(self) -> None:
+        enforcement = sr.build_state_guard_enforcement_decision(
+            {
+                "state_guard_status": "ok",
+                "state_guard_can_publish_full_signal": False,
+                "state_guard_decision": "RE_ENTRY_SIGNAL",
+                "state_guard_recommended_publication_type": "RE_ENTRY_SIGNAL",
+                "state_guard_reentry_allowed": False,
+                "state_guard_primary_signal_id": "20260701_183003",
+                "state_guard_primary_lifecycle_state": "TERMINAL",
+                "state_guard_reason": "reentry_requires_fresh_reset",
+            },
+            self._candidate(signal_id="20260702_213003"),
+            cfg(),
+        )
+
+        self.assertTrue(enforcement["state_guard_runtime_blocked_full_signal"])
+        self.assertEqual(enforcement["publication_type"], "suppress_duplicate")
+
+    def test_runner_management_rendering_used_for_active_runner(self) -> None:
+        message = sr.render_duplicate_update_message(
+            {
+                "publication_type": "runner_management_update",
+                "duplicate_signal_id": "20260701_183003",
+                "duplicate_signal_status": "RUNNER_ACTIVE",
+                "duplicate_signal": {
+                    "signal_id": "20260701_183003",
+                    "status": "RUNNER_ACTIVE",
+                    "display_symbol": "SOL/USDT",
+                    "direction": "long",
+                },
+            },
+            {"display_symbol": "SOL/USDT", "direction": "long"},
+        )
+
+        self.assertIn("RUNNER MANAGEMENT UPDATE", message)
+        self.assertIn("existing runner / add-on review only", message)
+
+    def test_active_setup_rendering_used_for_setup_armed(self) -> None:
+        message = sr.render_duplicate_update_message(
+            {
+                "publication_type": "active_signal_update",
+                "duplicate_signal_id": "20260701_163003",
+                "duplicate_signal_status": "SETUP_ARMED",
+                "duplicate_signal": {
+                    "signal_id": "20260701_163003",
+                    "status": "SETUP_ARMED",
+                    "display_symbol": "SOL/USDT",
+                    "direction": "long",
+                    "entry_price": 76.04,
+                },
+                "pending_update_classification": "refresh_pending_setup",
+                "previous_entry": 76.04,
+                "new_entry": 76.8,
+            },
+            {"display_symbol": "SOL/USDT", "direction": "long", "entry_price": 76.8},
+        )
+
+        self.assertIn("ACTIVE SETUP UPDATE", message)
+        self.assertIn("Это не новый независимый вход", message)
+
+    def test_manual_override_allows_full_signal_only_with_explicit_flag_and_reason(self) -> None:
+        import tg_bot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html = Path(tmpdir) / "signal_20260606_153001.html"
+            log = Path(tmpdir) / "signal_20260606_153001.log"
+            payload = {"symbol": "SOL/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+            publish_calls = []
+
+            async def fake_publish(*args, **kwargs):
+                publish_calls.append(kwargs)
+                return True
+
+            c = cfg(Path(tmpdir))
+            c.scheduled_state_guard_manual_override_enabled = True
+            c.scheduled_state_guard_manual_override_reason = "manual forensic override"
+            guard = {
+                "state_guard_status": "ok",
+                "state_guard_decision": "SUPPRESS_DUPLICATE",
+                "state_guard_recommended_publication_type": "SUPPRESS_DUPLICATE",
+                "state_guard_primary_signal_id": "20260701_183003",
+                "state_guard_primary_lifecycle_state": "SETUP_ARMED",
+                "state_guard_reason": "manual_release",
+                "state_guard_can_publish_full_signal": False,
+            }
+            with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
+                "scheduled_runner.read_last_signal_payload", return_value=payload
+            ), patch(
+                "scheduled_runner.load_in_work_signal_state", return_value=[]
+            ), patch(
+                "scheduled_runner.make_context", return_value=SimpleNamespace(bot=SimpleNamespace(sent=[]))
+            ), patch(
+                "scheduled_runner.asyncio.to_thread", self._inline_to_thread
+            ), patch.object(tg_bot, "_resolve_signal_run_artifacts", return_value=(html, log)), patch.object(
+                tg_bot, "html_file_to_tg_text", return_value=["signal text"]
+            ), patch.object(
+                tg_bot, "_infer_signal_id", return_value="20260606_153001"
+            ), patch.object(
+                tg_bot, "_publish_signal_result", fake_publish
+            ), patch.object(
+                tg_bot, "_build_signal_json_v1", return_value={"signal_id": "20260606_153001"}
+            ), patch.object(
+                tg_bot, "send_signal_to_aia", return_value=True
+            ), patch(
+                "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
+            ):
+                result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
+
+            self.assertTrue(result["published"])
+            self.assertEqual(result["publication_type"], "full_signal")
+            self.assertTrue(result["state_guard_manual_override_used"])
+            self.assertEqual(result["scheduled_state_guard_enforcement_action"], "manual_override_allow_full_signal")
+            self.assertEqual(result["state_guard_manual_override_reason"], "manual forensic override")
+            self.assertEqual(len(publish_calls), 1)
 
     def test_state_guard_shadow_logs_reentry_diagnostics(self) -> None:
         result = {
