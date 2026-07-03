@@ -1320,6 +1320,44 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
         )
     classification = str(decision.get("publication_type") or "").strip().upper()
     if classification == "SUPPRESS_DUPLICATE":
+        state_guard_reason = str(
+            decision.get("state_guard_reentry_reason")
+            or decision.get("state_guard_reason")
+            or decision.get("reason")
+            or ""
+        ).strip()
+        if str(status).upper() == "TERMINAL":
+            reason_map = {
+                "missing_fresh_pullback_or_reset": "fresh pullback/reset ещё не сформирован",
+                "cooldown_active": "ещё действует cooldown после завершённого сценария",
+                "headline_risk_active": "headline risk сейчас не допускает re-entry",
+                "missing_fresh_confirmation": "нет fresh confirmation/reprice для повторного входа",
+                "missing_fresh_setup": "нет fresh setup для повторного входа",
+            }
+            reason_line = reason_map.get(state_guard_reason, state_guard_reason.replace("_", " ")) if state_guard_reason else ""
+            title = (
+                "🔄 TERMINAL / COOLDOWN SUPPRESS_DUPLICATE"
+                if "cooldown" in state_guard_reason.lower()
+                else "🔄 TERMINAL / RE-ENTRY BLOCKED"
+            )
+            lines = [
+                title,
+                "",
+                f"Предыдущий {symbol} {side} уже завершён.",
+                f"Последний связанный сигнал: {old_id} от {_msk_label_from_signal_id(old_id)}.",
+                f"Статус AIA: {status}.",
+                "",
+                f"Новый scheduled scan снова выбрал {symbol} {side}, но re-entry сейчас не разрешён.",
+            ]
+            if reason_line:
+                lines.append(f"Причина: {reason_line}.")
+            lines.extend(
+                [
+                    "Новый full_signal не публикуем.",
+                    "Для повторного входа нужен fresh setup + reprice/reconfirm.",
+                ]
+            )
+            return "\n".join(lines)
         return (
             "🔄 MANAGEMENT_UPDATE / SUPPRESS_DUPLICATE\n\n"
             f"{symbol} {side} уже имеет активный/связанный сценарий.\n"

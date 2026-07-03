@@ -1094,8 +1094,32 @@ class TestScheduledSignalState(unittest.TestCase):
 
             self.assertEqual(result["publication_type"], "suppress_duplicate")
             self.assertEqual(result["scheduled_state_guard_enforcement_action"], "enforce_non_full_signal")
-            self.assertIn("SUPPRESS_DUPLICATE", messages[0])
+            self.assertIn("RE-ENTRY BLOCKED", messages[0])
             self.assertIn("Новый full_signal не публикуем", messages[0])
+
+    def test_terminal_suppress_duplicate_uses_reentry_blocked_wording(self) -> None:
+        message = sr.render_duplicate_update_message(
+            {
+                "publication_type": "suppress_duplicate",
+                "duplicate_signal_id": "20260703_013003",
+                "duplicate_signal_status": "TERMINAL",
+                "state_guard_reason": "reentry_requires_fresh_reset",
+                "state_guard_reentry_reason": "missing_fresh_pullback_or_reset",
+                "duplicate_signal": {
+                    "signal_id": "20260703_013003",
+                    "status": "TERMINAL",
+                    "display_symbol": "ETH/USDT",
+                    "direction": "long",
+                },
+            },
+            {"display_symbol": "ETH/USDT", "direction": "long"},
+        )
+
+        self.assertIn("TERMINAL / RE-ENTRY BLOCKED", message)
+        self.assertIn("Последний связанный сигнал", message)
+        self.assertNotIn("активный/связанный сценарий", message)
+        self.assertNotIn("Активный сигнал", message)
+        self.assertIn("fresh pullback/reset", message)
 
     def test_state_guard_enforcement_reentry_not_allowed_prevents_reentry_signal(self) -> None:
         enforcement = sr.build_state_guard_enforcement_decision(
@@ -1279,12 +1303,23 @@ class TestScheduledSignalState(unittest.TestCase):
             publish_kwargs = []
             built_kwargs = []
             sent_payloads = []
+            plain_messages = []
 
             async def fake_publish(*args, **kwargs):
                 publish_kwargs.append(kwargs)
                 return True
 
+            async def fake_publish_plain(_cfg, message, *, dry_run=False):
+                plain_messages.append(message)
+                return [123]
+
             c = cfg(Path(tmpdir))
+            guard = {
+                "state_guard_status": "ok",
+                "state_guard_decision": "ALLOW_FULL_SIGNAL",
+                "state_guard_can_publish_full_signal": True,
+                "state_guard_recommended_publication_type": "FULL_SIGNAL",
+            }
             with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
                 "scheduled_runner.read_last_signal_payload",
                 return_value=payload,
@@ -1304,6 +1339,10 @@ class TestScheduledSignalState(unittest.TestCase):
                 tg_bot, "send_signal_to_aia", side_effect=lambda body: sent_payloads.append(body) or True
             ), patch(
                 "scheduled_runner.load_in_work_signal_state", return_value=[]
+            ), patch(
+                "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
+            ), patch(
+                "scheduled_runner.publish_plain_message", fake_publish_plain
             ):
                 result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
 
@@ -1323,11 +1362,22 @@ class TestScheduledSignalState(unittest.TestCase):
             html = Path(tmpdir) / "signal_20260606_153001.html"
             log = Path(tmpdir) / "signal_20260606_153001.log"
             payload = {"symbol": "BTC/USDT", "direction": "long", "entry_range": [100.0, 101.0], "sl": 99.0, "tp1": 102.0, "tp2": 103.0}
+            plain_messages = []
 
             async def fake_publish(*args, **kwargs):
                 return True
 
+            async def fake_publish_plain(_cfg, message, *, dry_run=False):
+                plain_messages.append(message)
+                return [123]
+
             c = cfg(Path(tmpdir))
+            guard = {
+                "state_guard_status": "ok",
+                "state_guard_decision": "ALLOW_FULL_SIGNAL",
+                "state_guard_can_publish_full_signal": True,
+                "state_guard_recommended_publication_type": "FULL_SIGNAL",
+            }
             with patch("scheduled_runner.run_command", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")), patch(
                 "scheduled_runner.read_last_signal_payload",
                 return_value=payload,
@@ -1347,6 +1397,10 @@ class TestScheduledSignalState(unittest.TestCase):
                 tg_bot, "send_signal_to_aia", side_effect=RuntimeError("aia down")
             ), patch(
                 "scheduled_runner.load_in_work_signal_state", return_value=[]
+            ), patch(
+                "scheduled_runner.evaluate_state_guard_shadow", return_value=guard
+            ), patch(
+                "scheduled_runner.publish_plain_message", fake_publish_plain
             ):
                 result = asyncio.run(sr.generate_and_publish_signal("aggressive", c, dry_run=False))
 
