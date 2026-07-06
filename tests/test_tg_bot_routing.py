@@ -810,6 +810,7 @@ class TestTgBotRouting(unittest.TestCase):
         self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: None
         self.tg_bot._queue_aia_no_trade_forward = lambda payload, **kwargs: None
         self.tg_bot._send_personal = lambda *args, **kwargs: True
+        self.tg_bot._should_evaluate_manual_state_guard = lambda *args, **kwargs: False
 
         asyncio.run(
             self.tg_bot._run_symbol_core(
@@ -853,6 +854,7 @@ class TestTgBotRouting(unittest.TestCase):
         self.tg_bot._queue_aia_signal_forward = lambda payload, **kwargs: None
         self.tg_bot._queue_aia_no_trade_forward = lambda payload, **kwargs: None
         self.tg_bot._send_personal = lambda *args, **kwargs: True
+        self.tg_bot._should_evaluate_manual_state_guard = lambda *args, **kwargs: False
 
         asyncio.run(
             self.tg_bot._run_symbol_core(

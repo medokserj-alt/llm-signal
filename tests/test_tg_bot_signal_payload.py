@@ -159,6 +159,43 @@ class TestTgBotSignalPayload(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out["tp"], {"tp1": 63317.0, "tp2": 62678.0, "tp3": 62356.5})
 
+    def test_build_signal_json_includes_sl_horizon_policy_metadata(self) -> None:
+        tg_bot = _load_tg_bot_module()
+        tg_bot._AIA_UID_CONTEXT = None
+        tg_bot._read_last_signal_json = lambda: {
+            "symbol": "BTC/USDT",
+            "direction": "long",
+            "entry_range": [62954.09, 62954.09],
+            "sl": 62324.55,
+            "tp1": 63600.0,
+            "tp2": 64200.0,
+            "mode": "neutral",
+            "entry_mode": "wait_confirm",
+            "entry_price_neutral": 62954.09,
+            "sl_by_mode": {"neutral": 62324.55},
+            "sl_policy_by_mode": {
+                "neutral": {
+                    "sl_policy_applied": True,
+                    "sl_policy_mode": "neutral",
+                    "original_sl": 62550.61,
+                    "adjusted_sl": 62324.55,
+                    "sl_distance_pct": 0.01,
+                    "min_sl_distance_pct": 0.01,
+                    "sl_policy_reason": "horizon_policy_min_sl_floor:neutral",
+                }
+            },
+        }
+
+        out = tg_bot._build_signal_json_v1(
+            signal_id="20260704_223002",
+            published_at="2026-07-04T19:30:02Z",
+            channel_id="-1001234567890",
+        )
+
+        self.assertIsNotNone(out)
+        self.assertEqual(out["meta"]["sl_policy"]["sl_policy_mode"], "neutral")
+        self.assertTrue(out["meta"]["sl_policy"]["sl_policy_applied"])
+
     def test_build_signal_json_prefers_official_tp_over_shifted_mode_tvh(self) -> None:
         tg_bot = _load_tg_bot_module()
         tg_bot._AIA_UID_CONTEXT = None

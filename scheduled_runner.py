@@ -146,6 +146,10 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_reentry_signal",
     "state_guard_reentry_allowed",
     "state_guard_reentry_reason",
+    "state_guard_reentry_terminal_ttl_expired",
+    "state_guard_reentry_allowed_by_time_sanity",
+    "state_guard_reentry_terminal_elapsed_hours",
+    "state_guard_reentry_terminal_ttl_hours",
     "state_guard_entry_blocked",
     "state_guard_entry_blocked_reason",
     "state_guard_old_signal_id",
@@ -1333,6 +1337,7 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
                 "headline_risk_active": "headline risk сейчас не допускает re-entry",
                 "missing_fresh_confirmation": "нет fresh confirmation/reprice для повторного входа",
                 "missing_fresh_setup": "нет fresh setup для повторного входа",
+                "terminal_ttl_expired_time_sanity_unlock": "time-sanity TTL истёк; stale terminal больше не блокирует сам по себе",
             }
             reason_line = reason_map.get(state_guard_reason, state_guard_reason.replace("_", " ")) if state_guard_reason else ""
             title = (
@@ -1351,6 +1356,12 @@ def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
             ]
             if reason_line:
                 lines.append(f"Причина: {reason_line}.")
+            elapsed_hours = decision.get("state_guard_reentry_terminal_elapsed_hours")
+            ttl_hours = decision.get("state_guard_reentry_terminal_ttl_hours")
+            if state_guard_reason == "missing_fresh_pullback_or_reset" and elapsed_hours is not None and ttl_hours is not None:
+                lines.append(
+                    f"Re-entry заблокирован: fresh reset/pullback не найден, прошло {elapsed_hours:g} из {ttl_hours:g} часов."
+                )
             lines.extend(
                 [
                     "Новый full_signal не публикуем.",
@@ -1700,6 +1711,10 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             "state_guard_reentry_signal": evaluation.get("reentry_signal"),
             "state_guard_reentry_allowed": evaluation.get("reentry_allowed"),
             "state_guard_reentry_reason": evaluation.get("reentry_reason"),
+            "state_guard_reentry_terminal_ttl_expired": evaluation.get("reentry_terminal_ttl_expired"),
+            "state_guard_reentry_allowed_by_time_sanity": evaluation.get("reentry_allowed_by_time_sanity"),
+            "state_guard_reentry_terminal_elapsed_hours": evaluation.get("reentry_terminal_elapsed_hours"),
+            "state_guard_reentry_terminal_ttl_hours": evaluation.get("reentry_terminal_ttl_hours"),
             "state_guard_entry_blocked": evaluation.get("entry_blocked"),
             "state_guard_entry_blocked_reason": evaluation.get("entry_blocked_reason"),
             "state_guard_old_signal_id": evaluation.get("old_signal_id"),
@@ -1853,6 +1868,10 @@ def state_guard_shadow_log_row(
         "reentry_signal": result.get("state_guard_reentry_signal"),
         "reentry_allowed": result.get("state_guard_reentry_allowed"),
         "reentry_reason": result.get("state_guard_reentry_reason"),
+        "reentry_terminal_ttl_expired": result.get("state_guard_reentry_terminal_ttl_expired"),
+        "reentry_allowed_by_time_sanity": result.get("state_guard_reentry_allowed_by_time_sanity"),
+        "reentry_terminal_elapsed_hours": result.get("state_guard_reentry_terminal_elapsed_hours"),
+        "reentry_terminal_ttl_hours": result.get("state_guard_reentry_terminal_ttl_hours"),
         "entry_blocked": result.get("state_guard_entry_blocked"),
         "entry_blocked_reason": result.get("state_guard_entry_blocked_reason"),
         "old_signal_id": result.get("state_guard_old_signal_id"),
@@ -2107,19 +2126,19 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
             aia_avoid_soft_allowed = True
             reason = "avoid_without_hard_block_keep_default_mode"
         if preferred_mode_downgrade_enabled and preferred_mode in {"neutral", "conservative"} and cfg.signal_default_mode == "aggressive":
-            selected_mode = "neutral"
+            selected_mode = preferred_mode
             selected_mode_source = "aia_preferred_mode_soft_downgrade"
             preferred_mode_ignored_reason = ""
             soft_avoid_downgrade = True
             reason = "avoid_without_hard_block_downgrade_preferred_mode"
     elif preferred_mode in {"neutral", "conservative"} and cfg.signal_default_mode == "aggressive":
-        selected_mode = "neutral"
+        selected_mode = preferred_mode
         selected_mode_source = "aia_preferred_mode"
 
     return {
         "allowed": not hard_block_reasons,
         "reason": reason if not hard_block_reasons else ",".join(hard_block_reasons),
-        "selected_mode": selected_mode if selected_mode in {"aggressive", "neutral"} else "aggressive",
+        "selected_mode": selected_mode if selected_mode in {"aggressive", "neutral", "conservative"} else "aggressive",
         "selected_mode_source": selected_mode_source,
         "preferred_mode_downgrade_enabled": preferred_mode_downgrade_enabled,
         "preferred_mode_ignored_reason": preferred_mode_ignored_reason,
@@ -2128,6 +2147,10 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         "hard_block_reasons": hard_block_reasons,
         "aia_status": status,
         "preferred_mode": preferred_mode if preferred_mode in {"aggressive", "neutral", "conservative"} else "unknown",
+        "conservative_candidate": preferred_mode == "conservative",
+        "conservative_reason": selected_mode_source if preferred_mode == "conservative" else "",
+        "conservative_quality_score": ctx.get("conservative_quality_score"),
+        "higher_timeframe_alignment": ctx.get("higher_timeframe_alignment"),
         "focus_asset": asset,
         "focus_direction": direction,
         "flow_bias": _norm(ctx.get("flow_bias"), "unknown").lower(),

@@ -160,7 +160,7 @@ class TestAiaGate(unittest.TestCase):
         self.assertTrue(out["aia_avoid_soft_allowed"])
         self.assertTrue(out["preferred_mode_downgrade_enabled"])
         self.assertTrue(out["soft_avoid_downgrade"])
-        self.assertEqual(out["selected_mode"], "neutral")
+        self.assertEqual(out["selected_mode"], "conservative")
         self.assertEqual(out["selected_mode_source"], "aia_preferred_mode_soft_downgrade")
         self.assertEqual(out["preferred_mode_ignored_reason"], "")
 
@@ -174,7 +174,7 @@ class TestAiaGate(unittest.TestCase):
         self.assertTrue(out["allowed"])
         self.assertTrue(out["preferred_mode_downgrade_enabled"])
         self.assertTrue(out["soft_avoid_downgrade"])
-        self.assertEqual(out["selected_mode"], "neutral")
+        self.assertEqual(out["selected_mode"], "conservative")
         self.assertEqual(out["selected_mode_source"], "aia_preferred_mode_soft_downgrade")
 
     def test_soft_avoid_with_hard_reasons_blocks(self) -> None:
@@ -1120,6 +1120,28 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertNotIn("активный/связанный сценарий", message)
         self.assertNotIn("Активный сигнал", message)
         self.assertIn("fresh pullback/reset", message)
+
+    def test_terminal_suppress_duplicate_includes_reentry_ttl_progress(self) -> None:
+        message = sr.render_duplicate_update_message(
+            {
+                "publication_type": "suppress_duplicate",
+                "duplicate_signal_id": "20260704_104718",
+                "duplicate_signal_status": "TERMINAL",
+                "state_guard_reentry_reason": "missing_fresh_pullback_or_reset",
+                "state_guard_reentry_terminal_elapsed_hours": 12,
+                "state_guard_reentry_terminal_ttl_hours": 24,
+                "duplicate_signal": {
+                    "signal_id": "20260704_104718",
+                    "status": "TERMINAL",
+                    "display_symbol": "ETH/USDT",
+                    "direction": "long",
+                },
+            },
+            {"display_symbol": "ETH/USDT", "direction": "long"},
+        )
+
+        self.assertIn("Re-entry заблокирован", message)
+        self.assertIn("12 из 24 часов", message)
 
     def test_state_guard_enforcement_reentry_not_allowed_prevents_reentry_signal(self) -> None:
         enforcement = sr.build_state_guard_enforcement_decision(

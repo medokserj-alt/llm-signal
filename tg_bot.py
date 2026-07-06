@@ -2050,6 +2050,12 @@ def _build_signal_json_v1(
             out[key] = copy.deepcopy(value)
     if meta is not None:
         out["meta"] = meta
+        sl_policy_by_mode = d.get("sl_policy_by_mode") if isinstance(d.get("sl_policy_by_mode"), dict) else {}
+        sl_policy_meta = sl_policy_by_mode.get(mode) if isinstance(sl_policy_by_mode.get(mode), dict) else {}
+        if sl_policy_meta:
+            out["meta"]["sl_policy"] = copy.deepcopy(sl_policy_meta)
+            if sl_policy_meta.get("sl_policy_applied") is True:
+                out["meta"]["sl_policy_note"] = f"SL expanded by horizon policy for mode {mode}."
         if meta.get("entry_type") == "wait_confirm":
             max_wait_minutes = _extract_max_wait_minutes(d, default=180)
             out["meta"]["max_wait_minutes"] = int(max_wait_minutes)

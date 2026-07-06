@@ -77,6 +77,20 @@ NEUTRAL_NEAR_TICKS = 20
 # TP1 must provide at least 1% clean movement from the selected entry anchor.
 TP1_MIN_NET_MOVE_PCT = 0.01
 
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    try:
+        value = float(str(raw).strip()) if raw is not None and str(raw).strip() else float(default)
+    except Exception:
+        value = float(default)
+    return value if math.isfinite(value) and value > 0 else float(default)
+
+
+AGGRESSIVE_MIN_SL_PCT = _env_float("AGGRESSIVE_MIN_SL_PCT", 0.006)
+NEUTRAL_MIN_SL_PCT = _env_float("NEUTRAL_MIN_SL_PCT", 0.01)
+CONSERVATIVE_MIN_SL_PCT = _env_float("CONSERVATIVE_MIN_SL_PCT", 0.015)
+
 # ---- Flush gate (neutral must not knife-catch) ----
 # "Flush" is defined relative to ATR(14) on M15 candles.
 # X: two consecutive candles body >= X * ATR(14)
@@ -258,6 +272,58 @@ def _sanitize_signal_invalidation_wording(d: dict) -> None:
                 d[field] = value
         elif isinstance(value, str):
             d[field] = _sanitize_invalidation_text(value, side=side)
+
+
+def _min_sl_distance_pct_for_mode(mode: str | None) -> float:
+    mode_key = normalize_mode(mode)
+    if mode_key == "conservative":
+        return CONSERVATIVE_MIN_SL_PCT
+    if mode_key == "neutral":
+        return NEUTRAL_MIN_SL_PCT
+    return AGGRESSIVE_MIN_SL_PCT
+
+
+def _apply_mode_sl_policy(
+    d: dict,
+    *,
+    mode: str,
+    entry: float,
+    sl: float,
+    is_long: bool,
+    symbol,
+) -> tuple[float, dict[str, object]]:
+    min_sl_distance_pct = _min_sl_distance_pct_for_mode(mode)
+    floor_sl = entry * (1.0 - min_sl_distance_pct) if is_long else entry * (1.0 + min_sl_distance_pct)
+    original_sl = float(sl)
+    adjusted_sl = float(sl)
+    policy_applied = False
+    reason = "structure_sl_preserved"
+
+    if is_long:
+        if adjusted_sl > floor_sl:
+            adjusted_sl = floor_sl
+            policy_applied = True
+            reason = f"horizon_policy_min_sl_floor:{mode}"
+    else:
+        if adjusted_sl < floor_sl:
+            adjusted_sl = floor_sl
+            policy_applied = True
+            reason = f"horizon_policy_min_sl_floor:{mode}"
+
+    rounded_sl = _round_price(adjusted_sl, symbol=symbol)
+    adjusted_sl = float(rounded_sl if rounded_sl is not None else adjusted_sl)
+    risk = abs(entry - adjusted_sl)
+    sl_distance_pct = (risk / abs(entry)) if entry not in (0, 0.0) else None
+    metadata: dict[str, object] = {
+        "sl_policy_applied": policy_applied,
+        "sl_policy_mode": mode,
+        "original_sl": original_sl,
+        "adjusted_sl": adjusted_sl,
+        "sl_distance_pct": float(sl_distance_pct) if sl_distance_pct is not None else None,
+        "min_sl_distance_pct": float(min_sl_distance_pct),
+        "sl_policy_reason": reason,
+    }
+    return adjusted_sl, metadata
 
 
 def _rewrite_signal_horizon_wording(text, *, horizon_label: str, mode: str) -> str:
@@ -5744,6 +5810,7 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
     rr_ok_for_active_mode = True
 
     sl_by_mode: dict[str, float] = {}
+    sl_policy_by_mode: dict[str, dict[str, object]] = {}
     tp_by_mode: dict[str, dict] = {}
     rr_by_mode: dict[str, float] = {}
 
@@ -5761,9 +5828,16 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
                 sl_val = entry * (0.985 if mode == "conservative" else 0.99)
             else:
                 sl_val = entry * (1.015 if mode == "conservative" else 1.01)
-        rounded_sl = _round_price(sl_val, symbol=symbol)
-        sl_val = float(rounded_sl if rounded_sl is not None else sl_val)
+        sl_val, sl_policy_meta = _apply_mode_sl_policy(
+            d,
+            mode=mode,
+            entry=float(entry),
+            sl=float(sl_val),
+            is_long=is_long,
+            symbol=symbol,
+        )
         sl_by_mode[mode] = sl_val
+        sl_policy_by_mode[mode] = sl_policy_meta
 
         bucket_in = tp_in.get(mode)
         bucket_in = bucket_in if isinstance(bucket_in, dict) else {}
@@ -5945,6 +6019,7 @@ def validate_or_fallback_tvh_by_mode(d: dict) -> dict:
         rr_by_mode.setdefault(m, 0.0)
 
     d["sl_by_mode"] = sl_by_mode
+    d["sl_policy_by_mode"] = sl_policy_by_mode
     d["tp_by_mode"] = tp_by_mode
     d["rr_by_mode"] = rr_by_mode
     d["exit_plan_by_mode"] = exit_plan_by_mode
@@ -6281,6 +6356,19 @@ def _sync_top_level_trade_levels_for_mode(d: dict) -> None:
         if sl_val is not None and sl_val:
             rounded = _round_price(sl_val, symbol=symbol)
             d["sl"] = float(rounded if rounded is not None else sl_val)
+        sl_policy_by_mode = d.get("sl_policy_by_mode") if isinstance(d.get("sl_policy_by_mode"), dict) else {}
+        sl_policy_meta = sl_policy_by_mode.get(final_mode) if isinstance(sl_policy_by_mode.get(final_mode), dict) else {}
+        if sl_policy_meta:
+            d["sl_policy_applied"] = bool(sl_policy_meta.get("sl_policy_applied"))
+            d["sl_policy_mode"] = sl_policy_meta.get("sl_policy_mode")
+            d["original_sl"] = sl_policy_meta.get("original_sl")
+            d["adjusted_sl"] = sl_policy_meta.get("adjusted_sl")
+            d["sl_distance_pct"] = sl_policy_meta.get("sl_distance_pct")
+            d["min_sl_distance_pct"] = sl_policy_meta.get("min_sl_distance_pct")
+            d["sl_policy_reason"] = sl_policy_meta.get("sl_policy_reason")
+            if bool(sl_policy_meta.get("sl_policy_applied")):
+                d.setdefault("warnings", [])
+                _append_unique_str(d, "warnings", f"sl_horizon_policy_adjusted:{final_mode}")
 
         tp_by_mode = d.get("tp_by_mode") if isinstance(d.get("tp_by_mode"), dict) else {}
         tp_bucket = tp_by_mode.get(final_mode) if isinstance(tp_by_mode.get(final_mode), dict) else {}

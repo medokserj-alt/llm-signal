@@ -780,6 +780,10 @@ def main():
 
             lines.append(entry_line)
             lines.append(f"SL: {format_price(symbol if isinstance(symbol, str) else None, sl_val)}")
+            sl_policy_by_mode = data.get("sl_policy_by_mode") if isinstance(data.get("sl_policy_by_mode"), dict) else {}
+            sl_policy_meta = sl_policy_by_mode.get(mode) if isinstance(sl_policy_by_mode.get(mode), dict) else {}
+            if sl_policy_meta.get("sl_policy_applied") is True:
+                lines.append(f"SL расширен по horizon-policy режима {mode}.")
             if mode == "aggressive":
                 lines.append(f"Горизонт: {_holding_horizon_label(data)}")
                 lines.append(f"TP1: {format_price(symbol if isinstance(symbol, str) else None, tp1_val)}")
