@@ -230,6 +230,32 @@ class TestAiaGate(unittest.TestCase):
         self.assertFalse(blocked["allowed"])
         self.assertTrue(allowed["allowed"])
 
+    def test_day_bias_conflict_requires_explicit_regime_flip_reason(self) -> None:
+        blocked = sr.evaluate_aia_gate(
+            {
+                "status": "OPEN",
+                "day_bias": "long",
+                "focus_asset": "BTC",
+                "focus_direction": "short",
+            },
+            cfg(),
+        )
+        allowed = sr.evaluate_aia_gate(
+            {
+                "status": "OPEN",
+                "day_bias": "long",
+                "focus_asset": "BTC",
+                "focus_direction": "short",
+                "regime_flip_reason": "h1_ema_loss_and_risk_off_shift",
+            },
+            cfg(),
+        )
+
+        self.assertFalse(blocked["allowed"])
+        self.assertIn("counter_day_bias_without_regime_flip", blocked["hard_block_reasons"])
+        self.assertTrue(allowed["allowed"])
+        self.assertEqual(allowed["reason"], "allowed")
+
 
 class TestScheduledSignalState(unittest.TestCase):
     async def _inline_to_thread(self, func, *args, **kwargs):
@@ -912,6 +938,35 @@ class TestScheduledSignalState(unittest.TestCase):
             self.assertEqual(guard["state_guard_status"], "ok")
             self.assertEqual(guard["state_guard_decision"], "ALLOW_FULL_SIGNAL")
             self.assertTrue(guard["state_guard_can_publish_full_signal"])
+
+    def test_state_guard_enforcement_uses_active_direction_for_management_updates(self) -> None:
+        c = cfg()
+        guard = {
+            "state_guard_status": "ok",
+            "state_guard_decision": "MANAGEMENT_UPDATE",
+            "state_guard_recommended_publication_type": "MANAGEMENT_UPDATE",
+            "state_guard_primary_signal_id": "20260707_123004",
+            "state_guard_primary_lifecycle_state": "ENTRY_LIVE",
+            "state_guard_primary_position_status": "OPEN",
+            "state_guard_primary_direction": "short",
+            "state_guard_primary_entry": 610.0,
+            "state_guard_primary_sl": 620.0,
+            "state_guard_can_publish_full_signal": False,
+            "state_guard_reason": "same_trade_idea_already_live",
+        }
+        candidate = self._candidate(
+            symbol="BTC/USDT",
+            display_symbol="BTC/USDT",
+            direction="long",
+            signal_id="20260708_103000",
+        )
+
+        enforcement = sr.build_state_guard_enforcement_decision(guard, candidate, c)
+        message = sr.render_duplicate_update_message(enforcement, candidate)
+
+        self.assertEqual(enforcement["duplicate_signal"]["direction"], "short")
+        self.assertIn("BTC/USDT SHORT уже в работе", message)
+        self.assertNotIn("BTC/USDT LONG уже в работе", message)
 
     def test_state_guard_duplicate_runtime_enforcement_disabled_logs_shadow_only(self) -> None:
         c = cfg()

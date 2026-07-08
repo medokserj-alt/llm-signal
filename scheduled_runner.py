@@ -118,12 +118,15 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_shadow_enabled",
     "state_guard_status",
     "state_guard_decision",
+    "state_guard_decision_reason",
     "state_guard_can_publish_full_signal",
     "state_guard_recommended_publication_type",
     "state_guard_reason",
     "state_guard_primary_signal_id",
     "state_guard_primary_lifecycle_state",
     "state_guard_primary_position_status",
+    "state_guard_primary_symbol",
+    "state_guard_primary_direction",
     "state_guard_primary_entry",
     "state_guard_primary_sl",
     "state_guard_primary_tp1",
@@ -132,6 +135,9 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_active_same_direction_scenario_found",
     "state_guard_active_same_direction_signal_id",
     "state_guard_active_same_direction_status",
+    "state_guard_active_same_direction_symbol",
+    "state_guard_active_same_direction_direction",
+    "state_guard_active_same_direction_lifecycle",
     "state_guard_duplicate_detected",
     "state_guard_conflict_detected",
     "state_guard_replacement_candidate",
@@ -155,12 +161,20 @@ STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_old_signal_id",
     "state_guard_old_direction",
     "state_guard_new_bias_direction",
+    "state_guard_previous_direction",
+    "state_guard_new_direction",
+    "state_guard_direction_match",
+    "state_guard_regime_flip_candidate",
+    "state_guard_regime_flip_reason",
     "state_guard_human_decision_required",
     "state_guard_old_setup_recommendation",
     "state_guard_propose_reverse_signal",
     "active_same_direction_scenario_found",
     "active_same_direction_signal_id",
     "active_same_direction_status",
+    "active_same_direction_symbol",
+    "active_same_direction_direction",
+    "active_same_direction_lifecycle",
     "duplicate_detected",
     "duplicate_enforcement_enabled",
     "duplicate_enforcement_action",
@@ -1233,8 +1247,10 @@ def build_state_guard_enforcement_decision(state_guard: dict, candidate: dict, c
             "duplicate_signal": {
                 "signal_id": state_guard.get("state_guard_primary_signal_id"),
                 "status": state_guard.get("state_guard_primary_lifecycle_state"),
-                "display_symbol": candidate.get("display_symbol"),
-                "direction": candidate.get("direction"),
+                "display_symbol": state_guard.get("state_guard_active_same_direction_symbol") or candidate.get("display_symbol"),
+                "direction": state_guard.get("state_guard_active_same_direction_direction")
+                or state_guard.get("state_guard_primary_direction")
+                or candidate.get("direction"),
                 "entry_price": state_guard.get("state_guard_primary_entry"),
                 "sl": state_guard.get("state_guard_primary_sl"),
             },
@@ -1247,7 +1263,7 @@ def build_state_guard_enforcement_decision(state_guard: dict, candidate: dict, c
 def render_duplicate_update_message(decision: dict, candidate: dict) -> str:
     old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
     symbol = candidate.get("display_symbol") or old.get("display_symbol") or _display_symbol(candidate.get("symbol"))
-    side = str(candidate.get("direction") or old.get("direction") or "").upper()
+    side = str(old.get("direction") or candidate.get("direction") or "").upper()
     status = old.get("status") or decision.get("duplicate_signal_status") or "UNKNOWN"
     old_id = old.get("signal_id") or decision.get("duplicate_signal_id")
     if decision.get("publication_type") == "urgent_review":
@@ -1577,12 +1593,18 @@ def _state_guard_base(enabled: bool, status: str) -> dict:
         "state_guard_shadow_enabled": enabled,
         "state_guard_status": status,
         "state_guard_decision": None,
+        "state_guard_decision_reason": None,
         "state_guard_can_publish_full_signal": None,
         "state_guard_recommended_publication_type": None,
         "state_guard_reason": None,
         "state_guard_primary_signal_id": None,
         "state_guard_primary_lifecycle_state": None,
         "state_guard_primary_position_status": None,
+        "state_guard_primary_symbol": None,
+        "state_guard_primary_direction": None,
+        "state_guard_active_same_direction_symbol": None,
+        "state_guard_active_same_direction_direction": None,
+        "state_guard_active_same_direction_lifecycle": None,
         "state_guard_duplicate_detected": None,
         "state_guard_conflict_detected": None,
         "state_guard_replacement_candidate": None,
@@ -1602,6 +1624,11 @@ def _state_guard_base(enabled: bool, status: str) -> dict:
         "state_guard_old_signal_id": None,
         "state_guard_old_direction": None,
         "state_guard_new_bias_direction": None,
+        "state_guard_previous_direction": None,
+        "state_guard_new_direction": None,
+        "state_guard_direction_match": None,
+        "state_guard_regime_flip_candidate": None,
+        "state_guard_regime_flip_reason": None,
         "state_guard_human_decision_required": None,
         "state_guard_old_setup_recommendation": None,
         "state_guard_propose_reverse_signal": None,
@@ -1686,12 +1713,18 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
         {
             "state_guard_status": "ok",
             "state_guard_decision": evaluation.get("decision"),
+            "state_guard_decision_reason": evaluation.get("decision_reason") or evaluation.get("reason"),
             "state_guard_can_publish_full_signal": evaluation.get("can_publish_full_signal"),
             "state_guard_recommended_publication_type": evaluation.get("recommended_publication_type"),
             "state_guard_reason": evaluation.get("reason"),
             "state_guard_primary_signal_id": evaluation.get("primary_signal_id"),
             "state_guard_primary_lifecycle_state": evaluation.get("primary_lifecycle_state"),
             "state_guard_primary_position_status": evaluation.get("primary_position_status"),
+            "state_guard_primary_symbol": evaluation.get("active_symbol") or evaluation.get("candidate_symbol"),
+            "state_guard_primary_direction": evaluation.get("active_direction"),
+            "state_guard_active_same_direction_symbol": evaluation.get("active_symbol"),
+            "state_guard_active_same_direction_direction": evaluation.get("active_direction"),
+            "state_guard_active_same_direction_lifecycle": evaluation.get("active_lifecycle"),
             "state_guard_active_same_direction_scenario_found": evaluation.get("active_same_direction_scenario_found"),
             "state_guard_active_same_direction_signal_id": evaluation.get("active_same_direction_signal_id")
             or evaluation.get("primary_signal_id"),
@@ -1720,6 +1753,11 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             "state_guard_old_signal_id": evaluation.get("old_signal_id"),
             "state_guard_old_direction": evaluation.get("old_direction"),
             "state_guard_new_bias_direction": evaluation.get("new_bias_direction"),
+            "state_guard_previous_direction": evaluation.get("previous_direction"),
+            "state_guard_new_direction": evaluation.get("new_direction"),
+            "state_guard_direction_match": evaluation.get("direction_match"),
+            "state_guard_regime_flip_candidate": evaluation.get("regime_flip_candidate"),
+            "state_guard_regime_flip_reason": evaluation.get("regime_flip_reason"),
             "state_guard_human_decision_required": evaluation.get("human_decision_required"),
             "state_guard_old_setup_recommendation": evaluation.get("old_setup_recommendation"),
             "state_guard_propose_reverse_signal": evaluation.get("propose_reverse_signal"),
@@ -1728,6 +1766,9 @@ def evaluate_state_guard_shadow(candidate: dict, cfg: SchedulerConfig, *, now_ut
             or evaluation.get("primary_signal_id"),
             "active_same_direction_status": evaluation.get("active_same_direction_status")
             or evaluation.get("primary_lifecycle_state"),
+            "active_same_direction_symbol": evaluation.get("active_symbol"),
+            "active_same_direction_direction": evaluation.get("active_direction"),
+            "active_same_direction_lifecycle": evaluation.get("active_lifecycle"),
             "duplicate_detected": evaluation.get("duplicate_detected"),
         }
     )
@@ -1751,11 +1792,15 @@ def state_guard_duplicate_runtime_action(state_guard: dict, cfg: SchedulerConfig
     duplicate_decision = str(state_guard.get("state_guard_decision") or "").strip().upper()
     recommended = str(state_guard.get("state_guard_recommended_publication_type") or "").strip().upper()
     can_publish = state_guard.get("state_guard_can_publish_full_signal")
-    active_status = str(state_guard.get("state_guard_primary_lifecycle_state") or "").strip().upper()
+    active_status = str(
+        state_guard.get("state_guard_active_same_direction_status")
+        or state_guard.get("active_same_direction_status")
+        or state_guard.get("state_guard_primary_lifecycle_state")
+        or ""
+    ).strip().upper()
     same_direction_active = bool(
         state_guard.get("state_guard_active_same_direction_scenario_found")
         or state_guard.get("active_same_direction_scenario_found")
-        or state_guard.get("state_guard_primary_signal_id")
     )
     eligible = (
         same_direction_active
@@ -1812,19 +1857,23 @@ def day_bias_diagnostics(payload: dict, candidate: dict, gate: dict) -> dict:
         vs = "aligned" if day_bias_direction == candidate_direction else "counter"
         counter = vs == "counter"
     market_override = bool(payload.get("market_override_detected") or payload.get("market_override") or payload.get("override_detected"))
+    regime_flip_reason = (
+        payload.get("regime_flip_reason")
+        or payload.get("counter_regime_allowed_reason")
+        or gate.get("regime_flip_reason")
+        or gate.get("counter_regime_allowed_reason")
+    )
     allowed_reason = None
     if counter:
-        allowed_reason = (
-            payload.get("counter_regime_allowed_reason")
-            or payload.get("market_override_reason")
-            or ("market_override_detected" if market_override else "none")
-        )
+        allowed_reason = regime_flip_reason or payload.get("market_override_reason") or ("market_override_detected" if market_override else "none")
     return {
         "day_bias_direction": day_bias_direction or "unknown",
         "candidate_direction": candidate_direction or "unknown",
         "signal_direction_vs_day_bias": vs,
         "counter_regime_signal": counter,
         "counter_regime_allowed_reason": allowed_reason,
+        "regime_flip_candidate": counter,
+        "regime_flip_reason": regime_flip_reason,
         "market_override_detected": market_override,
     }
 
@@ -1842,6 +1891,17 @@ def state_guard_shadow_log_row(
         "candidate_signal_id": result.get("candidate_signal_id") or result.get("signal_id"),
         "symbol": candidate.get("display_symbol") or candidate.get("symbol"),
         "direction": candidate.get("direction"),
+        "active_symbol": result.get("state_guard_primary_symbol") or result.get("active_same_direction_symbol"),
+        "active_direction": result.get("state_guard_primary_direction") or result.get("active_same_direction_direction"),
+        "active_lifecycle": result.get("state_guard_primary_lifecycle_state") or result.get("active_same_direction_lifecycle"),
+        "candidate_symbol": candidate.get("display_symbol") or candidate.get("symbol"),
+        "candidate_direction": candidate.get("direction"),
+        "decision_reason": result.get("state_guard_decision_reason") or result.get("state_guard_reason"),
+        "direction_match": result.get("state_guard_direction_match"),
+        "previous_direction": result.get("state_guard_previous_direction"),
+        "new_direction": result.get("state_guard_new_direction"),
+        "regime_flip_candidate": result.get("state_guard_regime_flip_candidate"),
+        "regime_flip_reason": result.get("state_guard_regime_flip_reason"),
         "candidate_entry": candidate.get("entry_price"),
         "candidate_sl": candidate.get("sl"),
         "candidate_rr": _rr_for_signal(candidate),
@@ -2105,6 +2165,22 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
 
     if event_bias == "risk_off" and is_risk_on_alt_long(asset, direction):
         reasons.append("risk_off_alt_long_without_reset_reclaim")
+
+    raw_day_bias = (
+        ctx.get("day_bias")
+        or ctx.get("day_bias_direction")
+        or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("day_bias")
+    )
+    day_bias_direction = _day_bias_to_direction(raw_day_bias)
+    day_bias_conflict = bool(day_bias_direction and direction and day_bias_direction != direction)
+    regime_flip_reason = (
+        ctx.get("regime_flip_reason")
+        or ctx.get("counter_regime_allowed_reason")
+        or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("regime_flip_reason")
+        or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("counter_regime_allowed_reason")
+    )
+    if day_bias_conflict and not regime_flip_reason:
+        reasons.append("counter_day_bias_without_regime_flip")
 
     if cfg.gate_mode == "off":
         hard_block_reasons: list[str] = []
