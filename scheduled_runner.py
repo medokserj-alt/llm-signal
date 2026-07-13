@@ -468,6 +468,11 @@ def _candidate_from_payload(payload: dict, signal_id: str | None = None) -> dict
         "ema20_m15": _try_float(payload.get("ema20_m15")),
         "hard_block_conditions": payload.get("hard_block_conditions") if isinstance(payload.get("hard_block_conditions"), list) else [],
         "no_trade": bool(payload.get("no_trade")),
+        "event_risk": payload.get("event_risk") if isinstance(payload.get("event_risk"), dict) else {},
+        "explicit_regime_flip_reason": (
+            payload.get("explicit_regime_flip_reason")
+            or meta.get("explicit_regime_flip_reason")
+        ),
     }
 
 
@@ -869,6 +874,18 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
         "confidence_new": candidate.get("confidence"),
         "strategy_same_or_compatible": True,
         "duplicate_signal": None,
+        "headline_risk_delta": _event_risk_field({}, candidate, "headline_risk_delta") or "NONE",
+        "previous_risk_level": _event_risk_field({}, candidate, "previous_risk_level"),
+        "new_risk_level": _event_risk_field({}, candidate, "new_risk_level"),
+        "risk_transition_reason": _event_risk_field({}, candidate, "risk_transition_reason"),
+        "duplicate_decision": _event_risk_field({}, candidate, "duplicate_decision") or "duplicate_headline_same_state",
+        "headline_update_generated": bool(_event_risk_field({}, candidate, "headline_update_generated")),
+        "confirmation_required": False,
+        "confirmation_required_reason": None,
+        "management_review_required": False,
+        "management_review_reason": None,
+        "risk_reassessment_required": False,
+        "risk_reassessment_reason": None,
         **_stale_active_signal_defaults(),
     }
     symbol = candidate.get("symbol")
@@ -927,6 +944,7 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
                 "propose_reverse_signal": bool(pre_entry and strong_opposite),
             }
         )
+        _apply_headline_escalation_setup_impact(out, opposite_status)
         return out
 
     entry_threshold = _try_float(os.getenv("SCHEDULED_DUPLICATE_ENTRY_DISTANCE_PCT")) or 0.5
@@ -984,6 +1002,7 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
             out["replacement_reason"] = "existing_signal_confirmed_or_armed"
         elif status in WAIT_REPLACEABLE_STATUSES:
             out["replacement_reason"] = "wait_confirm_exists_material_reprice"
+        _apply_headline_escalation_setup_impact(out, status)
         return out
     if not related:
         return out
@@ -1015,16 +1034,20 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
     if status in LIVE_POSITION_STATUSES:
         out["publication_type"] = "active_signal_update"
         out["replacement_reason"] = "existing_signal_live_or_management"
+        _apply_headline_escalation_setup_impact(out, status)
         return out
     if status not in WAIT_REPLACEABLE_STATUSES:
         out["publication_type"] = "active_signal_update"
         out["replacement_reason"] = "existing_signal_confirmed_or_armed"
+        _apply_headline_escalation_setup_impact(out, status)
         return out
     if old.get("filled"):
         out["replacement_reason"] = "old_signal_already_filled"
+        _apply_headline_escalation_setup_impact(out, status)
         return out
     if candidate.get("no_trade") or candidate.get("hard_block_conditions"):
         out["replacement_reason"] = "candidate_has_hard_block"
+        _apply_headline_escalation_setup_impact(out, status)
         return out
 
     rr_not_worse = rr_old is None or rr_new is None or rr_new + 0.0001 >= rr_old
@@ -1049,6 +1072,7 @@ def evaluate_duplicate_publication(candidate: dict, active_signals: list[dict], 
         out["replaced_signal_id"] = old.get("signal_id")
     else:
         out["replacement_reason"] = "replacement_not_materially_better"
+    _apply_headline_escalation_setup_impact(out, status)
     return out
 
 
@@ -1086,6 +1110,24 @@ def _event_risk_field(decision: dict, candidate: dict, key: str):
     return _first_nonempty(decision.get(key), candidate.get(key), event_risk.get(key))
 
 
+def _apply_headline_escalation_setup_impact(out: dict, status: str) -> None:
+    if str(out.get("headline_risk_delta") or "").strip().upper() != "ESCALATION":
+        return
+    out["headline_update_generated"] = True
+    out["duplicate_decision"] = "headline_risk_update"
+    if status == "WAIT_CONFIRM":
+        out["confirmation_required"] = True
+        out["confirmation_required_reason"] = "headline_risk_escalation"
+        out["management_review_required"] = True
+        out["management_review_reason"] = "headline_risk_escalation"
+    elif status in {"CONFIRM_LIVE", "SETUP_ARMED"}:
+        out["management_review_required"] = True
+        out["management_review_reason"] = "headline_risk_escalation"
+    elif status in LIVE_POSITION_STATUSES:
+        out["risk_reassessment_required"] = True
+        out["risk_reassessment_reason"] = "headline_risk_escalation"
+
+
 def _headline_risk_advisory(decision: dict, candidate: dict) -> str:
     old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
     status = str(old.get("status") or decision.get("duplicate_signal_status") or "").upper()
@@ -1094,7 +1136,8 @@ def _headline_risk_advisory(decision: dict, candidate: dict) -> str:
         return ""
 
     level = str(_event_risk_field(decision, candidate, "event_risk_level") or "").strip().lower()
-    if level not in {"high", "severe", "critical"}:
+    delta = str(_event_risk_field(decision, candidate, "headline_risk_delta") or "NONE").strip().upper()
+    if level not in {"high", "severe", "critical"} and delta != "ESCALATION":
         return ""
 
     bias = str(_event_risk_field(decision, candidate, "event_bias") or "").strip().lower()
@@ -1112,8 +1155,20 @@ def _headline_risk_advisory(decision: dict, candidate: dict) -> str:
         "⚠️ HEADLINE RISK UPDATE",
         "",
         "Duplicate full signal remains suppressed, but fresh context shows elevated headline pressure.",
-        f"- event_risk_level: {level}",
     ]
+    previous_level = _event_risk_field(decision, candidate, "previous_risk_level")
+    new_level = _event_risk_field(decision, candidate, "new_risk_level") or level
+    reason = _event_risk_field(decision, candidate, "risk_transition_reason")
+    if previous_level:
+        lines.append(f"- previous_risk_level: {previous_level}")
+    if new_level:
+        lines.append(f"- new_risk_level: {new_level}")
+    if delta:
+        lines.append(f"- headline_risk_delta: {delta}")
+    if reason:
+        lines.append(f"- risk_transition_reason: {reason}")
+    if level:
+        lines.append(f"- event_risk_level: {level}")
     if bias:
         lines.append(f"- event_bias: {bias}")
     if topic:
@@ -1233,6 +1288,8 @@ def build_state_guard_enforcement_decision(state_guard: dict, candidate: dict, c
         publication_type = "SUPPRESS_DUPLICATE"
     publication_type = publication_type.lower()
     lineage = _state_guard_update_lineage(state_guard, candidate, publication_type)
+    headline_delta = _event_risk_field({}, candidate, "headline_risk_delta") or state_guard.get("headline_risk_delta") or "NONE"
+    previous_state = str(state_guard.get("state_guard_primary_lifecycle_state") or "").strip().upper()
     result.update(
         {
             "state_guard_runtime_blocked_full_signal": True,
@@ -1255,6 +1312,18 @@ def build_state_guard_enforcement_decision(state_guard: dict, candidate: dict, c
                 "sl": state_guard.get("state_guard_primary_sl"),
             },
             **lineage,
+            "headline_risk_delta": headline_delta,
+            "previous_risk_level": _event_risk_field({}, candidate, "previous_risk_level") or state_guard.get("previous_risk_level"),
+            "new_risk_level": _event_risk_field({}, candidate, "new_risk_level") or state_guard.get("new_risk_level"),
+            "risk_transition_reason": _event_risk_field({}, candidate, "risk_transition_reason") or state_guard.get("risk_transition_reason"),
+            "duplicate_decision": "headline_risk_update" if str(headline_delta).upper() == "ESCALATION" else "duplicate_headline_same_state",
+            "headline_update_generated": str(headline_delta).upper() == "ESCALATION",
+            "confirmation_required": str(headline_delta).upper() == "ESCALATION" and previous_state == "WAIT_CONFIRM",
+            "confirmation_required_reason": "headline_risk_escalation" if str(headline_delta).upper() == "ESCALATION" and previous_state == "WAIT_CONFIRM" else None,
+            "management_review_required": str(headline_delta).upper() == "ESCALATION" and previous_state in {"WAIT_CONFIRM", "CONFIRM_LIVE", "SETUP_ARMED"},
+            "management_review_reason": "headline_risk_escalation" if str(headline_delta).upper() == "ESCALATION" and previous_state in {"WAIT_CONFIRM", "CONFIRM_LIVE", "SETUP_ARMED"} else None,
+            "risk_reassessment_required": str(headline_delta).upper() == "ESCALATION" and previous_state in LIVE_POSITION_STATUSES,
+            "risk_reassessment_reason": "headline_risk_escalation" if str(headline_delta).upper() == "ESCALATION" and previous_state in LIVE_POSITION_STATUSES else None,
         }
     )
     return result
@@ -2141,11 +2210,38 @@ def is_risk_on_alt_long(asset: str, direction: str) -> bool:
     return asset.upper() not in {"BTC", "ETH"} and direction.lower() in {"long", "buy", "bullish"}
 
 
+def evaluate_post_generation_event_risk_gate(candidate: dict, gate_context: dict) -> dict:
+    direction = _normalize_direction(candidate.get("direction"))
+    event_risk_level = _norm(gate_context.get("event_risk_level"), "unknown").lower()
+    event_bias = _norm(gate_context.get("event_bias"), "unknown").lower()
+    explicit_regime_flip_reason = (
+        candidate.get("explicit_regime_flip_reason")
+        or gate_context.get("explicit_regime_flip_reason")
+    )
+    blocked = (
+        event_risk_level == "severe"
+        and event_bias == "risk_off"
+        and direction == "long"
+        and not explicit_regime_flip_reason
+    )
+    return {
+        "post_generation_event_risk_gate": True,
+        "candidate_direction": direction,
+        "event_bias": event_bias,
+        "event_risk_level": event_risk_level,
+        "explicit_regime_flip_reason": explicit_regime_flip_reason,
+        "can_publish_full_signal": not blocked,
+        "blocked_reason": "counter_risk_without_regime_flip" if blocked else None,
+        "publication_type": "blocked_by_severe_risk" if blocked else "full_signal",
+    }
+
+
 def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
     status = _norm(ctx.get("status"), "unknown").upper()
     preferred_mode = _norm(ctx.get("preferred_mode"), "unknown").lower()
     event_risk_level = _norm(ctx.get("event_risk_level"), "unknown").lower()
     event_bias = _norm(ctx.get("event_bias"), "unknown").lower()
+    headline_risk_delta = _norm(ctx.get("headline_risk_delta"), "NONE").upper()
     confirm_policy = _norm(ctx.get("confirm_policy"), "unknown").lower()
     asset, direction = _candidate_from_context(ctx)
     reasons: list[str] = []
@@ -2174,11 +2270,19 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
     day_bias_direction = _day_bias_to_direction(raw_day_bias)
     day_bias_conflict = bool(day_bias_direction and direction and day_bias_direction != direction)
     regime_flip_reason = (
-        ctx.get("regime_flip_reason")
+        ctx.get("explicit_regime_flip_reason")
+        or ctx.get("regime_flip_reason")
         or ctx.get("counter_regime_allowed_reason")
+        or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("explicit_regime_flip_reason")
         or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("regime_flip_reason")
         or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("counter_regime_allowed_reason")
     )
+    explicit_regime_flip_reason = (
+        ctx.get("explicit_regime_flip_reason")
+        or (ctx.get("day_mid_context", {}) if isinstance(ctx.get("day_mid_context"), dict) else {}).get("explicit_regime_flip_reason")
+    )
+    if event_risk_level == "severe" and headline_risk_delta == "ESCALATION" and candidate_conflict and not regime_flip_reason:
+        reasons.append("counter_trend_signal_during_escalation_without_regime_flip")
     if day_bias_conflict and not regime_flip_reason:
         reasons.append("counter_day_bias_without_regime_flip")
 
@@ -2231,10 +2335,17 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         "focus_direction": direction,
         "flow_bias": _norm(ctx.get("flow_bias"), "unknown").lower(),
         "event_risk_level": event_risk_level,
+        "headline_risk_delta": headline_risk_delta,
+        "previous_risk_level": ctx.get("previous_risk_level"),
+        "new_risk_level": ctx.get("new_risk_level"),
+        "risk_transition_reason": ctx.get("risk_transition_reason"),
+        "duplicate_decision": ctx.get("duplicate_decision"),
+        "headline_update_generated": bool(ctx.get("headline_update_generated")),
         "dominant_critical_topic": dominant.get("topic_id") if isinstance(dominant, dict) else _norm(dominant, ""),
         "event_bias": event_bias,
         "confirm_policy": confirm_policy,
         "aia_context_missing": bool(ctx.get("aia_context_missing")),
+        "explicit_regime_flip_reason": explicit_regime_flip_reason,
     }
 
 
@@ -2406,6 +2517,7 @@ async def generate_and_publish_signal(
     published_at = datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     signal_id = tg_bot._infer_signal_id(Path(sig_html), Path(run_log) if run_log else None, published_at)
     candidate = _candidate_from_payload(payload, signal_id=signal_id)
+    post_generation_gate = evaluate_post_generation_event_risk_gate(candidate, gate_context)
     tp_validation = _tp_ladder_validation(
         candidate.get("direction"),
         candidate.get("entry_price"),
@@ -2493,7 +2605,19 @@ async def generate_and_publish_signal(
             "pending_update_classification": state_guard_enforcement.get("pending_update_classification"),
             "entry_distance_pct": state_guard_enforcement.get("entry_distance_pct"),
         }
-        for key in ("event_risk_level", "event_bias", "dominant_critical_topic", "critical_topics", "confirm_policy"):
+        for key in (
+            "event_risk_level",
+            "event_bias",
+            "dominant_critical_topic",
+            "critical_topics",
+            "confirm_policy",
+            "headline_risk_delta",
+            "previous_risk_level",
+            "new_risk_level",
+            "risk_transition_reason",
+            "duplicate_decision",
+            "headline_update_generated",
+        ):
             if gate_context.get(key) not in (None, "", [], {}):
                 decision[key] = gate_context.get(key)
         message = render_duplicate_update_message(decision, candidate)
@@ -2561,6 +2685,23 @@ async def generate_and_publish_signal(
             **state_guard_enforcement,
             **day_diagnostics,
             **duplicate_result,
+        }
+
+    if not post_generation_gate["can_publish_full_signal"]:
+        return {
+            "published": False,
+            "reason": "counter_risk_without_regime_flip",
+            "signal_id": None,
+            "candidate_signal_id": signal_id,
+            "artifact_path": relpath(Path(sig_html)),
+            "run_log": relpath(Path(run_log)) if run_log else None,
+            "last_payload": payload,
+            "aia_forward_attempted": False,
+            "aia_forward_ok": False,
+            "aia_forward_error": None,
+            "aia_forward_mode": "skipped_post_generation_event_risk_gate",
+            "aia_forward_warning": None,
+            **post_generation_gate,
         }
 
     publish_text = parts[0]
@@ -2658,6 +2799,9 @@ async def generate_and_publish_signal(
         **state_guard_enforcement,
         **day_diagnostics,
         **duplicate_result,
+        "post_generation_event_risk_gate": True,
+        "explicit_regime_flip_reason": post_generation_gate.get("explicit_regime_flip_reason"),
+        "post_generation_event_risk_blocked_reason": post_generation_gate.get("blocked_reason"),
     }
 
 
@@ -2683,6 +2827,12 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
         "focus_direction": gate.get("focus_direction", "unknown"),
         "flow_bias": gate.get("flow_bias", "unknown"),
         "event_risk_level": gate.get("event_risk_level", "unknown"),
+        "headline_risk_delta": gate.get("headline_risk_delta", "NONE"),
+        "previous_risk_level": gate.get("previous_risk_level"),
+        "new_risk_level": gate.get("new_risk_level"),
+        "risk_transition_reason": gate.get("risk_transition_reason"),
+        "duplicate_decision": gate.get("duplicate_decision"),
+        "headline_update_generated": gate.get("headline_update_generated"),
         "dominant_critical_topic": gate.get("dominant_critical_topic", ""),
         "event_bias": gate.get("event_bias", "unknown"),
         "confirm_policy": gate.get("confirm_policy", "unknown"),
@@ -2878,6 +3028,18 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "confidence_old",
                 "confidence_new",
                 "strategy_same_or_compatible",
+                "headline_risk_delta",
+                "previous_risk_level",
+                "new_risk_level",
+                "risk_transition_reason",
+                "duplicate_decision",
+                "headline_update_generated",
+                "confirmation_required",
+                "confirmation_required_reason",
+                "management_review_required",
+                "management_review_reason",
+                "risk_reassessment_required",
+                "risk_reassessment_reason",
                 "stale_active_signal_ignored",
                 "stale_active_signal_id",
                 "stale_active_signal_status",
@@ -2900,6 +3062,9 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "invalid_tp_ladder",
                 "duplicate_tp_targets",
                 "tp_ladder_warnings",
+                "post_generation_event_risk_gate",
+                "explicit_regime_flip_reason",
+                "blocked_reason",
             ):
                 row[key] = result.get(key)
             for key in STATE_GUARD_DECISION_LOG_FIELDS:
@@ -2932,6 +3097,18 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 }
                 row.update({"decision": "cancel", "reason": reason})
             for key in STATE_GUARD_DECISION_LOG_FIELDS:
+                if key in result:
+                    row[key] = result.get(key)
+            for key in (
+                "post_generation_event_risk_gate",
+                "candidate_direction",
+                "event_bias",
+                "event_risk_level",
+                "explicit_regime_flip_reason",
+                "blocked_reason",
+                "publication_type",
+                "can_publish_full_signal",
+            ):
                 if key in result:
                     row[key] = result.get(key)
     except Exception as exc:

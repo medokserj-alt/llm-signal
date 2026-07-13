@@ -94,6 +94,30 @@ class TestScheduledTimeMath(unittest.TestCase):
 
 
 class TestAiaGate(unittest.TestCase):
+    def test_post_generation_severe_risk_off_long_without_flip_is_blocked(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            {"direction": "long"},
+            {"event_risk_level": "severe", "event_bias": "risk_off"},
+        )
+        self.assertFalse(out["can_publish_full_signal"])
+        self.assertEqual(out["publication_type"], "blocked_by_severe_risk")
+        self.assertEqual(out["blocked_reason"], "counter_risk_without_regime_flip")
+
+    def test_post_generation_severe_risk_off_short_is_allowed(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            {"direction": "short"},
+            {"event_risk_level": "severe", "event_bias": "risk_off"},
+        )
+        self.assertTrue(out["can_publish_full_signal"])
+
+    def test_post_generation_severe_risk_off_long_with_flip_is_allowed(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            {"direction": "long", "explicit_regime_flip_reason": "confirmed_market_reversal"},
+            {"event_risk_level": "severe", "event_bias": "risk_off"},
+        )
+        self.assertTrue(out["can_publish_full_signal"])
+        self.assertEqual(out["explicit_regime_flip_reason"], "confirmed_market_reversal")
+
     def test_open_without_hard_block_allows_publish(self) -> None:
         out = sr.evaluate_aia_gate({"status": "OPEN", "preferred_mode": "aggressive"}, cfg())
         self.assertTrue(out["allowed"])
@@ -230,6 +254,48 @@ class TestAiaGate(unittest.TestCase):
         self.assertFalse(blocked["allowed"])
         self.assertTrue(allowed["allowed"])
 
+    def test_severe_headline_escalation_blocks_counter_trend_without_regime_flip(self) -> None:
+        blocked = sr.evaluate_aia_gate(
+            {
+                "event_risk_level": "severe",
+                "headline_risk_delta": "ESCALATION",
+                "event_bias": "risk_off",
+                "focus_asset": "BTC",
+                "focus_direction": "LONG",
+            },
+            cfg(),
+        )
+        allowed = sr.evaluate_aia_gate(
+            {
+                "event_risk_level": "severe",
+                "headline_risk_delta": "ESCALATION",
+                "event_bias": "risk_off",
+                "focus_asset": "BTC",
+                "focus_direction": "LONG",
+                "explicit_regime_flip_reason": "spot_absorption_overrides_headline_shock",
+            },
+            cfg(),
+        )
+
+        self.assertFalse(blocked["allowed"])
+        self.assertIn("counter_trend_signal_during_escalation_without_regime_flip", blocked["hard_block_reasons"])
+        self.assertTrue(allowed["allowed"])
+
+    def test_severe_headline_escalation_allows_risk_off_aligned_short(self) -> None:
+        out = sr.evaluate_aia_gate(
+            {
+                "event_risk_level": "severe",
+                "headline_risk_delta": "ESCALATION",
+                "event_bias": "risk_off",
+                "focus_asset": "BTC",
+                "focus_direction": "SHORT",
+            },
+            cfg(),
+        )
+
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["headline_risk_delta"], "ESCALATION")
+
     def test_day_bias_conflict_requires_explicit_regime_flip_reason(self) -> None:
         blocked = sr.evaluate_aia_gate(
             {
@@ -351,6 +417,27 @@ class TestScheduledSignalState(unittest.TestCase):
         decision = sr.evaluate_duplicate_publication(candidate, [self._old(rr=3.1)])
         self.assertEqual(decision["publication_type"], "active_signal_update")
         self.assertFalse(decision["replacement_selected"])
+
+    def test_wait_confirm_headline_escalation_requires_management_review(self) -> None:
+        candidate = self._candidate(
+            entry_price=610.14,
+            sl=604.04,
+            event_risk={
+                "headline_risk_delta": "ESCALATION",
+                "previous_risk_level": "severe",
+                "new_risk_level": "severe",
+                "risk_transition_reason": "military_action",
+                "headline_update_generated": True,
+            },
+        )
+        decision = sr.evaluate_duplicate_publication(candidate, [self._old("WAIT_CONFIRM", rr=3.1)])
+
+        self.assertEqual(decision["publication_type"], "active_signal_update")
+        self.assertEqual(decision["headline_risk_delta"], "ESCALATION")
+        self.assertTrue(decision["headline_update_generated"])
+        self.assertTrue(decision["confirmation_required"])
+        self.assertTrue(decision["management_review_required"])
+        self.assertEqual(decision["management_review_reason"], "headline_risk_escalation")
 
     def test_wait_confirm_near_duplicate_with_worse_rr_updates(self) -> None:
         candidate = self._candidate(entry_price=610.14, sl=603.0, rr=2.0, ema20_m15=610.14)

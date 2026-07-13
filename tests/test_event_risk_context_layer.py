@@ -8,6 +8,18 @@ from event_risk_context import build_event_risk_context, render_event_risk_conte
 
 
 class TestEventRiskContextLayer(unittest.TestCase):
+    def test_confirmed_regional_military_attacks_are_not_neutral(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-07-13 00:00 МСК] [impact:neutral] Iran launches attacks on American military facilities in Bahrain and Kuwait after fresh US strikes",
+            calendar_events=[],
+        )
+
+        item = snapshot["event_risk_context"][0]
+        self.assertEqual(item["impact"], "high")
+        self.assertEqual(item["directional_risk"], "risk_off")
+        self.assertEqual(snapshot["event_bias"], "risk_off")
+        self.assertEqual(snapshot["event_risk_level"], "severe")
+
     def test_critical_topic_detects_iran_talks_halted_as_high_headline_risk(self) -> None:
         snapshot = build_event_risk_context(
             "- [2026-06-01 10:00 МСК] [impact:neutral] Iran halts talks with US after latest escalation",
@@ -28,6 +40,42 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual(snapshot.get("event_risk_level"), "severe")
         self.assertEqual((snapshot.get("dominant_critical_topic") or {}).get("topic_id"), "strategic_shipping_energy_chokepoint")
         self.assertEqual(snapshot.get("confirm_policy"), "block_stale_confirm")
+
+    def test_same_iran_topic_same_severity_is_duplicate_same_state(self) -> None:
+        snapshot = build_event_risk_context(
+            "\n".join(
+                [
+                    "- [2026-06-01 10:00 МСК] [impact:neutral] Iran threatens to block Strait of Hormuz as oil tankers come under fire",
+                    "- [2026-06-01 10:05 МСК] [impact:neutral] Iran repeats Hormuz warning as talks remain stalled",
+                ]
+            ),
+            calendar_events=[],
+        )
+
+        self.assertEqual(snapshot.get("event_risk_level"), "severe")
+        self.assertEqual(snapshot.get("headline_risk_delta"), "NONE")
+        self.assertEqual(snapshot.get("duplicate_decision"), "duplicate_headline_same_state")
+        self.assertFalse(snapshot.get("headline_update_generated"))
+
+    def test_same_iran_topic_military_escalation_generates_headline_update(self) -> None:
+        snapshot = build_event_risk_context(
+            "\n".join(
+                [
+                    "- [2026-06-01 10:00 МСК] [impact:neutral] Iran threatens to block Strait of Hormuz as oil tankers come under fire",
+                    "- [2026-06-01 10:05 МСК] [impact:−] US military launches strikes against Iran in further escalation",
+                ]
+            ),
+            calendar_events=[],
+        )
+
+        self.assertEqual(snapshot.get("event_risk_level"), "severe")
+        self.assertEqual(snapshot.get("event_bias"), "risk_off")
+        self.assertEqual(snapshot.get("headline_risk_delta"), "ESCALATION")
+        self.assertEqual(snapshot.get("previous_risk_level"), "severe")
+        self.assertEqual(snapshot.get("new_risk_level"), "severe")
+        self.assertEqual(snapshot.get("risk_transition_reason"), "military_action")
+        self.assertEqual(snapshot.get("duplicate_decision"), "headline_risk_update")
+        self.assertTrue(snapshot.get("headline_update_generated"))
 
     def test_read_aia_event_risk_context_preserves_severe(self) -> None:
         with tempfile.TemporaryDirectory() as td:

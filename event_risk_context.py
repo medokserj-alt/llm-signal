@@ -387,6 +387,13 @@ _CONFIRMED_GEO_ESCALATION_MARKERS = (
     "missile strike",
     "attack confirmed",
     "attacks launched",
+    "launches attacks",
+    "launched attacks",
+    "attacks on american military facilities",
+    "fresh us strikes",
+    "fresh u.s. strikes",
+    "military base attacked",
+    "military bases attacked",
     "retaliation launched",
 )
 _ESCALATION_RISK_MARKERS = (
@@ -460,6 +467,51 @@ _GEO_MILITARY_THREAT_MARKERS = (
     "missile strike",
     "attack launched",
     "renewed military",
+)
+_HEADLINE_MILITARY_ESCALATION_MARKERS = (
+    "military action",
+    "military response",
+    "military strike",
+    "military escalation",
+    "strike launched",
+    "strikes launched",
+    "launches strikes",
+    "launched strikes",
+    "airstrike",
+    "airstrikes",
+    "missile strike",
+    "attack confirmed",
+    "attack launched",
+    "retaliation launched",
+    "struck iran",
+    "struck iranian",
+)
+_HEADLINE_SHIPPING_ENERGY_ESCALATION_MARKERS = (
+    "hormuz closure",
+    "strait of hormuz closure",
+    "threatens hormuz closure",
+    "threatens to block",
+    "threat to block",
+    "blockade imposed",
+    "shipping halted",
+    "shipping disrupted",
+    "strait closed",
+    "oil supply shock",
+    "energy shock",
+    "tanker attacks",
+    "oil tankers come under fire",
+)
+_HEADLINE_DEESCALATION_MARKERS = (
+    "ceasefire agreement confirmed",
+    "ceasefire reached",
+    "ceasefire extended",
+    "truce reached",
+    "truce extended",
+    "de-escalation confirmed",
+    "deescalation confirmed",
+    "shipping resumed",
+    "strait reopened",
+    "sanctions relief",
 )
 _GEO_NEGOTIATION_MARKERS = (
     "talks",
@@ -787,6 +839,8 @@ def _geopolitics_location_tokens(value) -> tuple[str, ...]:
         ("hormuz", "hormuz"),
         ("muscat", "muscat"),
         ("oman", "oman"),
+        ("bahrain", "bahrain"),
+        ("kuwait", "kuwait"),
         ("red sea", "red_sea"),
         ("gaza", "gaza"),
         ("lebanon", "lebanon"),
@@ -969,10 +1023,20 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
             "war escalation",
             "war will work out",
             "struck iranian radar",
+            "launches strikes",
+            "launched strikes",
+            "strikes against iran",
             "radar sites",
             "missile attack",
             "missile and drone attacks",
             "drone attack",
+            "launches attacks",
+            "launched attacks",
+            "american military facilities",
+            "fresh us strikes",
+            "fresh u.s. strikes",
+            "military base",
+            "military bases",
             "airstrike",
             "ground offensive",
             "offensive in lebanon",
@@ -986,7 +1050,17 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
             low,
             (
                 "struck iranian radar",
+                "launches strikes",
+                "launched strikes",
+                "strikes against iran",
                 "missile and drone attacks",
+                "launches attacks",
+                "launched attacks",
+                "american military facilities",
+                "fresh us strikes",
+                "fresh u.s. strikes",
+                "military base",
+                "military bases",
                 "conflict expands",
                 "war escalation",
                 "ceasefire collapse",
@@ -1205,6 +1279,140 @@ def _critical_topic_snapshot_fields(items: list[dict]) -> dict:
         "matched_entities": _unique_text_tokens([entity for topic in topics for entity in (topic.get("matched_entities") or [])]),
         "matched_phrases": _unique_text_tokens([phrase for topic in topics for phrase in (topic.get("matched_phrases") or [])]),
         "escalation_reason": _merge_unique_texts(*(topic.get("escalation_reason") for topic in topics), max_items=2) if topics else "",
+    }
+
+
+def _headline_state_markers(text: str) -> set[str]:
+    low = _text(text).lower()
+    markers: set[str] = set()
+    if any(marker in low for marker in _HEADLINE_MILITARY_ESCALATION_MARKERS):
+        markers.add("military_action")
+    if any(marker in low for marker in _HEADLINE_SHIPPING_ENERGY_ESCALATION_MARKERS):
+        markers.add("shipping_energy_chokepoint")
+    if any(marker in low for marker in _HEADLINE_DEESCALATION_MARKERS):
+        markers.add("deescalation")
+    if any(marker in low for marker in ("risk_off", "downside volatility", "tail risk", "risk premium")):
+        markers.add("market_relevance")
+    return markers
+
+
+def _headline_transition_reason(previous_text: str, new_text: str, delta: str) -> str:
+    new_markers = _headline_state_markers(new_text)
+    previous_markers = _headline_state_markers(previous_text)
+    added = new_markers - previous_markers
+    if "military_action" in added or (delta == "ESCALATION" and "military_action" in new_markers):
+        return "military_action"
+    if "shipping_energy_chokepoint" in added or (delta == "ESCALATION" and "shipping_energy_chokepoint" in new_markers):
+        return "shipping_energy_risk"
+    if "deescalation" in added or (delta == "DEESCALATION" and "deescalation" in new_markers):
+        return "deescalation_confirmed"
+    if delta == "MINOR_UPDATE":
+        return "same_topic_minor_update"
+    return "same_topic_same_state"
+
+
+def _headline_delta_rank(value) -> int:
+    return {"NONE": 0, "MINOR_UPDATE": 1, "DEESCALATION": 2, "ESCALATION": 3}.get(_text(value), 0)
+
+
+def _dominant_headline_delta(items: list[dict]) -> dict:
+    best = None
+    for item in items:
+        if best is None or _headline_delta_rank(item.get("headline_risk_delta")) > _headline_delta_rank(best.get("headline_risk_delta")):
+            best = item
+    if not best:
+        return {
+            "headline_risk_delta": "NONE",
+            "previous_risk_level": "",
+            "new_risk_level": "",
+            "risk_transition_reason": "",
+            "duplicate_decision": "duplicate_headline_same_state",
+            "headline_update_generated": False,
+        }
+    return {
+        "headline_risk_delta": best.get("headline_risk_delta") or "NONE",
+        "previous_risk_level": best.get("previous_risk_level") or "",
+        "new_risk_level": best.get("new_risk_level") or "",
+        "risk_transition_reason": best.get("risk_transition_reason") or "",
+        "duplicate_decision": best.get("duplicate_decision") or "duplicate_headline_same_state",
+        "headline_update_generated": bool(best.get("headline_update_generated")),
+    }
+
+
+def _snapshot_headline_delta(items: list[dict], critical_fields: dict, dominant_delta: dict) -> dict:
+    if _headline_delta_rank(dominant_delta.get("headline_risk_delta")) >= _headline_delta_rank("ESCALATION"):
+        return dominant_delta
+    if critical_fields.get("event_risk_level") != "severe" or critical_fields.get("event_bias") != "risk_off":
+        return dominant_delta
+    if len(items) < 2:
+        return dominant_delta
+    combined = " ".join(
+        " ".join(
+            [
+                _text(item.get("source_title")),
+                _text(item.get("event")),
+                " ".join(item.get("recent_developments") or []),
+                " ".join(item.get("confirmed_facts") or []),
+                " ".join(item.get("anticipated_consequences") or []),
+            ]
+        )
+        for item in items
+    )
+    markers = _headline_state_markers(combined)
+    if "military_action" in markers:
+        return {
+            "headline_risk_delta": "ESCALATION",
+            "previous_risk_level": critical_fields.get("event_risk_level") or dominant_delta.get("previous_risk_level") or "",
+            "new_risk_level": critical_fields.get("event_risk_level") or dominant_delta.get("new_risk_level") or "",
+            "risk_transition_reason": "military_action",
+            "duplicate_decision": "headline_risk_update",
+            "headline_update_generated": True,
+        }
+    if "deescalation" in markers:
+        return {
+            "headline_risk_delta": "DEESCALATION",
+            "previous_risk_level": critical_fields.get("event_risk_level") or dominant_delta.get("previous_risk_level") or "",
+            "new_risk_level": dominant_delta.get("new_risk_level") or "",
+            "risk_transition_reason": "deescalation_confirmed",
+            "duplicate_decision": "headline_risk_update",
+            "headline_update_generated": False,
+        }
+    return dominant_delta
+
+
+def _headline_risk_delta_for_cluster(item: dict, interpretation: dict, *, impact: str, directional_risk: str) -> dict:
+    source_titles = [_text(title) for title in (item.get("_source_titles") or []) if _text(title)]
+    developments = [_text(value) for value in (interpretation.get("recent_developments") or []) if _text(value)]
+    previous_text = source_titles[0] if source_titles else (developments[0] if developments else "")
+    latest_text = source_titles[-1] if source_titles else (developments[-1] if developments else previous_text)
+    previous_impact = _classify_impact(previous_text, category=item.get("category"), phase=_classify_phase(previous_text, category=item.get("category")))
+    previous_interpretation = _interpret_event_title(previous_text, category=item.get("category")) if previous_text else {}
+    previous_phase = _classify_phase(previous_text, category=item.get("category"), interpretation=previous_interpretation)
+    previous_direction = _classify_directional_risk(previous_text, phase=previous_phase, interpretation=previous_interpretation)
+
+    previous_markers = _headline_state_markers(previous_text)
+    latest_markers = _headline_state_markers(latest_text)
+    added_markers = latest_markers - previous_markers
+    impact_up = _impact_rank(impact) > _impact_rank(previous_impact)
+    direction_up = previous_direction != "risk_off" and directional_risk == "risk_off"
+    direction_down = previous_direction == "risk_off" and directional_risk == "risk_on"
+
+    delta = "NONE"
+    if "deescalation" in added_markers or direction_down:
+        delta = "DEESCALATION"
+    elif added_markers & {"military_action", "shipping_energy_chokepoint"} or impact_up or direction_up:
+        delta = "ESCALATION"
+    elif len(source_titles) > 1 or len(developments) > 1:
+        delta = "MINOR_UPDATE"
+
+    duplicate_decision = "duplicate_headline_same_state" if delta in {"NONE", "MINOR_UPDATE"} else "headline_risk_update"
+    return {
+        "headline_risk_delta": delta,
+        "previous_risk_level": _stronger_regime_severity(previous_impact) or previous_impact or "",
+        "new_risk_level": _stronger_regime_severity(impact) or impact or "",
+        "risk_transition_reason": _headline_transition_reason(previous_text, latest_text, delta),
+        "duplicate_decision": duplicate_decision,
+        "headline_update_generated": delta == "ESCALATION",
     }
 
 
@@ -2077,6 +2285,12 @@ def _normalize_event_risk_item(item) -> dict | None:
             "risk_asymmetry": "",
             "continuation_mode": "",
             "strictness": "",
+            "headline_risk_delta": "NONE",
+            "previous_risk_level": "",
+            "new_risk_level": "",
+            "risk_transition_reason": "",
+            "duplicate_decision": "duplicate_headline_same_state",
+            "headline_update_generated": False,
         }
 
     if not isinstance(item, dict):
@@ -2114,6 +2328,12 @@ def _normalize_event_risk_item(item) -> dict | None:
         "risk_asymmetry": _text(item.get("risk_asymmetry")),
         "continuation_mode": _text(item.get("continuation_mode")),
         "strictness": _text(item.get("strictness")),
+        "headline_risk_delta": _text(item.get("headline_risk_delta")) if _text(item.get("headline_risk_delta")) in {"NONE", "MINOR_UPDATE", "ESCALATION", "DEESCALATION"} else "NONE",
+        "previous_risk_level": _text(item.get("previous_risk_level")),
+        "new_risk_level": _text(item.get("new_risk_level")),
+        "risk_transition_reason": _text(item.get("risk_transition_reason")),
+        "duplicate_decision": _text(item.get("duplicate_decision")) or "duplicate_headline_same_state",
+        "headline_update_generated": bool(item.get("headline_update_generated")),
     }
 
     if not out["event"]:
@@ -2190,10 +2410,21 @@ def normalize_event_risk_snapshot(raw) -> dict:
             existing["continuation_mode"] = normalized.get("continuation_mode")
         if normalized.get("strictness") and not existing.get("strictness"):
             existing["strictness"] = normalized.get("strictness")
+        if _headline_delta_rank(normalized.get("headline_risk_delta")) > _headline_delta_rank(existing.get("headline_risk_delta")):
+            for key in (
+                "headline_risk_delta",
+                "previous_risk_level",
+                "new_risk_level",
+                "risk_transition_reason",
+                "duplicate_decision",
+                "headline_update_generated",
+            ):
+                existing[key] = normalized.get(key)
 
     out.sort(key=_event_risk_sort_key, reverse=True)
 
     critical_fields = _critical_topic_snapshot_fields(out)
+    dominant_delta = _snapshot_headline_delta(out, critical_fields, _dominant_headline_delta(out))
     regime_layer = _build_event_risk_regime_layer(out)
     if critical_fields.get("headline_risk_active") and regime_layer:
         regime_layer = dict(regime_layer)
@@ -2213,6 +2444,7 @@ def normalize_event_risk_snapshot(raw) -> dict:
         "event_risk_context": out,
         "regime_layer": regime_layer,
         **critical_fields,
+        **dominant_delta,
     }
 
 
@@ -2405,6 +2637,12 @@ def _cluster_event_risk_items(items: list[dict]) -> list[dict]:
                 "source_title": " ".join(item.get("_source_titles") or []),
             }
         )
+        headline_delta = _headline_risk_delta_for_cluster(
+            item,
+            interpretation,
+            impact=impact,
+            directional_risk=directional_risk,
+        )
         out.append(
             {
                 "event": interpretation.get("event"),
@@ -2430,6 +2668,7 @@ def _cluster_event_risk_items(items: list[dict]) -> list[dict]:
                 "risk_asymmetry": regime_profile.get("risk_asymmetry") or "",
                 "continuation_mode": regime_profile.get("continuation_mode") or "",
                 "strictness": regime_profile.get("strictness") or "",
+                **headline_delta,
             }
         )
     return out
@@ -2582,6 +2821,12 @@ def attach_event_risk_context(
             "critical_topics",
             "dominant_critical_topic",
             "headline_risk_active",
+            "headline_risk_delta",
+            "previous_risk_level",
+            "new_risk_level",
+            "risk_transition_reason",
+            "duplicate_decision",
+            "headline_update_generated",
             "event_risk_level",
             "event_bias",
             "confirm_policy",
