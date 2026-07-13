@@ -378,6 +378,18 @@ class TestTgBotRouting(unittest.TestCase):
             [event["target_chat_id"] for event in result["signal_events"] if event["event"] == "telegram_publish"],
             [-1003493070625],
         )
+
+    def test_dima_window_env_does_not_change_manual_requested_signal_route(self) -> None:
+        previous = os.environ.get("TG_DIMA_SCHEDULED_MODE")
+        os.environ["TG_DIMA_SCHEDULED_MODE"] = "WINDOW_ONLY"
+        try:
+            result = self._run_symbol_publish(8556231754, symbol="ETH/USDT")
+        finally:
+            if previous is None:
+                os.environ.pop("TG_DIMA_SCHEDULED_MODE", None)
+            else:
+                os.environ["TG_DIMA_SCHEDULED_MODE"] = previous
+        self.assertEqual([call["chat_id"] for call in result["context"].bot.calls], [-1003493070625])
         self.assertEqual(len(result["aia_signal_calls"]), 1)
         payload, meta = result["aia_signal_calls"][0]
         self.assertEqual(meta["target_chat_id"], -1003493070625)

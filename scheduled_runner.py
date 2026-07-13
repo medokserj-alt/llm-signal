@@ -24,6 +24,7 @@ AGENT_STATE_REPO_ROOT = Path(os.getenv("STATE_GUARD_AGENT_REPO_ROOT", "/root/llm
 DEFAULT_STATE_GUARD_STATE_PATH = AGENT_STATE_REPO_ROOT / "logs/agent_trade_state.json"
 
 DEFAULT_TARGET_CHAT_IDS = [-1003492385200, -1003493070625, -1003530482991]
+DEFAULT_DIMA_CHAT_ID = -1003493070625
 DEFAULT_START_DATE = "2026-06-05"
 DEFAULT_SIGNAL_SLOTS = ["09:30", "12:30", "15:30", "18:30", "21:30", "00:30"]
 SCHEDULER_UID = -9000605
@@ -1549,7 +1550,7 @@ def render_replacement_prefix(decision: dict, candidate: dict) -> str:
 async def publish_plain_message(cfg: SchedulerConfig, message: str, *, dry_run: bool = False) -> list[int]:
     context = make_context(dry_run=dry_run)
     message_ids: list[int] = []
-    for channel in cfg.target_chat_ids:
+    for channel in scheduled_full_signal_targets(cfg):
         sent = await context.bot.send_message(chat_id=channel, text=message, parse_mode=None, disable_web_page_preview=True)
         if dry_run:
             message_ids.append(getattr(sent, "message_id", None))
@@ -1600,6 +1601,10 @@ class SchedulerConfig:
     scheduled_state_guard_duplicate_enforcement_enabled: bool = False
     scheduled_state_guard_manual_override_enabled: bool = False
     scheduled_state_guard_manual_override_reason: str = ""
+    dima_scheduled_mode: str = "FULL_SIGNAL"
+    dima_chat_id: int = DEFAULT_DIMA_CHAT_ID
+    dima_window_cooldown_minutes: int = 90
+    dima_macro_update_max_age_minutes: int = 60
 
     @classmethod
     def from_env(cls) -> "SchedulerConfig":
@@ -1642,7 +1647,23 @@ class SchedulerConfig:
             scheduled_state_guard_manual_override_reason=str(
                 os.getenv("SCHEDULED_STATE_GUARD_MANUAL_OVERRIDE_REASON", "")
             ).strip(),
+            dima_scheduled_mode=str(os.getenv("TG_DIMA_SCHEDULED_MODE", "FULL_SIGNAL")).strip().upper(),
+            dima_chat_id=parse_int_env("TG_DIMA_CHAT_ID", DEFAULT_DIMA_CHAT_ID),
+            dima_window_cooldown_minutes=max(1, parse_int_env("DIMA_WINDOW_COOLDOWN_MINUTES", 90)),
+            dima_macro_update_max_age_minutes=max(1, parse_int_env("DIMA_MACRO_UPDATE_MAX_AGE_MINUTES", 60)),
         )
+
+
+def dima_window_only(cfg: SchedulerConfig) -> bool:
+    return str(getattr(cfg, "dima_scheduled_mode", "FULL_SIGNAL") or "FULL_SIGNAL").strip().upper() == "WINDOW_ONLY"
+
+
+def scheduled_full_signal_targets(cfg: SchedulerConfig) -> list[int]:
+    targets = list(cfg.target_chat_ids)
+    if not dima_window_only(cfg):
+        return targets
+    dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
+    return [chat_id for chat_id in targets if chat_id != dima_chat_id]
 
 
 def publish_decision_log_path(now_utc: datetime) -> Path:
@@ -2158,7 +2179,7 @@ def render_macro_event_message(message_type: str, event: dict, classification: d
 async def publish_macro_event_message(cfg: SchedulerConfig, message: str, *, dry_run: bool = False) -> list[int]:
     context = make_context(dry_run=dry_run)
     message_ids: list[int] = []
-    for channel in cfg.target_chat_ids:
+    for channel in scheduled_full_signal_targets(cfg):
         sent = await context.bot.send_message(chat_id=channel, text=message, parse_mode=None, disable_web_page_preview=True)
         message_id = getattr(sent, "message_id", None)
         if isinstance(message_id, int):
@@ -2175,6 +2196,277 @@ def macro_message_allowed(state: dict, dedupe_key: str, message_type: str, now_u
         old_cls = existing.get("post_event_classification")
         return bool(classification and old_cls != classification)
     return False
+
+
+def _dima_focus(value) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"", "NONE", "UNKNOWN", "NO FOCUS"}:
+        return "none"
+    asset = text.split("/", 1)[0]
+    return f"{asset}/USDT"
+
+
+def _dima_direction(value) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"short", "sell", "bearish"}:
+        return "short"
+    if text in {"long", "buy", "bullish"}:
+        return "long"
+    return "observe"
+
+
+def classify_dima_window(ctx: dict) -> str:
+    status = str(ctx.get("aia_status") or ctx.get("status") or "").strip().upper()
+    focus = _dima_focus(ctx.get("focus_asset") or ctx.get("focus"))
+    direction = _dima_direction(ctx.get("focus_direction") or ctx.get("allowed_direction"))
+    event_bias = str(ctx.get("event_bias") or ctx.get("risk_regime") or "").strip().lower()
+    event_level = str(ctx.get("event_risk_level") or "").strip().lower()
+    confirm_policy = str(ctx.get("confirm_policy") or "").strip().lower()
+    if status in {"AVOID", "AVOID_HARD"} or ctx.get("allowed") is False:
+        return "AVOID_WINDOW"
+    if focus == "none":
+        return "AVOID_WINDOW" if event_bias == "risk_off" or event_level == "severe" else "WATCH_ONLY"
+    if direction == "long" and event_bias == "risk_off":
+        return "CAUTION_WINDOW"
+    if confirm_policy in {"defensive", "block_stale_confirm", "strict"}:
+        return "CAUTION_WINDOW"
+    return "GOOD_WINDOW" if direction in {"long", "short"} else "WATCH_ONLY"
+
+
+def dima_window_snapshot(ctx: dict) -> dict:
+    window_type = classify_dima_window(ctx)
+    focus = _dima_focus(ctx.get("focus_asset") or ctx.get("focus"))
+    direction = _dima_direction(ctx.get("focus_direction") or ctx.get("allowed_direction"))
+    event_bias = str(ctx.get("event_bias") or ctx.get("risk_regime") or "neutral").strip().lower()
+    return {
+        "window_type": window_type,
+        "focus": focus,
+        "direction": direction,
+        "risk_regime": event_bias,
+        "dedup_key": f"{window_type}|{focus}|{direction}",
+    }
+
+
+def render_dima_market_window(ctx: dict) -> str:
+    snap = dima_window_snapshot(ctx)
+    window_type = snap["window_type"]
+    focus = "нет" if snap["focus"] == "none" else snap["focus"]
+    direction = snap["direction"]
+    event_bias = snap["risk_regime"]
+    severe = str(ctx.get("event_risk_level") or "").strip().lower() == "severe"
+    topic = str(ctx.get("dominant_critical_topic") or "").lower()
+    geo_risk = severe or event_bias == "risk_off" or "shipping" in topic or "hormuz" in topic
+
+    if window_type in {"AVOID_WINDOW", "WATCH_ONLY"}:
+        situation = (
+            "сейчас плохое окно для нового входа."
+            if window_type == "AVOID_WINDOW"
+            else "рынок пока не даёт ясного торгового окна."
+        )
+        preferred = "наблюдение"
+        mode = "осторожный, без погони за движением"
+        actions = [
+            "не открывать новые позиции с рынка",
+            "не догонять уже начавшееся движение",
+            "ждать новый ретест или чистое восстановление уровня с подтверждением",
+            "старые идеи перепроверять перед входом",
+        ]
+        reasons = [
+            "активен тяжёлый геополитический риск" if geo_risk else "структура рынка остаётся смешанной",
+            "рынок не даёт явного лидера" if snap["focus"] == "none" else "направление пока не подтверждено",
+            "фон повышает вероятность ложных выносов",
+        ]
+        tail_title = "Следующее полезное окно:"
+        tail = [
+            "шорт — только после ретеста и подтверждённого отбоя вниз",
+            "лонг — только после явного восстановления уровня и ослабления давления продавцов",
+        ]
+    elif direction == "short":
+        situation = "рынок слабый; отскоки лучше рассматривать как возможность для продажи."
+        preferred = "шорт после подтверждения"
+        mode = "ждать ретест, без погони"
+        actions = [
+            "не продавать внизу после резкого импульса",
+            "ждать возврат к средней или зоне ретеста",
+            "действовать только после подтверждённого отбоя вниз",
+        ]
+        reasons = [
+            "общий фон остаётся защитным и поддерживает продавцов" if event_bias == "risk_off" else "структура поддерживает продажи от отскока",
+            "повышенный событийный риск может ускорить движение вниз" if geo_risk else "продолжение требует подтверждения",
+        ]
+        tail_title = "Что сломает идею:"
+        tail = [
+            "закрепление выше средней на часовом графике",
+            "ослабление геополитического риска" if geo_risk else "устойчивый разворот структуры вверх",
+            "сильный импульс спроса по BTC и ETH",
+        ]
+    else:
+        situation = "возможен тактический лонг, но фон остаётся хрупким."
+        preferred = "лонг только после подтверждения"
+        mode = "осторожно, ждать подтверждение"
+        actions = [
+            "ждать закрепление выше локальной зоны",
+            "не входить до подтверждения на пятнадцатиминутном графике",
+            "снижать размер позиции из-за событийного риска",
+        ]
+        reasons = [
+            "есть попытка восстановления структуры",
+            "фон пока не подходит для агрессивной погони" if geo_risk else "пробой ещё должен подтвердиться",
+        ]
+        tail_title = "Что сломает идею:"
+        tail = [
+            "новая геополитическая эскалация" if geo_risk else "возврат продавцов",
+            "возврат ниже средней на пятнадцатиминутном графике",
+            "резкое защитное движение по BTC и ETH",
+        ]
+
+    lines = [
+        "🧭 Рыночное окно",
+        "",
+        f"Ситуация: {situation}",
+        f"Фокус: {focus}",
+        f"Предпочтительное направление: {preferred}",
+        f"Режим: {mode}",
+        "",
+        "Что делать:",
+        *[f"- {item}" for item in actions],
+        "",
+        "Почему:",
+        *[f"- {item}" for item in reasons],
+        "",
+        tail_title,
+        *[f"- {item}" for item in tail],
+        "",
+        "👉 Для точного торгового плана запроси сигнал в канале Dima.",
+        "",
+        "Это не торговый сигнал.",
+    ]
+    return "\n".join(lines)
+
+
+def _dima_window_update_reason(previous: dict | None, current: dict) -> str:
+    if not isinstance(previous, dict):
+        return "первое сообщение об окне"
+    for key, reason in (
+        ("risk_regime", "изменился режим риска"),
+        ("focus", "изменился рыночный фокус"),
+        ("direction", "изменилось предпочтительное направление"),
+        ("window_type", "изменилось качество торгового окна"),
+    ):
+        if previous.get(key) != current.get(key):
+            return reason
+    return "истёк период защиты от повторов"
+
+
+async def maybe_publish_dima_market_window(
+    cfg: SchedulerConfig,
+    state: dict,
+    ctx: dict,
+    *,
+    now_utc: datetime,
+    dry_run: bool = False,
+) -> dict:
+    snap = dima_window_snapshot(ctx)
+    audit = {
+        "channel_mode": "WINDOW_ONLY" if dima_window_only(cfg) else "FULL_SIGNAL",
+        "window_message_sent": False,
+        "lifecycle_created": False,
+        "dima_manual_signal_preserved": True,
+        "dima_window_dedup_key": snap["dedup_key"],
+        "dima_window_cooldown_applied": False,
+        "dima_window_update_reason": None,
+    }
+    dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
+    if not dima_window_only(cfg) or dima_chat_id not in cfg.target_chat_ids:
+        return audit
+    previous = state.get("dima_window") if isinstance(state.get("dima_window"), dict) else None
+    important_change = bool(previous and any(previous.get(key) != snap.get(key) for key in ("risk_regime", "focus", "direction", "window_type")))
+    previous_at = None
+    if previous:
+        try:
+            previous_at = datetime.fromisoformat(str(previous.get("sent_at_utc") or "").replace("Z", "+00:00"))
+        except Exception:
+            previous_at = None
+    elapsed_minutes = (now_utc - previous_at).total_seconds() / 60.0 if previous_at else None
+    cooldown = int(getattr(cfg, "dima_window_cooldown_minutes", 90))
+    same_key = bool(previous and previous.get("dedup_key") == snap["dedup_key"])
+    if same_key and not important_change and elapsed_minutes is not None and elapsed_minutes < cooldown:
+        audit["dima_window_cooldown_applied"] = True
+        audit["dima_window_update_reason"] = "повторное окно подавлено периодом защиты"
+        return audit
+    context = make_context(dry_run=dry_run)
+    await context.bot.send_message(
+        chat_id=dima_chat_id,
+        text=render_dima_market_window(ctx),
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+    reason = _dima_window_update_reason(previous, snap)
+    state["dima_window"] = {**snap, "sent_at_utc": now_utc.isoformat().replace("+00:00", "Z")}
+    audit["window_message_sent"] = True
+    audit["dima_window_update_reason"] = reason
+    return audit
+
+
+def render_dima_macro_window(event: dict, classification: dict | None = None) -> str:
+    raw_name = str(event.get("event_name") or event.get("event") or "событие").strip()
+    name = (
+        raw_name.replace("Fed Bowman speech", "речь ФРС — Мишель Боуман")
+        .replace("Fed speech - ", "речь ФРС — ")
+        .replace("Governor Christopher J. Waller", "Кристофер Уоллер")
+        .replace("Fed ", "ФРС — ")
+    )
+    cls = classification if isinstance(classification, dict) else {}
+    bias = str(cls.get("bias_after_event") or cls.get("market_bias") or "neutral").lower()
+    reaction = "первая реакция BTC и ETH остаётся нейтральной" if bias in {"neutral", "unclear", "unknown"} else "первая реакция рынка уже направленная, но требует подтверждения"
+    return "\n".join(
+        [
+            "📊 Событийное окно",
+            "",
+            f"Событие: {name}",
+            "Статус: реакция ещё не подтверждена",
+            "Рекомендация: новые входы не открывать, дождаться одной-двух пятнадцатиминутных свечей",
+            "",
+            "Что важно:",
+            f"- {reaction}",
+            "- риск ложного движения повышен",
+            "- точный торговый план лучше запрашивать после подтверждения",
+            "",
+            "Это не торговый сигнал.",
+        ]
+    )
+
+
+async def maybe_publish_dima_macro_window(
+    cfg: SchedulerConfig,
+    event: dict,
+    classification: dict | None,
+    *,
+    now_utc: datetime,
+    dry_run: bool = False,
+) -> dict:
+    audit = {"dima_macro_window_sent": False, "dima_macro_stale_suppressed": False, "lifecycle_created": False}
+    dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
+    if not dima_window_only(cfg) or dima_chat_id not in cfg.target_chat_ids:
+        return audit
+    raw_time = event.get("event_time_utc")
+    try:
+        event_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+    except Exception:
+        event_time = None
+    max_age = int(getattr(cfg, "dima_macro_update_max_age_minutes", 60))
+    if event_time is not None and (now_utc - event_time).total_seconds() / 60.0 > max_age:
+        audit["dima_macro_stale_suppressed"] = True
+        return audit
+    context = make_context(dry_run=dry_run)
+    await context.bot.send_message(
+        chat_id=dima_chat_id,
+        text=render_dima_macro_window(event, classification),
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+    audit["dima_macro_window_sent"] = True
+    return audit
 
 
 def _norm(value, default="unknown") -> str:
@@ -2723,23 +3015,27 @@ async def generate_and_publish_signal(
     old_get_targets = tg_bot.get_main_publication_targets
     old_get_chat = tg_bot.get_main_publication_chat_id
     old_get_mode = tg_bot.get_user_mode
+    full_signal_targets = scheduled_full_signal_targets(cfg)
     try:
-        tg_bot.get_main_publication_targets = lambda uid: cfg.target_chat_ids.copy()
-        tg_bot.get_main_publication_chat_id = lambda uid: cfg.target_chat_ids[0] if cfg.target_chat_ids else None
+        tg_bot.get_main_publication_targets = lambda uid: full_signal_targets.copy()
+        tg_bot.get_main_publication_chat_id = lambda uid: full_signal_targets[0] if full_signal_targets else None
         tg_bot.get_user_mode = lambda uid: selected_mode
-        context = make_context(dry_run=dry_run)
-        ok = await tg_bot._publish_signal_result(
-            context,
-            SCHEDULER_UID,
-            text=publish_text,
-            target_chat_id=cfg.target_chat_ids[0],
-            delivery_kind="main",
-            source="scheduled_runner.py:generate_and_publish_signal",
-            symbol_hint=None,
-            sig_html=Path(sig_html),
-            run_log=Path(run_log) if run_log else None,
-            skip_aia_forward=True,
-        )
+        if full_signal_targets:
+            context = make_context(dry_run=dry_run)
+            ok = await tg_bot._publish_signal_result(
+                context,
+                SCHEDULER_UID,
+                text=publish_text,
+                target_chat_id=full_signal_targets[0],
+                delivery_kind="main",
+                source="scheduled_runner.py:generate_and_publish_signal",
+                symbol_hint=None,
+                sig_html=Path(sig_html),
+                run_log=Path(run_log) if run_log else None,
+                skip_aia_forward=True,
+            )
+        else:
+            ok = True
     finally:
         tg_bot.get_main_publication_targets = old_get_targets
         tg_bot.get_main_publication_chat_id = old_get_chat
@@ -2769,9 +3065,9 @@ async def generate_and_publish_signal(
         signal_json_v1 = tg_bot._build_signal_json_v1(
             signal_id=signal_id,
             published_at=published_at,
-            channel_id=cfg.target_chat_ids[0] if cfg.target_chat_ids else None,
-            origin_chat_id=cfg.target_chat_ids[0] if cfg.target_chat_ids else None,
-            publish_targets=cfg.target_chat_ids.copy(),
+            channel_id=full_signal_targets[0] if full_signal_targets else None,
+            origin_chat_id=full_signal_targets[0] if full_signal_targets else None,
+            publish_targets=full_signal_targets.copy(),
             symbol_hint=None,
             last_payload=payload,
             last_json_path=PROJECT_ROOT / "logs/last.json",
@@ -2802,6 +3098,12 @@ async def generate_and_publish_signal(
         "post_generation_event_risk_gate": True,
         "explicit_regime_flip_reason": post_generation_gate.get("explicit_regime_flip_reason"),
         "post_generation_event_risk_blocked_reason": post_generation_gate.get("blocked_reason"),
+        "channel_mode": "WINDOW_ONLY" if dima_window_only(cfg) else "FULL_SIGNAL",
+        "original_publication_type": duplicate_result.get("publication_type") or "full_signal",
+        "window_message_sent": False,
+        "lifecycle_created": False if dima_window_only(cfg) else bool(full_signal_targets and aia_forward.get("aia_forward_attempted")),
+        "dima_manual_signal_preserved": True,
+        "scheduled_full_signal_targets": full_signal_targets,
     }
 
 
@@ -2892,9 +3194,17 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         dedupe_key = macro_dedupe_key(event, message_type, str(macro_guard.get("phase") or "macro"), now_utc)
         should_send = macro_message_allowed(state, dedupe_key, message_type, now_utc, classification)
         message_ids: list[int] = []
+        dima_macro_audit: dict = {}
         if should_send:
             message = render_macro_event_message(message_type, event, classification)
             message_ids = await publish_macro_event_message(cfg, message, dry_run=dry_run)
+            dima_macro_audit = await maybe_publish_dima_macro_window(
+                cfg,
+                event,
+                classification,
+                now_utc=now_utc,
+                dry_run=dry_run,
+            )
             state.setdefault("macro_dedupe", {})[dedupe_key] = {
                 "sent_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
                 "macro_message_type": message_type,
@@ -2933,12 +3243,22 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "post_event_classification_status": "present" if classification else "missing",
                 "old_narrative_valid": classification.get("old_narrative_valid") if isinstance(classification, dict) else None,
                 "allowed_direction": classification.get("allowed_direction") if isinstance(classification, dict) else None,
+                **dima_macro_audit,
             }
         )
         if not dry_run:
             write_json_atomic(cfg.signal_state_path, state)
             append_jsonl(signal_decision_log_path(now_utc), row)
         return
+
+    dima_window_audit = await maybe_publish_dima_market_window(
+        cfg,
+        state,
+        gate,
+        now_utc=now_utc,
+        dry_run=dry_run,
+    )
+    row.update(dima_window_audit)
 
     if not gate["allowed"]:
         if attempt < cfg.max_attempts:
@@ -2999,6 +3319,8 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                     "aia_forward_error": result.get("aia_forward_error"),
                     "aia_forward_mode": result.get("aia_forward_mode"),
                     "aia_forward_warning": result.get("aia_forward_warning"),
+                    "original_publication_type": publication_type,
+                    **dima_window_audit,
                 }
             )
             for key in (
