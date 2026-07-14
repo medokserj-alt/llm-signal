@@ -41,6 +41,39 @@ class TestEventRiskContextLayer(unittest.TestCase):
         self.assertEqual((snapshot.get("dominant_critical_topic") or {}).get("topic_id"), "strategic_shipping_energy_chokepoint")
         self.assertEqual(snapshot.get("confirm_policy"), "block_stale_confirm")
 
+    def test_reuters_naval_blockade_and_regional_attacks_are_severe(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [2026-07-13 23:34 МСК] [impact:−] Iran escalates attacks across Gulf, Trump says US reinstating naval blockade of Iranian shipping in Strait of Hormuz",
+            calendar_events=[],
+        )
+        self.assertEqual(snapshot.get("event_risk_level"), "severe")
+        self.assertEqual(snapshot.get("event_bias"), "risk_off")
+        topics = {topic.get("topic_id") for topic in snapshot.get("critical_topics") or []}
+        self.assertIn("strategic_shipping_energy_chokepoint", topics)
+
+    def test_english_and_russian_natanz_strike_threats_are_severe(self) -> None:
+        headlines = (
+            "Trump says US will strike Iran very strongly today and may bomb the nuclear site at Natanz",
+            "США намерены нанести очень сильные удары по Ирану сегодня; Трамп допустил удар по ядерному объекту в Натанзе",
+        )
+        for headline in headlines:
+            with self.subTest(headline=headline):
+                snapshot = build_event_risk_context(f"- [impact:−] {headline}", calendar_events=[])
+                self.assertEqual(snapshot.get("event_risk_level"), "severe")
+                self.assertEqual(snapshot.get("event_bias"), "risk_off")
+                self.assertTrue(snapshot.get("headline_risk_active"))
+
+    def test_abandon_hormuz_cargo_fee_is_deescalation_not_severe_escalation(self) -> None:
+        snapshot = build_event_risk_context(
+            "- [impact:+] Trump says US to abandon proposed Strait of Hormuz cargo fee",
+            calendar_events=[],
+        )
+        self.assertNotEqual(snapshot.get("event_risk_level"), "severe")
+        self.assertNotEqual(snapshot.get("event_bias"), "risk_off")
+        item = snapshot["event_risk_context"][0]
+        self.assertEqual(item.get("directional_risk"), "risk_on")
+        self.assertNotEqual(snapshot.get("headline_risk_delta"), "ESCALATION")
+
     def test_same_iran_topic_same_severity_is_duplicate_same_state(self) -> None:
         snapshot = build_event_risk_context(
             "\n".join(

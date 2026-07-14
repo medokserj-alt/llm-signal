@@ -469,6 +469,24 @@ _GEO_MILITARY_THREAT_MARKERS = (
     "renewed military",
 )
 _HEADLINE_MILITARY_ESCALATION_MARKERS = (
+    "will strike iran",
+    "strike iran very strongly",
+    "strong strikes on iran",
+    "strikes today",
+    "strikes tomorrow",
+    "natanz",
+    "nuclear site threat",
+    "missile and drone attacks",
+    "attacks across gulf",
+    "houthis fire missiles",
+    "сша намерены нанести",
+    "сильные удары по ирану",
+    "сильный удар по ирану",
+    "сегодня мы нанесем",
+    "завтра тоже нанесем",
+    "натанз",
+    "ядерному объекту",
+    "бомбардировке",
     "military action",
     "military response",
     "military strike",
@@ -487,6 +505,12 @@ _HEADLINE_MILITARY_ESCALATION_MARKERS = (
     "struck iranian",
 )
 _HEADLINE_SHIPPING_ENERGY_ESCALATION_MARKERS = (
+    "naval blockade",
+    "blockade of iranian shipping",
+    "entire iranian coastline",
+    "all vessels",
+    "control of the strait of hormuz",
+    "oil up 9%",
     "hormuz closure",
     "strait of hormuz closure",
     "threatens hormuz closure",
@@ -512,6 +536,14 @@ _HEADLINE_DEESCALATION_MARKERS = (
     "shipping resumed",
     "strait reopened",
     "sanctions relief",
+    "abandon proposed",
+    "lift blockade",
+    "lifts blockade",
+    "reopen shipping",
+    "reopens shipping",
+    "talks resume",
+    "talks resumed",
+    "tensions ease",
 )
 _GEO_NEGOTIATION_MARKERS = (
     "talks",
@@ -1008,6 +1040,10 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
             "irgc",
             "houthis",
             "militia",
+            "иран",
+            "сша",
+            "трамп",
+            "натанз",
         ),
     )
     geo_phrases = _phrase_hits(
@@ -1043,6 +1079,23 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
             "retaliation",
             "proxy forces",
             "conflict expands",
+            "will strike iran",
+            "strike iran very strongly",
+            "strong strikes on iran",
+            "strikes today",
+            "strikes tomorrow",
+            "attacks across gulf",
+            "houthis fire missiles",
+            "natanz",
+            "nuclear site",
+            "сша намерены нанести",
+            "сильные удары по ирану",
+            "сильный удар по ирану",
+            "сегодня мы нанесем",
+            "завтра тоже нанесем",
+            "натанз",
+            "ядерному объекту",
+            "бомбардировке",
         ),
     )
     if geo_entities and geo_phrases:
@@ -1065,12 +1118,29 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
                 "war escalation",
                 "ceasefire collapse",
                 "ground offensive",
+                "will strike iran",
+                "strike iran very strongly",
+                "strong strikes on iran",
+                "strikes today",
+                "strikes tomorrow",
+                "attacks across gulf",
+                "houthis fire missiles",
+                "natanz",
+                "nuclear site",
+                "сша намерены нанести",
+                "сильные удары по ирану",
+                "сильный удар по ирану",
+                "сегодня мы нанесем",
+                "завтра тоже нанесем",
+                "натанз",
+                "ядерному объекту",
+                "бомбардировке",
             ),
         )
         topics.append(
             _critical_topic(
                 topic_id="geopolitical_military_escalation",
-                severity_floor="severe" if len(severe_markers) >= 2 else "high",
+                severity_floor="severe" if severe_markers else "high",
                 event_bias="risk_off",
                 matched_entities=geo_entities,
                 matched_phrases=geo_phrases,
@@ -1088,6 +1158,8 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
             "suez canal",
             "persian gulf",
             "gulf",
+            "ормуз",
+            "персидский залив",
         ),
     )
     shipping_phrases = _phrase_hits(
@@ -1103,13 +1175,22 @@ def detect_critical_topics_from_text(text: str) -> list[dict]:
             "oil tankers come under fire",
             "oil supply shock",
             "energy shock",
+            "naval blockade",
+            "blockade of iranian shipping",
+            "entire iranian coastline",
+            "all vessels",
+            "control of the strait of hormuz",
+            "блокад",
+            "судоходств",
         ),
     )
     if shipping_entities and shipping_phrases:
         topics.append(
             _critical_topic(
                 topic_id="strategic_shipping_energy_chokepoint",
-                severity_floor="severe" if any(p in shipping_phrases for p in ("blockade", "closure", "threatens to block", "threat to block")) else "high",
+                severity_floor="severe"
+                if any(("blockade" in p) or ("блокад" in p) or p in {"closure", "threatens to block", "threat to block"} for p in shipping_phrases)
+                else "high",
                 event_bias="risk_off",
                 matched_entities=shipping_entities,
                 matched_phrases=shipping_phrases,
@@ -1619,6 +1700,13 @@ def _is_scheduled_macro_title(title: str, calendar_events=None) -> bool:
 
 def _classify_category(title: str) -> str:
     low = _text(title).lower()
+    critical_topic_ids = {
+        _text(topic.get("topic_id"))
+        for topic in detect_critical_topics_from_text(title)
+        if isinstance(topic, dict)
+    }
+    if critical_topic_ids & {"geopolitical_military_escalation", "strategic_shipping_energy_chokepoint"}:
+        return "geopolitics"
     relevance = classify_market_relevance(title)
     relevance_category = _text(relevance.get("category"))
 
@@ -1718,6 +1806,9 @@ def _classify_directional_risk(title: str, *, phase: str, interpretation: dict |
 
     if _is_stablecoin_adoption_story(low):
         return "mixed"
+
+    if any(marker in low for marker in _HEADLINE_DEESCALATION_MARKERS):
+        return "risk_on"
 
     if phase in {"pre_event", "ongoing"} and anticipated_consequences:
         return "uncertain"
