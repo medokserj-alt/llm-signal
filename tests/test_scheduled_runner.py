@@ -101,7 +101,19 @@ class TestAiaGate(unittest.TestCase):
         )
         self.assertFalse(out["can_publish_full_signal"])
         self.assertEqual(out["publication_type"], "blocked_by_severe_risk")
-        self.assertEqual(out["blocked_reason"], "counter_risk_without_regime_flip")
+        self.assertEqual(out["execution_mode"], "BLOCKED")
+        self.assertEqual(out["blocked_reason"], "counter_risk_without_regime_confirmation")
+
+    def test_post_generation_background_severe_confirmed_major_long_is_tactical(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            {"symbol": "BTC/USDT", "direction": "long", "entry_mode": "wait_confirm"},
+            {"event_risk_level": "severe", "event_bias": "risk_off", "flow_bias": "bullish"},
+        )
+        self.assertTrue(out["can_publish_full_signal"])
+        self.assertEqual(out["execution_mode"], "TACTICAL_CONFIRM_ONLY")
+        self.assertEqual(out["publication_type"], "tactical_confirm_signal")
+        self.assertEqual(out["entry_mode_required"], "WAIT_CONFIRM")
+        self.assertEqual(out["risk_size_mode"], "REDUCED")
 
     def test_post_generation_severe_risk_off_short_is_allowed(self) -> None:
         out = sr.evaluate_post_generation_event_risk_gate(
@@ -117,6 +129,15 @@ class TestAiaGate(unittest.TestCase):
         )
         self.assertTrue(out["can_publish_full_signal"])
         self.assertEqual(out["explicit_regime_flip_reason"], "confirmed_market_reversal")
+
+    def test_immediate_fresh_escalation_still_blocks_counter_risk_long(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            {"symbol": "BTC/USDT", "direction": "long", "entry_mode": "wait_confirm"},
+            {"event_risk_level": "severe", "event_bias": "risk_off", "headline_risk_delta": "ESCALATION", "flow_bias": "bullish"},
+        )
+        self.assertFalse(out["can_publish_full_signal"])
+        self.assertEqual(out["execution_mode"], "BLOCKED")
+        self.assertEqual(out["blocked_reason"], "immediate_shock_counter_risk")
 
     def test_open_without_hard_block_allows_publish(self) -> None:
         out = sr.evaluate_aia_gate({"status": "OPEN", "preferred_mode": "aggressive"}, cfg())
@@ -217,7 +238,25 @@ class TestAiaGate(unittest.TestCase):
         self.assertFalse(out["allowed"])
         self.assertFalse(out["aia_avoid_soft_allowed"])
         self.assertFalse(out["soft_avoid_downgrade"])
-        self.assertIn("severe_block_stale_confirm_conflicts_event_bias", out["hard_block_reasons"])
+        self.assertIn("counter_risk_without_regime_confirmation", out["hard_block_reasons"])
+
+    def test_aia_background_severe_btc_long_becomes_tactical_not_hard_block(self) -> None:
+        out = sr.evaluate_aia_gate(
+            {
+                "status": "AVOID_HARD",
+                "preferred_mode": "conservative",
+                "event_risk_level": "severe",
+                "confirm_policy": "block_stale_confirm",
+                "event_bias": "risk_off",
+                "focus_asset": "BTC",
+                "focus_direction": "LONG",
+                "flow_bias": "bullish",
+            },
+            cfg(),
+        )
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["execution_mode"], "TACTICAL_CONFIRM_ONLY")
+        self.assertEqual(out["entry_mode_required"], "WAIT_CONFIRM")
 
     def test_strict_mode_blocks_avoid(self) -> None:
         c = cfg()
@@ -253,6 +292,19 @@ class TestAiaGate(unittest.TestCase):
         allowed = sr.evaluate_aia_gate({**base, "focus_asset": "BTC", "focus_direction": "SHORT"}, cfg())
         self.assertFalse(blocked["allowed"])
         self.assertTrue(allowed["allowed"])
+
+    def test_day_execution_policy_conflict_is_audited_not_forced(self) -> None:
+        out = sr.day_execution_policy_conflict(
+            {
+                "price_regime": "risk_on",
+                "day_preferred_direction": "LONG",
+                "day_focus": ["BTC", "ETH"],
+                "execution_mode": "BLOCKED",
+                "reason": "counter_risk_without_regime_confirmation",
+            }
+        )
+        self.assertTrue(out["day_execution_policy_conflict"])
+        self.assertEqual(out["downstream_execution_mode"], "BLOCKED")
 
     def test_severe_headline_escalation_blocks_counter_trend_without_regime_flip(self) -> None:
         blocked = sr.evaluate_aia_gate(

@@ -2222,6 +2222,15 @@ def classify_dima_window(ctx: dict) -> str:
     event_bias = str(ctx.get("event_bias") or ctx.get("risk_regime") or "").strip().lower()
     event_level = str(ctx.get("event_risk_level") or "").strip().lower()
     confirm_policy = str(ctx.get("confirm_policy") or "").strip().lower()
+    execution_mode = str(ctx.get("execution_mode") or "").strip().upper()
+    shock = _risk_shock_state(ctx).get("immediate_shock_window")
+    if execution_mode == "TACTICAL_CONFIRM_ONLY":
+        return "CAUTION_WINDOW"
+    if focus != "none" and direction in {"long", "short"} and not shock:
+        if direction == "long" and event_bias == "risk_off":
+            return "CAUTION_WINDOW"
+        if confirm_policy in {"defensive", "block_stale_confirm", "strict"}:
+            return "CAUTION_WINDOW"
     if status in {"AVOID", "AVOID_HARD"} or ctx.get("allowed") is False:
         return "AVOID_WINDOW"
     if focus == "none":
@@ -2301,23 +2310,29 @@ def render_dima_market_window(ctx: dict) -> str:
             "сильный импульс спроса по BTC и ETH",
         ]
     else:
-        situation = "возможен тактический лонг, но фон остаётся хрупким."
-        preferred = "лонг только после подтверждения"
-        mode = "осторожно, ждать подтверждение"
+        extended = bool(ctx.get("extended_breakout") or ctx.get("chase_risk") == "high")
+        situation = (
+            "рынок сохраняет бычью структуру, но вход с текущих уровней запоздал."
+            if extended
+            else "возможен тактический лонг, но фон остаётся хрупким."
+        )
+        preferred = "LONG после отката и подтверждения"
+        mode = "только WAIT_CONFIRM, без входа с рынка"
         actions = [
-            "ждать закрепление выше локальной зоны",
-            "не входить до подтверждения на пятнадцатиминутном графике",
-            "снижать размер позиции из-за событийного риска",
+            "ждать ретест EMA20 M15 или пробитого уровня",
+            "вход только после удержания уровня",
+            "не догонять импульс",
+            "использовать сниженный риск из-за Ирана/Ормуза" if geo_risk else "использовать сниженный риск до подтверждения",
         ]
         reasons = [
-            "есть попытка восстановления структуры",
+            "DAY/текущая структура допускает LONG-фокус" if direction == "long" else "есть попытка восстановления структуры",
             "фон пока не подходит для агрессивной погони" if geo_risk else "пробой ещё должен подтвердиться",
         ]
-        tail_title = "Что сломает идею:"
+        tail_title = "Что отменит сценарий:"
         tail = [
+            "потеря локального higher low",
+            "возврат под ключевой H1 уровень",
             "новая геополитическая эскалация" if geo_risk else "возврат продавцов",
-            "возврат ниже средней на пятнадцатиминутном графике",
-            "резкое защитное движение по BTC и ETH",
         ]
 
     lines = [
@@ -2502,6 +2517,133 @@ def is_risk_on_alt_long(asset: str, direction: str) -> bool:
     return asset.upper() not in {"BTC", "ETH"} and direction.lower() in {"long", "buy", "bullish"}
 
 
+def _candidate_entry_mode(candidate: dict) -> str:
+    return str(
+        candidate.get("entry_mode")
+        or candidate.get("strategy_type")
+        or candidate.get("entry_type")
+        or ""
+    ).strip().lower().replace("-", "_")
+
+
+def _is_confirm_only_candidate(candidate: dict) -> bool:
+    mode = _candidate_entry_mode(candidate)
+    if mode in {"wait_confirm", "confirm", "confirmation", "retest_confirm"}:
+        return True
+    status = str(candidate.get("lifecycle_status") or candidate.get("status") or "").strip().upper()
+    return status == "WAIT_CONFIRM"
+
+
+def _risk_shock_state(ctx: dict) -> dict:
+    headline_delta = _norm(ctx.get("headline_risk_delta"), "NONE").upper()
+    transition = str(ctx.get("risk_transition_reason") or "").strip().lower()
+    nearest = ctx.get("nearest_event_minutes")
+    try:
+        nearest_int = int(nearest) if nearest not in (None, "") else None
+    except (TypeError, ValueError):
+        nearest_int = None
+    immediate = bool(
+        headline_delta == "ESCALATION"
+        or "escalation" in transition
+        or ctx.get("event_risk_window_active")
+        or (nearest_int is not None and nearest_int <= 30)
+    )
+    return {
+        "immediate_shock_window": immediate,
+        "background_risk_active": _norm(ctx.get("event_risk_level"), "").lower() == "severe",
+        "immediate_shock_until": ctx.get("immediate_shock_until"),
+        "material_event_at": ctx.get("material_event_at") or ctx.get("headline_timestamp"),
+        "last_material_change_at": ctx.get("last_material_change_at") or ctx.get("headline_timestamp"),
+        "snapshot_built_at": ctx.get("snapshot_built_at") or ctx.get("event_risk_generated_at") or ctx.get("generated_at"),
+    }
+
+
+def _regime_confirmation_reasons(candidate: dict, ctx: dict) -> list[str]:
+    reasons: list[str] = []
+    asset = str(candidate.get("asset") or candidate.get("symbol") or ctx.get("focus_asset") or "").upper().split("/", 1)[0]
+    direction = _normalize_direction(candidate.get("direction") or ctx.get("focus_direction"))
+    flow_bias = _norm(ctx.get("flow_bias"), "").lower()
+    if asset in {"BTC", "ETH"}:
+        reasons.append("major_asset_btc_eth")
+    if direction == "long" and flow_bias in {"bullish", "neutral", "unknown", ""}:
+        reasons.append("flow_not_opposed")
+    if bool(ctx.get("market_override_detected") or ctx.get("market_override")):
+        reasons.append("market_override_detected")
+    if ctx.get("higher_timeframe_alignment") in {True, "true", "bullish", "aligned"}:
+        reasons.append("higher_timeframe_alignment")
+    day_direction = _day_bias_to_direction(
+        ctx.get("day_preferred_direction")
+        or ctx.get("day_bias")
+        or ctx.get("day_regime")
+        or ctx.get("price_regime")
+    )
+    if day_direction and day_direction == direction:
+        reasons.append("day_direction_aligned")
+    explicit = candidate.get("explicit_regime_flip_reason") or ctx.get("explicit_regime_flip_reason") or ctx.get("regime_flip_reason")
+    if explicit:
+        reasons.append(str(explicit))
+    return sorted(set(reasons))
+
+
+def determine_execution_mode(candidate: dict, gate_context: dict) -> dict:
+    direction = _normalize_direction(candidate.get("direction"))
+    event_risk_level = _norm(gate_context.get("event_risk_level"), "unknown").lower()
+    event_bias = _norm(gate_context.get("event_bias"), "unknown").lower()
+    shock = _risk_shock_state(gate_context)
+    conflict = direction_conflicts_event_bias(direction, event_bias)
+    reasons = _regime_confirmation_reasons(candidate, gate_context)
+    confirm_only = _is_confirm_only_candidate(candidate)
+    mode = "NORMAL"
+    blocked_reason = None
+    if event_risk_level == "severe" and event_bias == "risk_off" and conflict:
+        if shock["immediate_shock_window"]:
+            mode = "BLOCKED"
+            blocked_reason = "immediate_shock_counter_risk"
+        elif candidate.get("explicit_regime_flip_reason") or gate_context.get("explicit_regime_flip_reason") or gate_context.get("regime_flip_reason"):
+            mode = "TACTICAL_CONFIRM_ONLY" if confirm_only else "NORMAL"
+        elif confirm_only and len(reasons) >= 2:
+            mode = "TACTICAL_CONFIRM_ONLY"
+        else:
+            mode = "BLOCKED"
+            blocked_reason = "counter_risk_without_regime_confirmation"
+    return {
+        "execution_mode": mode,
+        "risk_size_mode": "REDUCED" if mode == "TACTICAL_CONFIRM_ONLY" else "STANDARD",
+        "regime_confirmation_reasons": reasons,
+        "entry_mode_required": "WAIT_CONFIRM" if mode == "TACTICAL_CONFIRM_ONLY" else None,
+        "blocked_reason": blocked_reason,
+        "candidate_confirm_only": confirm_only,
+        **shock,
+    }
+
+
+def day_execution_policy_conflict(ctx: dict) -> dict:
+    day_regime = str(ctx.get("day_regime") or ctx.get("price_regime") or "").strip().lower()
+    day_focus = ctx.get("day_focus") or ctx.get("day_candidates") or ctx.get("focus_asset")
+    day_direction = _day_bias_to_direction(
+        ctx.get("day_preferred_direction")
+        or ctx.get("preferred_direction")
+        or ctx.get("day_bias")
+        or day_regime
+    )
+    downstream = str(ctx.get("execution_mode") or "").strip().upper()
+    blocking = str(ctx.get("reason") or ",".join(ctx.get("hard_block_reasons") or [])).strip()
+    severe_only = bool(
+        downstream == "BLOCKED"
+        and "risk" in blocking.lower()
+        and not any(token in blocking.lower() for token in ("macro", "technical", "no_setup", "chaotic"))
+    )
+    conflict = bool(day_regime in {"risk_on", "bullish"} and day_direction == "long" and severe_only)
+    return {
+        "day_execution_policy_conflict": conflict,
+        "day_regime": day_regime,
+        "day_focus": day_focus,
+        "day_preferred_direction": day_direction,
+        "downstream_execution_mode": downstream or "unknown",
+        "blocking_reason": blocking,
+    }
+
+
 def evaluate_post_generation_event_risk_gate(candidate: dict, gate_context: dict) -> dict:
     direction = _normalize_direction(candidate.get("direction"))
     event_risk_level = _norm(gate_context.get("event_risk_level"), "unknown").lower()
@@ -2510,12 +2652,8 @@ def evaluate_post_generation_event_risk_gate(candidate: dict, gate_context: dict
         candidate.get("explicit_regime_flip_reason")
         or gate_context.get("explicit_regime_flip_reason")
     )
-    blocked = (
-        event_risk_level == "severe"
-        and event_bias == "risk_off"
-        and direction == "long"
-        and not explicit_regime_flip_reason
-    )
+    execution = determine_execution_mode(candidate, gate_context)
+    blocked = execution["execution_mode"] == "BLOCKED"
     return {
         "post_generation_event_risk_gate": True,
         "candidate_direction": direction,
@@ -2523,8 +2661,9 @@ def evaluate_post_generation_event_risk_gate(candidate: dict, gate_context: dict
         "event_risk_level": event_risk_level,
         "explicit_regime_flip_reason": explicit_regime_flip_reason,
         "can_publish_full_signal": not blocked,
-        "blocked_reason": "counter_risk_without_regime_flip" if blocked else None,
-        "publication_type": "blocked_by_severe_risk" if blocked else "full_signal",
+        "blocked_reason": execution.get("blocked_reason"),
+        "publication_type": "blocked_by_severe_risk" if blocked else "tactical_confirm_signal" if execution["execution_mode"] == "TACTICAL_CONFIRM_ONLY" else "full_signal",
+        **execution,
     }
 
 
@@ -2542,16 +2681,28 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         reasons.append("aia_status_avoid")
 
     candidate_conflict = direction_conflicts_event_bias(direction, event_bias)
-    if event_risk_level == "severe" and confirm_policy == "block_stale_confirm" and candidate_conflict:
-        reasons.append("severe_block_stale_confirm_conflicts_event_bias")
+    pseudo_candidate = {
+        "asset": asset,
+        "direction": direction,
+        "entry_mode": ctx.get("entry_mode") or ctx.get("candidate_entry_mode") or "wait_confirm",
+        "explicit_regime_flip_reason": ctx.get("explicit_regime_flip_reason"),
+    }
+    execution = determine_execution_mode(pseudo_candidate, ctx)
+    if (
+        event_risk_level == "severe"
+        and confirm_policy == "block_stale_confirm"
+        and candidate_conflict
+        and execution["execution_mode"] == "BLOCKED"
+    ):
+        reasons.append(execution.get("blocked_reason") or "severe_block_stale_confirm_conflicts_event_bias")
 
     dominant = ctx.get("dominant_critical_topic")
     critical_topics = ctx.get("critical_topics")
     critical_active = bool(dominant) or bool(critical_topics)
-    if critical_active and candidate_conflict:
+    if critical_active and candidate_conflict and execution["execution_mode"] == "BLOCKED":
         reasons.append("critical_topic_conflicts_event_bias")
 
-    if event_bias == "risk_off" and is_risk_on_alt_long(asset, direction):
+    if event_bias == "risk_off" and is_risk_on_alt_long(asset, direction) and execution["execution_mode"] == "BLOCKED":
         reasons.append("risk_off_alt_long_without_reset_reclaim")
 
     raw_day_bias = (
@@ -2638,6 +2789,16 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         "confirm_policy": confirm_policy,
         "aia_context_missing": bool(ctx.get("aia_context_missing")),
         "explicit_regime_flip_reason": explicit_regime_flip_reason,
+        "execution_mode": execution["execution_mode"] if not hard_block_reasons else "BLOCKED",
+        "risk_size_mode": execution["risk_size_mode"],
+        "regime_confirmation_reasons": execution["regime_confirmation_reasons"],
+        "entry_mode_required": execution["entry_mode_required"],
+        "immediate_shock_window": execution["immediate_shock_window"],
+        "background_risk_active": execution["background_risk_active"],
+        "material_event_at": execution["material_event_at"],
+        "last_material_change_at": execution["last_material_change_at"],
+        "snapshot_built_at": execution["snapshot_built_at"],
+        "immediate_shock_until": execution["immediate_shock_until"],
     }
 
 
@@ -2982,7 +3143,7 @@ async def generate_and_publish_signal(
     if not post_generation_gate["can_publish_full_signal"]:
         return {
             "published": False,
-            "reason": "counter_risk_without_regime_flip",
+            "reason": post_generation_gate.get("blocked_reason") or "post_generation_event_risk_gate",
             "signal_id": None,
             "candidate_signal_id": signal_id,
             "artifact_path": relpath(Path(sig_html)),
@@ -3108,6 +3269,7 @@ async def generate_and_publish_signal(
 
 
 def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, slot_time: datetime, attempt: int, gate: dict) -> dict:
+    policy_conflict = day_execution_policy_conflict(gate)
     return {
         "ts_utc": now_utc.isoformat().replace("+00:00", "Z"),
         "slot_id": slot_id,
@@ -3139,10 +3301,21 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
         "event_bias": gate.get("event_bias", "unknown"),
         "confirm_policy": gate.get("confirm_policy", "unknown"),
         "hard_block_reasons": gate.get("hard_block_reasons", []),
+        "execution_mode": gate.get("execution_mode", "NORMAL"),
+        "risk_size_mode": gate.get("risk_size_mode"),
+        "regime_confirmation_reasons": gate.get("regime_confirmation_reasons", []),
+        "entry_mode_required": gate.get("entry_mode_required"),
+        "immediate_shock_window": gate.get("immediate_shock_window"),
+        "background_risk_active": gate.get("background_risk_active"),
+        "material_event_at": gate.get("material_event_at"),
+        "last_material_change_at": gate.get("last_material_change_at"),
+        "snapshot_built_at": gate.get("snapshot_built_at"),
+        "immediate_shock_until": gate.get("immediate_shock_until"),
         "target_chat_ids": cfg.target_chat_ids,
         "signal_id": None,
         "error": None,
         "aia_context_missing": bool(gate.get("aia_context_missing")),
+        **policy_conflict,
     }
 
 

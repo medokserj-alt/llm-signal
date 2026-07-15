@@ -110,8 +110,23 @@ class DimaWindowModeTests(unittest.TestCase):
         )
         self.assertEqual(sr.classify_dima_window(context), "CAUTION_WINDOW")
         message = sr.render_dima_market_window(context)
-        self.assertIn("лонг только после подтверждения", message)
+        self.assertIn("LONG после отката и подтверждения", message)
         self.assertIn("фон остаётся хрупким", message)
+
+    def test_avoid_hard_with_btc_long_background_risk_still_shows_retest_window(self) -> None:
+        context = _avoid_context(
+            aia_status="AVOID_HARD",
+            allowed=False,
+            focus_asset="BTC",
+            focus_direction="LONG",
+            flow_bias="bullish",
+        )
+        self.assertEqual(sr.classify_dima_window(context), "CAUTION_WINDOW")
+        message = sr.render_dima_market_window(context)
+        self.assertIn("Фокус: BTC/USDT", message)
+        self.assertIn("LONG после отката и подтверждения", message)
+        self.assertIn("ждать ретест EMA20 M15 или пробитого уровня", message)
+        self.assertIn("не догонять импульс", message)
 
     def test_repeated_same_window_is_suppressed_during_cooldown(self) -> None:
         cfg = _cfg()
