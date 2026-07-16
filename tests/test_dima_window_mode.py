@@ -128,6 +128,75 @@ class DimaWindowModeTests(unittest.TestCase):
         self.assertIn("ждать ретест EMA20 M15 или пробитого уровня", message)
         self.assertIn("не догонять импульс", message)
 
+    def test_post_generation_tactical_context_reaches_dima_renderer(self) -> None:
+        gate = _avoid_context(
+            aia_status="AVOID_HARD",
+            allowed=True,
+            focus_asset="none",
+            focus_direction="observe only",
+            flow_bias="bullish",
+        )
+        result = {
+            "execution_mode": "TACTICAL_CONFIRM_ONLY",
+            "risk_size_mode": "REDUCED",
+            "entry_mode_required": "WAIT_CONFIRM",
+            "last_payload": {
+                "symbol": "BTC/USDT",
+                "direction": "long",
+                "entry_mode": "wait_confirm",
+                "extended_breakout": True,
+            },
+        }
+
+        context = sr._dima_context_from_signal_result(gate, result)
+        self.assertEqual(context["focus_asset"], "BTC/USDT")
+        self.assertEqual(context["focus_direction"], "long")
+        self.assertEqual(context["execution_mode"], "TACTICAL_CONFIRM_ONLY")
+
+        message = sr.render_dima_market_window(context)
+        self.assertIn("Фокус: BTC/USDT", message)
+        self.assertIn("LONG после отката и подтверждения", message)
+        self.assertIn("рынок сохраняет бычью структуру", message)
+
+    def test_execution_mode_change_bypasses_generic_window_cooldown(self) -> None:
+        cfg = _cfg()
+        state = {}
+        now = datetime(2026, 7, 13, 9, 30, tzinfo=timezone.utc)
+        asyncio.run(
+            sr.maybe_publish_dima_market_window(
+                cfg,
+                state,
+                _avoid_context(
+                    aia_status="WATCH",
+                    allowed=True,
+                    focus_asset="BTC",
+                    focus_direction="LONG",
+                    execution_mode="NORMAL",
+                ),
+                now_utc=now,
+                dry_run=True,
+            )
+        )
+        changed = asyncio.run(
+            sr.maybe_publish_dima_market_window(
+                cfg,
+                state,
+                _avoid_context(
+                    aia_status="WATCH",
+                    allowed=True,
+                    focus_asset="BTC",
+                    focus_direction="LONG",
+                    execution_mode="TACTICAL_CONFIRM_ONLY",
+                ),
+                now_utc=now + timedelta(minutes=10),
+                dry_run=True,
+            )
+        )
+
+        self.assertTrue(changed["window_message_sent"])
+        self.assertFalse(changed["dima_window_cooldown_applied"])
+        self.assertEqual(changed["dima_window_audit_reason"], "execution_mode_changed")
+
     def test_repeated_same_window_is_suppressed_during_cooldown(self) -> None:
         cfg = _cfg()
         state = {}

@@ -1739,5 +1739,293 @@ class TestScheduledSignalState(unittest.TestCase):
         self.assertEqual(row["preferred_mode_ignored_reason"], "soft_gate_no_hard_block")
 
 
+class TestScheduledCandidateFunnelObservability(unittest.TestCase):
+    def _row(self, c: sr.SchedulerConfig | None = None) -> dict:
+        c = c or cfg()
+        gate = sr.evaluate_aia_gate(
+            {
+                "status": "AVOID_HARD",
+                "preferred_mode": "conservative",
+                "event_risk_level": "severe",
+                "event_bias": "risk_off",
+                "flow_bias": "neutral",
+            },
+            c,
+        )
+        return sr.base_signal_log_row(
+            datetime(2026, 7, 16, 19, 30, tzinfo=timezone.utc),
+            c,
+            "20260716_2130",
+            sr.slot_datetime_msk(date(2026, 7, 16), "21:30"),
+            2,
+            gate,
+        )
+
+    def test_candidate_selected_publish_row_includes_funnel_and_top_level_fields(self) -> None:
+        c = cfg()
+        c.dima_scheduled_mode = "WINDOW_ONLY"
+        row = self._row(c)
+        row.update({"decision": "publish", "reason": "published"})
+        result = {
+            "published": True,
+            "reason": "published",
+            "signal_id": "20260716_223000",
+            "publication_type": "full_signal",
+            "scheduled_full_signal_targets": sr.scheduled_full_signal_targets(c),
+            "aia_forward_attempted": True,
+            "aia_forward_ok": True,
+            "last_payload": {
+                "symbol": "BTC/USDT",
+                "direction": "short",
+                "entry_mode": "wait_confirm",
+                "entry": 64328.57,
+                "sl": 64971.86,
+                "tp1": 63621.0,
+                "tp2": 62979.0,
+                "tp3": 62398.71,
+                "rr": 3.0,
+                "rr_by_mode": {"aggressive": 3.0},
+                "confidence": "Low",
+                "price_vs_ema20_m15": "below",
+                "price_vs_ema20_h1": "below",
+                "ema_fan_m15_state": "bear",
+                "ema_fan_h1_state": "mixed",
+                "confirmation_rules": ["wait_for_retest"],
+                "validity_minutes": 360,
+                "confirm_profile_used": "strict_event_confirm",
+            },
+            "can_publish_full_signal": True,
+            "post_generation_event_risk_gate": True,
+            "execution_mode": "NORMAL",
+            "risk_size_mode": "STANDARD",
+            "event_risk_level": "severe",
+            "event_bias": "risk_off",
+            "immediate_shock_window": False,
+            "background_risk_active": True,
+        }
+
+        sr.add_scheduled_decision_observability(row, c, result)
+
+        funnel = row["candidate_funnel"]
+        self.assertEqual(row["decision"], "publish")
+        self.assertEqual(funnel["stage"], "PUBLICATION_SENT")
+        self.assertTrue(funnel["candidate_generated"])
+        self.assertEqual(funnel["selected_symbol"], "BTC/USDT")
+        self.assertEqual(funnel["selected_direction"], "short")
+        self.assertEqual(funnel["entry"], 64328.57)
+        self.assertEqual(funnel["stop_loss"], 64971.86)
+        self.assertEqual(funnel["take_profit_1"], 63621.0)
+        self.assertEqual(funnel["take_profit_2"], 62979.0)
+        self.assertEqual(funnel["take_profit_3"], 62398.71)
+        self.assertEqual(funnel["risk_reward"], 3.0)
+        self.assertEqual(funnel["required_risk_reward"], 1.0)
+        self.assertEqual(funnel["risk_reward_gap"], 2.0)
+        self.assertTrue(funnel["full_signal_eligible"])
+        self.assertEqual(funnel["publication_targets"], ["Sergey", "mixed"])
+        self.assertEqual(row["publication_audit"]["payload_type"], "FULL_SIGNAL")
+        self.assertTrue(row["publication_audit"]["targets"]["Sergey"]["sent"])
+        self.assertTrue(row["publication_audit"]["targets"]["mixed"]["sent"])
+        self.assertTrue(row["publication_audit"]["targets"]["Dima"]["skipped"])
+        self.assertTrue(row["wait_confirm_lifecycle_audit"]["lifecycle_handoff_attempted"])
+        self.assertTrue(row["wait_confirm_lifecycle_audit"]["aia_ingest_occurred"])
+
+    def test_no_candidate_row_marks_candidate_generated_false(self) -> None:
+        c = cfg()
+        row = self._row(c)
+        row.update({"decision": "cancel", "reason": "no_valid_signal_candidate"})
+
+        sr.add_scheduled_decision_observability(row, c, {"published": False, "reason": "no_valid_signal_candidate"})
+
+        self.assertEqual(row["candidate_funnel"]["stage"], "NO_CANDIDATE")
+        self.assertFalse(row["candidate_funnel"]["candidate_generated"])
+        self.assertEqual(row["candidate_funnel"]["candidate_count"], 0)
+
+    def test_contract_rejected_btc_short_records_rr_required_and_gap(self) -> None:
+        c = cfg()
+        row = self._row(c)
+        row.update({"decision": "cancel", "reason": "signal_core_no_trade"})
+        result = {
+            "published": False,
+            "reason": "signal_core_no_trade",
+            "last_payload": {
+                "symbol": "BTC/USDT",
+                "direction": "short",
+                "entry": 100.0,
+                "sl": 110.0,
+                "tp1": 96.0,
+                "tp2": 93.5,
+                "rr": 0.65,
+                "rr_by_mode": {"aggressive": 0.65},
+                "no_trade": True,
+                "no_trade_reasons": ["risk_reward_below_minimum"],
+            },
+        }
+
+        sr.add_scheduled_decision_observability(row, c, result)
+
+        funnel = row["candidate_funnel"]
+        self.assertEqual(funnel["stage"], "CONTRACT_REJECTED")
+        self.assertEqual(funnel["risk_reward"], 0.65)
+        self.assertEqual(funnel["required_risk_reward"], 1.0)
+        self.assertAlmostEqual(funnel["risk_reward_gap"], -0.35)
+        self.assertIn("risk_reward_must_reach_required_minimum", funnel["conditions_to_eligibility"])
+
+    def test_policy_blocked_bnb_long_preserves_contract_details(self) -> None:
+        c = cfg()
+        row = self._row(c)
+        row.update({"decision": "cancel", "reason": "counter_risk_without_regime_confirmation"})
+        result = {
+            "published": False,
+            "reason": "counter_risk_without_regime_confirmation",
+            "blocked_reason": "counter_risk_without_regime_confirmation",
+            "publication_type": "blocked_by_severe_risk",
+            "can_publish_full_signal": False,
+            "execution_mode": "BLOCKED",
+            "risk_size_mode": "STANDARD",
+            "event_risk_level": "severe",
+            "event_bias": "risk_off",
+            "immediate_shock_window": False,
+            "background_risk_active": True,
+            "last_payload": {
+                "symbol": "BNB/USDT",
+                "direction": "long",
+                "entry": 700.0,
+                "sl": 690.0,
+                "tp1": 710.0,
+                "tp2": 720.86,
+                "rr": 2.086,
+                "rr_by_mode": {"aggressive": 2.086},
+                "entry_mode": "wait_confirm",
+            },
+        }
+
+        sr.add_scheduled_decision_observability(row, c, result)
+
+        funnel = row["candidate_funnel"]
+        self.assertEqual(funnel["stage"], "POLICY_BLOCKED")
+        self.assertEqual(funnel["selected_symbol"], "BNB/USDT")
+        self.assertEqual(funnel["risk_reward"], 2.086)
+        self.assertEqual(funnel["required_risk_reward"], 1.0)
+        self.assertFalse(funnel["full_signal_eligible"])
+        self.assertIn("counter_risk_without_regime_confirmation", funnel["full_signal_block_reasons"])
+        self.assertIn("blocked_by_severe_risk", funnel["full_signal_block_reasons"])
+        self.assertIn("regime_confirmation_required", funnel["conditions_to_eligibility"])
+        self.assertIn("severe_risk_must_clear_or_policy_must_allow_confirm_only", funnel["conditions_to_eligibility"])
+
+    def test_condition_mapping_is_deterministic_and_ignores_generic_signal_core_when_specific_exists(self) -> None:
+        out = sr._conditions_to_eligibility(
+            [
+                "signal_core_no_trade",
+                "counter_regime_long_requires_fresh_reclaim",
+                "blocked_by_severe_risk",
+                "counter_regime_long_requires_fresh_reclaim",
+            ]
+        )
+
+        self.assertEqual(out, ["fresh_reclaim_required", "severe_risk_must_clear_or_policy_must_allow_confirm_only"])
+
+    def test_missing_numeric_values_remain_null(self) -> None:
+        c = cfg()
+        row = self._row(c)
+        row.update({"decision": "cancel", "reason": "signal_core_no_trade"})
+        sr.add_scheduled_decision_observability(
+            row,
+            c,
+            {"published": False, "reason": "signal_core_no_trade", "last_payload": {"symbol": "ETH/USDT", "direction": "long"}},
+        )
+
+        funnel = row["candidate_funnel"]
+        self.assertIsNone(funnel["entry"])
+        self.assertIsNone(funnel["stop_loss"])
+        self.assertIsNone(funnel["risk_reward"])
+        self.assertIsNone(funnel["risk_reward_gap"])
+
+    def test_dima_window_routing_audit_uses_logical_names_only(self) -> None:
+        c = cfg()
+        row = self._row(c)
+        row.update(
+            {
+                "decision": "defer",
+                "window_message_sent": True,
+                "dima_window_update_reason": "изменился рыночный фокус",
+                "dima_window_audit_reason": "focus_changed",
+            }
+        )
+
+        sr.add_scheduled_decision_observability(row, c, stage=sr.FUNNEL_STAGE_WINDOW_ONLY)
+
+        audit = row["publication_audit"]
+        self.assertEqual(row["candidate_funnel"]["stage"], "WINDOW_ONLY")
+        self.assertEqual(audit["payload_type"], "WINDOW_ONLY")
+        self.assertTrue(audit["targets"]["Dima"]["sent"])
+        self.assertFalse(audit["targets"]["Sergey"]["sent"])
+        self.assertNotIn("-100", json.dumps(row["candidate_funnel"]))
+        self.assertNotIn("-100", json.dumps(row["publication_audit"]))
+
+    def test_retry_dedupe_behavior_and_key_ignore_diagnostics(self) -> None:
+        c = cfg()
+        row = self._row(c)
+        row.update({"decision": "duplicate_skip", "reason": "already_published", "signal_id": "sig-1"})
+
+        sr.add_scheduled_decision_observability(row, c, stage=sr.FUNNEL_STAGE_RETRY_DEDUPED)
+
+        dedupe_identity = (row["slot_id"], row["attempt"], row["signal_id"])
+        row["candidate_funnel"]["stage"] = "PUBLICATION_SENT"
+        self.assertEqual(dedupe_identity, (row["slot_id"], row["attempt"], row["signal_id"]))
+
+    def test_historical_row_without_candidate_funnel_is_readable(self) -> None:
+        row = json.loads('{"slot_id":"20260716_2130","decision":"publish"}')
+
+        self.assertEqual(row.get("slot_id"), "20260716_2130")
+        self.assertIsNone(row.get("candidate_funnel"))
+
+    def test_run_signal_slot_persists_observability_without_changing_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = cfg(Path(tmpdir))
+            c.dima_scheduled_mode = "WINDOW_ONLY"
+            state = {"slots": {}}
+            slot_time = sr.slot_datetime_msk(date(2026, 7, 16), "21:30")
+            result = {
+                "published": True,
+                "reason": "published",
+                "signal_id": "20260716_223000",
+                "publication_type": "full_signal",
+                "scheduled_full_signal_targets": sr.scheduled_full_signal_targets(c),
+                "aia_forward_attempted": True,
+                "aia_forward_ok": True,
+                "last_payload": {
+                    "symbol": "BTC/USDT",
+                    "direction": "short",
+                    "entry_mode": "wait_confirm",
+                    "entry": 64328.57,
+                    "sl": 64971.86,
+                    "tp1": 63621.0,
+                    "tp2": 62979.0,
+                    "tp3": 62398.71,
+                    "rr": 3.0,
+                    "rr_by_mode": {"aggressive": 3.0},
+                },
+                "can_publish_full_signal": True,
+                "execution_mode": "NORMAL",
+                "event_risk_level": "severe",
+                "event_bias": "risk_off",
+                "immediate_shock_window": False,
+                "background_risk_active": True,
+            }
+            with patch("scheduled_runner.LOGS_DIR", Path(tmpdir) / "logs"), patch(
+                "scheduled_runner.load_aia_context",
+                return_value={"status": "AVOID_HARD", "preferred_mode": "conservative", "event_risk_level": "severe", "event_bias": "risk_off"},
+            ), patch("scheduled_runner.generate_and_publish_signal", return_value=result):
+                with patch("scheduled_runner.maybe_publish_dima_market_window", return_value={"window_message_sent": False}):
+                    asyncio.run(sr.run_signal_slot(datetime(2026, 7, 16, 19, 30, tzinfo=timezone.utc), c, state, "20260716_2130", slot_time, 2, dry_run=False))
+
+            row = json.loads((Path(tmpdir) / "logs" / "scheduled_signal_decisions_20260716.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(row["decision"], "publish")
+            self.assertEqual(row["candidate_funnel"]["stage"], "PUBLICATION_SENT")
+            self.assertEqual(row["candidate_funnel"]["entry"], 64328.57)
+            self.assertEqual(row["publication_audit"]["payload_type"], "FULL_SIGNAL")
+            self.assertEqual(state["slots"]["20260716_2130"]["status"], "published")
+
+
 if __name__ == "__main__":
     unittest.main()

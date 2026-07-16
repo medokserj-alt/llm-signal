@@ -497,6 +497,379 @@ def _rr_for_signal(signal: dict) -> float | None:
     return round(reward / risk, 4) if reward > 0 else None
 
 
+FUNNEL_STAGE_PRE_GENERATION = "PRE_GENERATION"
+FUNNEL_STAGE_NO_CANDIDATE = "NO_CANDIDATE"
+FUNNEL_STAGE_CANDIDATE_SELECTED = "CANDIDATE_SELECTED"
+FUNNEL_STAGE_CONTRACT_REJECTED = "CONTRACT_REJECTED"
+FUNNEL_STAGE_POLICY_BLOCKED = "POLICY_BLOCKED"
+FUNNEL_STAGE_WAIT_CONFIRM_PERSISTED = "WAIT_CONFIRM_PERSISTED"
+FUNNEL_STAGE_FULL_SIGNAL_ELIGIBLE = "FULL_SIGNAL_ELIGIBLE"
+FUNNEL_STAGE_WINDOW_ONLY = "WINDOW_ONLY"
+FUNNEL_STAGE_PUBLICATION_SENT = "PUBLICATION_SENT"
+FUNNEL_STAGE_PUBLICATION_SKIPPED = "PUBLICATION_SKIPPED"
+FUNNEL_STAGE_RETRY_DEDUPED = "RETRY_DEDUPED"
+FUNNEL_STAGE_RUN_CANCELLED = "RUN_CANCELLED"
+FUNNEL_STAGE_RUN_FAILED = "RUN_FAILED"
+
+
+def _clean_list(value) -> list:
+    if value in (None, "", {}, []):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [item for item in value if item not in (None, "", [], {})]
+    return [value]
+
+
+def _first_present(*values):
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _selected_mode_required_rr(mode: str | None, payload: dict) -> float | None:
+    for key in ("required_risk_reward", "required_rr", "min_rr_required", "rr_min_required"):
+        value = _try_float(payload.get(key))
+        if value is not None:
+            return value
+    mode = str(mode or payload.get("mode") or payload.get("requested_mode") or "").strip().lower()
+    if mode == "aggressive":
+        return 1.0
+    if mode in {"neutral", "conservative"}:
+        return 1.5
+    return None
+
+
+def _mode_rr(payload: dict, mode: str | None, candidate: dict) -> float | None:
+    rr_by_mode = payload.get("rr_by_mode") if isinstance(payload.get("rr_by_mode"), dict) else {}
+    mode_key = str(mode or payload.get("mode") or payload.get("requested_mode") or "").strip().lower()
+    return _first_present(
+        _try_float(rr_by_mode.get(mode_key)) if mode_key else None,
+        _try_float(payload.get("risk_reward")),
+        _rr_for_signal(candidate),
+    )
+
+
+def _conditions_to_eligibility(reasons: list) -> list[str]:
+    mapping = {
+        "counter_regime_long_requires_fresh_reclaim": "fresh_reclaim_required",
+        "alt_long_conflicts_with_risk_off_requires_fresh_reclaim": "fresh_reclaim_required",
+        "macro_event_direction_requires_fresh_reclaim": "fresh_reclaim_required",
+        "counter_risk_without_regime_confirmation": "regime_confirmation_required",
+        "blocked_by_severe_risk": "severe_risk_must_clear_or_policy_must_allow_confirm_only",
+        "risk_reward_below_minimum": "risk_reward_must_reach_required_minimum",
+        "confirmation_missing": "wait_confirm_rules_must_pass",
+        "immediate_shock_active": "immediate_shock_window_must_expire",
+        "immediate_shock_counter_risk": "immediate_shock_window_must_expire",
+        "fresh_reclaim_missing": "fresh_reclaim_required",
+        "regime_flip_missing": "regime_confirmation_required",
+    }
+    out: list[str] = []
+    lowered = [str(reason).strip().lower() for reason in reasons if str(reason).strip()]
+    concrete = [reason for reason in lowered if reason != "signal_core_no_trade"]
+    for reason in concrete or lowered:
+        condition = mapping.get(reason)
+        if not condition and ("недостаточный rr" in reason or "risk_reward" in reason or "rr" in reason and "below" in reason):
+            condition = "risk_reward_must_reach_required_minimum"
+        if condition and condition not in out:
+            out.append(condition)
+    return out
+
+
+def _candidate_funnel_base(stage: str = FUNNEL_STAGE_PRE_GENERATION) -> dict:
+    return {
+        "stage": stage,
+        "candidate_generated": False,
+        "candidate_count": 0,
+        "considered_symbols": [],
+        "considered_directions": [],
+        "selected_symbol": None,
+        "selected_direction": None,
+        "entry_mode": None,
+        "candidate_score": None,
+        "structure_score": None,
+        "confirmation_score": None,
+        "confidence": None,
+        "entry": None,
+        "stop_loss": None,
+        "take_profit": None,
+        "take_profit_1": None,
+        "take_profit_2": None,
+        "take_profit_3": None,
+        "risk_reward": None,
+        "required_risk_reward": None,
+        "risk_reward_gap": None,
+        "price_structure": None,
+        "day_regime": None,
+        "day_focus": [],
+        "mid_regime": None,
+        "m15_state": None,
+        "h1_state": None,
+        "ema20_m15_relation": None,
+        "ema20_h1_relation": None,
+        "ema_fan_m15": None,
+        "ema_fan_h1": None,
+        "adx_m15": None,
+        "volume_confirmation": None,
+        "fresh_reclaim_required": None,
+        "fresh_reclaim_present": None,
+        "regime_flip_required": None,
+        "regime_flip_present": None,
+        "confirmation_required": None,
+        "confirmation_rules": [],
+        "confirmation_deadline_minutes": None,
+        "immediate_shock_active": None,
+        "immediate_shock_until": None,
+        "background_risk_active": None,
+        "event_risk_level": None,
+        "event_bias": None,
+        "risk_size_mode": None,
+        "execution_mode": None,
+        "pre_generation_gate": None,
+        "post_generation_gate": None,
+        "full_signal_eligible": None,
+        "full_signal_block_reasons": [],
+        "no_trade_reasons": [],
+        "publication_targets": [],
+        "publication_result": None,
+        "conditions_to_eligibility": [],
+    }
+
+
+def build_candidate_funnel(row: dict, cfg: SchedulerConfig, result: dict | None = None, *, stage: str | None = None) -> dict:
+    result = result if isinstance(result, dict) else {}
+    payload = result.get("last_payload") if isinstance(result.get("last_payload"), dict) else {}
+    candidate = _candidate_from_payload(payload, signal_id=result.get("candidate_signal_id") or result.get("signal_id")) if payload else {}
+    selected_mode = row.get("selected_mode") or result.get("selected_mode") or payload.get("mode") or payload.get("requested_mode")
+    rr = _mode_rr(payload, selected_mode, candidate) if payload else _try_float(row.get("rr_new"))
+    required_rr = _selected_mode_required_rr(str(selected_mode), payload) if payload else None
+    rr_gap = round(rr - required_rr, 6) if rr is not None and required_rr is not None else None
+    reasons = []
+    reasons.extend(_clean_list(result.get("reason") or row.get("reason")))
+    reasons.extend(_clean_list(result.get("blocked_reason") or row.get("blocked_reason")))
+    reasons.extend(_clean_list(result.get("publication_type") if result.get("publication_type") == "blocked_by_severe_risk" else None))
+    reasons.extend(_clean_list(payload.get("no_trade_reasons")))
+    reasons.extend(_clean_list(payload.get("hard_block_conditions")))
+    if rr is not None and required_rr is not None and rr < required_rr:
+        reasons.append("risk_reward_below_minimum")
+
+    final_stage = stage or _infer_candidate_funnel_stage(row, result, payload, rr, required_rr)
+    funnel = _candidate_funnel_base(final_stage)
+    if payload:
+        symbol = candidate.get("display_symbol") or candidate.get("symbol")
+        direction = candidate.get("direction")
+        funnel.update(
+            {
+                "candidate_generated": True,
+                "candidate_count": 1,
+                "considered_symbols": _clean_list(payload.get("considered_symbols") or symbol),
+                "considered_directions": _clean_list(payload.get("considered_directions") or direction),
+                "selected_symbol": symbol,
+                "selected_direction": direction,
+                "entry_mode": payload.get("entry_mode") or candidate.get("strategy_type"),
+                "candidate_score": _try_float(payload.get("candidate_score") or payload.get("score") or payload.get("confidence_score")),
+                "structure_score": _try_float(payload.get("structure_score")),
+                "confirmation_score": _try_float(payload.get("confirmation_score")),
+                "confidence": payload.get("confidence"),
+                "entry": _first_present(candidate.get("entry_price"), _try_float(payload.get("entry"))),
+                "stop_loss": candidate.get("sl"),
+                "take_profit": _first_present(candidate.get("tp2"), candidate.get("tp1"), candidate.get("tp3")),
+                "take_profit_1": candidate.get("tp1"),
+                "take_profit_2": candidate.get("tp2"),
+                "take_profit_3": candidate.get("tp3"),
+                "risk_reward": rr,
+                "required_risk_reward": required_rr,
+                "risk_reward_gap": rr_gap,
+                "price_structure": _first_present(payload.get("price_structure"), payload.get("ema_guard_state")),
+                "day_regime": _first_present(payload.get("day_regime"), row.get("day_regime")),
+                "day_focus": _clean_list(payload.get("day_focus") or row.get("day_focus")),
+                "mid_regime": payload.get("mid_regime"),
+                "m15_state": _first_present(payload.get("m15_state"), payload.get("price_vs_ema20_m15")),
+                "h1_state": _first_present(payload.get("h1_state"), payload.get("price_vs_ema20_h1")),
+                "ema20_m15_relation": payload.get("price_vs_ema20_m15"),
+                "ema20_h1_relation": payload.get("price_vs_ema20_h1"),
+                "ema_fan_m15": _first_present(payload.get("ema_fan_m15"), payload.get("ema_fan_m15_state")),
+                "ema_fan_h1": _first_present(payload.get("ema_fan_h1"), payload.get("ema_fan_h1_state")),
+                "adx_m15": _first_present(payload.get("adx_m15"), (payload.get("adx_guard") or {}).get("state") if isinstance(payload.get("adx_guard"), dict) else payload.get("adx_guard")),
+                "volume_confirmation": payload.get("volume_confirmation"),
+                "fresh_reclaim_required": any("fresh_reclaim" in str(reason) for reason in reasons),
+                "fresh_reclaim_present": _first_present(payload.get("fresh_reclaim"), payload.get("fresh_reset_reclaim"), payload.get("fresh_higher_low_after_reset")),
+                "regime_flip_required": any("regime_confirmation" in str(reason) or "regime_flip" in str(reason) for reason in reasons),
+                "regime_flip_present": bool(_first_present(payload.get("explicit_regime_flip_reason"), payload.get("regime_flip_reason"), result.get("explicit_regime_flip_reason"))),
+                "confirmation_required": _first_present(result.get("confirmation_required"), payload.get("entry_mode") == "wait_confirm", row.get("entry_mode_required") == "WAIT_CONFIRM"),
+                "confirmation_rules": _clean_list(payload.get("confirmation_rules")),
+                "confirmation_deadline_minutes": _try_float(_first_present(payload.get("confirm_timeout_minutes"), payload.get("validity_minutes"), payload.get("max_valid_minutes"))),
+            }
+        )
+    else:
+        funnel["candidate_count"] = 0
+
+    targets = _publication_target_names(cfg, result)
+    full_signal_eligible = _first_present(result.get("can_publish_full_signal"), result.get("state_guard_can_publish_full_signal"))
+    if result.get("published") and str(result.get("publication_type") or "full_signal") == "full_signal":
+        full_signal_eligible = True
+    funnel.update(
+        {
+            "immediate_shock_active": _first_present(result.get("immediate_shock_window"), row.get("immediate_shock_window")),
+            "immediate_shock_until": _first_present(result.get("immediate_shock_until"), row.get("immediate_shock_until")),
+            "background_risk_active": _first_present(result.get("background_risk_active"), row.get("background_risk_active")),
+            "event_risk_level": _first_present(result.get("event_risk_level"), row.get("event_risk_level"), payload.get("event_risk_level")),
+            "event_bias": _first_present(result.get("event_bias"), row.get("event_bias"), payload.get("event_bias")),
+            "risk_size_mode": _first_present(result.get("risk_size_mode"), row.get("risk_size_mode")),
+            "execution_mode": _first_present(result.get("execution_mode"), row.get("execution_mode")),
+            "pre_generation_gate": "allowed" if row.get("hard_block_reasons") in ([], None) and row.get("decision") not in {"cancel", "defer"} else row.get("reason"),
+            "post_generation_gate": _first_present(result.get("publication_type"), result.get("post_generation_event_risk_blocked_reason"), result.get("blocked_reason")),
+            "full_signal_eligible": full_signal_eligible,
+            "full_signal_block_reasons": list(dict.fromkeys([str(reason) for reason in reasons if str(reason) not in {"published", "no_valid_signal_candidate"}])),
+            "no_trade_reasons": _clean_list(payload.get("no_trade_reasons")),
+            "publication_targets": targets,
+            "publication_result": _publication_result_label(row, result),
+        }
+    )
+    funnel["conditions_to_eligibility"] = _conditions_to_eligibility(funnel["full_signal_block_reasons"])
+    return funnel
+
+
+def _infer_candidate_funnel_stage(row: dict, result: dict, payload: dict, rr: float | None, required_rr: float | None) -> str:
+    decision = str(row.get("decision") or "").strip().lower()
+    reason = str(result.get("reason") or row.get("reason") or "").strip()
+    publication_type = str(result.get("publication_type") or row.get("publication_type") or "").strip().lower()
+    if decision == "duplicate_skip":
+        return FUNNEL_STAGE_RETRY_DEDUPED
+    if decision == "error":
+        return FUNNEL_STAGE_RUN_FAILED
+    if reason == "no_valid_signal_candidate":
+        return FUNNEL_STAGE_NO_CANDIDATE
+    if decision in {"cancel", "skipped_disabled"} and not payload:
+        return FUNNEL_STAGE_RUN_CANCELLED
+    if result.get("published"):
+        if publication_type == "full_signal":
+            return FUNNEL_STAGE_PUBLICATION_SENT
+        return FUNNEL_STAGE_PUBLICATION_SKIPPED
+    if payload and (payload.get("no_trade") or reason == "signal_core_no_trade"):
+        if rr is not None and required_rr is not None and rr < required_rr:
+            return FUNNEL_STAGE_CONTRACT_REJECTED
+        no_trade = " ".join(str(item).lower() for item in _clean_list(payload.get("no_trade_reasons")) + _clean_list(payload.get("no_trade_hint")))
+        if "rr" in no_trade or "уров" in no_trade or "level" in no_trade:
+            return FUNNEL_STAGE_CONTRACT_REJECTED
+        return FUNNEL_STAGE_NO_CANDIDATE
+    if publication_type == "blocked_by_severe_risk" or result.get("can_publish_full_signal") is False:
+        return FUNNEL_STAGE_POLICY_BLOCKED
+    if payload:
+        if result.get("aia_forward_attempted") and _candidate_entry_mode(_candidate_from_payload(payload)) == "wait_confirm":
+            return FUNNEL_STAGE_WAIT_CONFIRM_PERSISTED
+        return FUNNEL_STAGE_FULL_SIGNAL_ELIGIBLE
+    if row.get("window_message_sent"):
+        return FUNNEL_STAGE_WINDOW_ONLY
+    return FUNNEL_STAGE_PRE_GENERATION
+
+
+def _logical_target_name(chat_id: int, cfg: SchedulerConfig) -> str | None:
+    dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
+    if int(chat_id) == dima_chat_id:
+        return "Dima"
+    non_dima = [item for item in cfg.target_chat_ids if int(item) != dima_chat_id]
+    if non_dima and int(chat_id) == int(non_dima[0]):
+        return "Sergey"
+    if len(non_dima) > 1 and int(chat_id) == int(non_dima[1]):
+        return "mixed"
+    return None
+
+
+def _publication_target_names(cfg: SchedulerConfig, result: dict | None = None) -> list[str]:
+    result = result if isinstance(result, dict) else {}
+    raw_targets = result.get("scheduled_full_signal_targets")
+    targets = raw_targets if isinstance(raw_targets, list) else scheduled_full_signal_targets(cfg)
+    names: list[str] = []
+    for chat_id in targets:
+        name = _logical_target_name(int(chat_id), cfg)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _publication_result_label(row: dict, result: dict) -> str | None:
+    if result.get("published"):
+        return "sent"
+    if result:
+        return "skipped"
+    if row.get("window_message_sent"):
+        return "sent"
+    if row.get("dima_window_cooldown_applied"):
+        return "skipped"
+    return None
+
+
+def build_publication_audit(row: dict, cfg: SchedulerConfig, result: dict | None = None) -> dict:
+    result = result if isinstance(result, dict) else {}
+    publication_type = str(result.get("publication_type") or row.get("publication_type") or "").strip().lower()
+    payload_type = None
+    if row.get("window_message_sent") or row.get("dima_window_cooldown_applied"):
+        payload_type = "WINDOW_ONLY"
+    if publication_type == "full_signal" or (result.get("published") and not publication_type):
+        payload_type = "FULL_SIGNAL"
+    elif publication_type in {"active_signal_update", "management_update", "conflict_update", "urgent_review", "replace_wait_confirm", "suppress_duplicate"}:
+        payload_type = "LIFECYCLE_NOTIFICATION"
+    audit = {
+        "payload_type": payload_type,
+        "targets": {
+            "Dima": {"expected": False, "created": False, "sender_seen": None, "sent": False, "skipped": False, "reason": None},
+            "Sergey": {"expected": False, "created": False, "sender_seen": None, "sent": False, "skipped": False, "reason": None},
+            "mixed": {"expected": False, "created": False, "sender_seen": None, "sent": False, "skipped": False, "reason": None},
+        },
+    }
+    if payload_type == "WINDOW_ONLY":
+        target = audit["targets"]["Dima"]
+        target.update(
+            {
+                "expected": dima_window_only(cfg),
+                "created": bool(row.get("window_message_sent") or row.get("dima_window_cooldown_applied")),
+                "sender_seen": True if row.get("window_message_sent") else None,
+                "sent": bool(row.get("window_message_sent")),
+                "skipped": bool(row.get("dima_window_cooldown_applied")),
+                "reason": row.get("dima_window_audit_reason") or row.get("dima_window_update_reason"),
+            }
+        )
+        return audit
+    expected_names = _publication_target_names(cfg, result)
+    for name in expected_names:
+        target = audit["targets"][name]
+        target["expected"] = True
+        target["created"] = bool(result)
+        target["sender_seen"] = True if result.get("published") and payload_type == "FULL_SIGNAL" else None
+        target["sent"] = bool(result.get("published") and payload_type == "FULL_SIGNAL")
+        target["skipped"] = bool(result and not result.get("published"))
+        target["reason"] = result.get("reason")
+    if dima_window_only(cfg) and payload_type == "FULL_SIGNAL":
+        audit["targets"]["Dima"].update({"expected": False, "created": False, "sent": False, "skipped": True, "reason": "dima_window_only"})
+    return audit
+
+
+def build_wait_confirm_lifecycle_audit(row: dict, result: dict | None = None) -> dict:
+    result = result if isinstance(result, dict) else {}
+    payload = result.get("last_payload") if isinstance(result.get("last_payload"), dict) else {}
+    entry_mode = str(payload.get("entry_mode") or "").strip().lower()
+    attempted = bool(result.get("aia_forward_attempted")) if entry_mode == "wait_confirm" else False
+    return {
+        "lifecycle_handoff_attempted": attempted,
+        "lifecycle_record_created": bool(result.get("lifecycle_created")) if result.get("lifecycle_created") is not None else False,
+        "confirm_rule_version": payload.get("confirm_profile_used"),
+        "confirmation_rules": _clean_list(payload.get("confirmation_rules")),
+        "confirmation_deadline_minutes": _try_float(_first_present(payload.get("confirm_timeout_minutes"), payload.get("validity_minutes"), payload.get("max_valid_minutes"))),
+        "watcher_visible_id": result.get("signal_id") or result.get("candidate_signal_id"),
+        "aia_ingest_occurred": result.get("aia_forward_ok") if attempted else None,
+        "async_market_watch_followup_required": True if attempted and result.get("aia_forward_ok") else None,
+        "observed_lifecycle_state": None,
+    }
+
+
+def add_scheduled_decision_observability(row: dict, cfg: SchedulerConfig, result: dict | None = None, *, stage: str | None = None) -> dict:
+    row["candidate_funnel"] = build_candidate_funnel(row, cfg, result, stage=stage)
+    row["publication_audit"] = build_publication_audit(row, cfg, result)
+    row["wait_confirm_lifecycle_audit"] = build_wait_confirm_lifecycle_audit(row, result)
+    return row
+
+
 def _distance_pct(a: float | None, b: float | None) -> float | None:
     if a is None or b is None:
         return None
@@ -2247,12 +2620,16 @@ def dima_window_snapshot(ctx: dict) -> dict:
     focus = _dima_focus(ctx.get("focus_asset") or ctx.get("focus"))
     direction = _dima_direction(ctx.get("focus_direction") or ctx.get("allowed_direction"))
     event_bias = str(ctx.get("event_bias") or ctx.get("risk_regime") or "neutral").strip().lower()
+    execution_mode = str(ctx.get("execution_mode") or "UNSPECIFIED").strip().upper() or "UNSPECIFIED"
+    window_quality = str(ctx.get("window_quality") or window_type).strip().upper() or window_type
     return {
         "window_type": window_type,
+        "window_quality": window_quality,
+        "execution_mode": execution_mode,
         "focus": focus,
         "direction": direction,
         "risk_regime": event_bias,
-        "dedup_key": f"{window_type}|{focus}|{direction}",
+        "dedup_key": f"{window_type}|{execution_mode}|{focus}|{direction}|{event_bias}|{window_quality}",
     }
 
 
@@ -2373,6 +2750,69 @@ def _dima_window_update_reason(previous: dict | None, current: dict) -> str:
     return "истёк период защиты от повторов"
 
 
+def _dima_window_audit_reason(previous: dict | None, current: dict, *, same_slot: bool = False) -> str:
+    if same_slot:
+        return "same_slot_retry_dedup"
+    if not isinstance(previous, dict):
+        return "new_scheduled_slot_refresh"
+    for key, reason in (
+        ("execution_mode", "execution_mode_changed"),
+        ("focus", "focus_changed"),
+        ("direction", "direction_changed"),
+        ("window_quality", "window_quality_changed"),
+        ("risk_regime", "material_window_change"),
+        ("window_type", "material_window_change"),
+    ):
+        if previous.get(key) != current.get(key):
+            return reason
+    return "identical_window_cooldown"
+
+
+def _dima_context_from_signal_result(gate: dict, result: dict) -> dict:
+    ctx = dict(gate)
+    if not isinstance(result, dict):
+        return ctx
+
+    payload = result.get("last_payload") if isinstance(result.get("last_payload"), dict) else {}
+    if payload:
+        candidate = _candidate_from_payload(payload, signal_id=result.get("candidate_signal_id") or result.get("signal_id"))
+        symbol = candidate.get("display_symbol") or candidate.get("symbol")
+        direction = candidate.get("direction")
+        if symbol:
+            ctx["focus_asset"] = symbol
+            ctx.setdefault("focus", symbol)
+        if direction:
+            ctx["focus_direction"] = direction
+            ctx.setdefault("allowed_direction", direction)
+        entry_mode = payload.get("entry_mode") or candidate.get("strategy_type")
+        if entry_mode:
+            ctx["entry_mode"] = entry_mode
+        for key in ("extended_breakout", "chase_risk", "explicit_regime_flip_reason"):
+            if payload.get(key) not in (None, "", [], {}):
+                ctx[key] = payload.get(key)
+
+    for key in (
+        "execution_mode",
+        "risk_size_mode",
+        "entry_mode_required",
+        "regime_confirmation_reasons",
+        "blocked_reason",
+        "candidate_confirm_only",
+        "can_publish_full_signal",
+        "publication_type",
+        "post_generation_event_risk_gate",
+        "immediate_shock_window",
+        "background_risk_active",
+        "immediate_shock_until",
+        "material_event_at",
+        "last_material_change_at",
+        "snapshot_built_at",
+    ):
+        if result.get(key) not in (None, "", [], {}):
+            ctx[key] = result.get(key)
+    return ctx
+
+
 async def maybe_publish_dima_market_window(
     cfg: SchedulerConfig,
     state: dict,
@@ -2390,12 +2830,19 @@ async def maybe_publish_dima_market_window(
         "dima_window_dedup_key": snap["dedup_key"],
         "dima_window_cooldown_applied": False,
         "dima_window_update_reason": None,
+        "dima_window_audit_reason": None,
     }
     dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
     if not dima_window_only(cfg) or dima_chat_id not in cfg.target_chat_ids:
         return audit
     previous = state.get("dima_window") if isinstance(state.get("dima_window"), dict) else None
-    important_change = bool(previous and any(previous.get(key) != snap.get(key) for key in ("risk_regime", "focus", "direction", "window_type")))
+    important_change = bool(
+        previous
+        and any(
+            previous.get(key) != snap.get(key)
+            for key in ("execution_mode", "risk_regime", "focus", "direction", "window_type", "window_quality")
+        )
+    )
     previous_at = None
     if previous:
         try:
@@ -2405,9 +2852,12 @@ async def maybe_publish_dima_market_window(
     elapsed_minutes = (now_utc - previous_at).total_seconds() / 60.0 if previous_at else None
     cooldown = int(getattr(cfg, "dima_window_cooldown_minutes", 90))
     same_key = bool(previous and previous.get("dedup_key") == snap["dedup_key"])
+    current_slot = str(ctx.get("slot_id") or "").strip()
+    same_slot = bool(current_slot and previous and previous.get("slot_id") == current_slot)
     if same_key and not important_change and elapsed_minutes is not None and elapsed_minutes < cooldown:
         audit["dima_window_cooldown_applied"] = True
         audit["dima_window_update_reason"] = "повторное окно подавлено периодом защиты"
+        audit["dima_window_audit_reason"] = _dima_window_audit_reason(previous, snap, same_slot=same_slot)
         return audit
     context = make_context(dry_run=dry_run)
     await context.bot.send_message(
@@ -2417,9 +2867,10 @@ async def maybe_publish_dima_market_window(
         disable_web_page_preview=True,
     )
     reason = _dima_window_update_reason(previous, snap)
-    state["dima_window"] = {**snap, "sent_at_utc": now_utc.isoformat().replace("+00:00", "Z")}
+    state["dima_window"] = {**snap, "sent_at_utc": now_utc.isoformat().replace("+00:00", "Z"), "slot_id": current_slot or None}
     audit["window_message_sent"] = True
     audit["dima_window_update_reason"] = reason
+    audit["dima_window_audit_reason"] = _dima_window_audit_reason(previous, snap)
     return audit
 
 
@@ -3327,6 +3778,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         row = base_signal_log_row(now_utc, cfg, slot_id, slot_time, attempt, gate)
         row.update({"decision": "duplicate_skip", "reason": f"already_{current.get('status')}", "signal_id": current.get("signal_id")})
         if not dry_run:
+            add_scheduled_decision_observability(row, cfg, stage=FUNNEL_STAGE_RETRY_DEDUPED)
             append_jsonl(signal_decision_log_path(now_utc), row)
         return
 
@@ -3421,19 +3873,19 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         )
         if not dry_run:
             write_json_atomic(cfg.signal_state_path, state)
+            add_scheduled_decision_observability(row, cfg, stage=FUNNEL_STAGE_PUBLICATION_SKIPPED)
             append_jsonl(signal_decision_log_path(now_utc), row)
         return
 
-    dima_window_audit = await maybe_publish_dima_market_window(
-        cfg,
-        state,
-        gate,
-        now_utc=now_utc,
-        dry_run=dry_run,
-    )
-    row.update(dima_window_audit)
-
     if not gate["allowed"]:
+        dima_window_audit = await maybe_publish_dima_market_window(
+            cfg,
+            state,
+            {**gate, "slot_id": slot_id},
+            now_utc=now_utc,
+            dry_run=dry_run,
+        )
+        row.update(dima_window_audit)
         if attempt < cfg.max_attempts:
             retry_at = slot_time + timedelta(minutes=cfg.retry_delay_minutes)
             slots[slot_id] = {
@@ -3461,11 +3913,24 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
             row.update({"decision": "cancel", "reason": gate["reason"]})
         if not dry_run:
             write_json_atomic(cfg.signal_state_path, state)
+            add_scheduled_decision_observability(
+                row,
+                cfg,
+                stage=FUNNEL_STAGE_RUN_CANCELLED if row.get("decision") == "cancel" else FUNNEL_STAGE_PRE_GENERATION,
+            )
             append_jsonl(signal_decision_log_path(now_utc), row)
         return
 
     try:
         result = await generate_and_publish_signal(str(gate["selected_mode"]), cfg, dry_run=dry_run, now_utc=now_utc, gate=gate)
+        dima_window_audit = await maybe_publish_dima_market_window(
+            cfg,
+            state,
+            {**_dima_context_from_signal_result(gate, result), "slot_id": slot_id},
+            now_utc=now_utc,
+            dry_run=dry_run,
+        )
+        row.update(dima_window_audit)
         state_guard_shadow_available = "state_guard_status" in result
         if result.get("published"):
             publication_type = str(result.get("publication_type") or "full_signal")
@@ -3603,6 +4068,17 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "blocked_reason",
                 "publication_type",
                 "can_publish_full_signal",
+                "execution_mode",
+                "risk_size_mode",
+                "entry_mode_required",
+                "regime_confirmation_reasons",
+                "candidate_confirm_only",
+                "immediate_shock_window",
+                "background_risk_active",
+                "immediate_shock_until",
+                "material_event_at",
+                "last_material_change_at",
+                "snapshot_built_at",
             ):
                 if key in result:
                     row[key] = result.get(key)
@@ -3620,6 +4096,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         row.update({"decision": "error", "reason": "system_routing_api_error", "error": str(exc)})
     if not dry_run:
         write_json_atomic(cfg.signal_state_path, state)
+        add_scheduled_decision_observability(row, cfg, result if "result" in locals() else None)
         append_jsonl(signal_decision_log_path(now_utc), row)
         if "state_guard_shadow_available" in locals() and state_guard_shadow_available:
             append_jsonl(scheduled_state_guard_shadow_log_path(now_utc), state_guard_shadow_log_row(now_utc, slot_id, result))
@@ -3703,6 +4180,7 @@ async def run_due_jobs(now_utc: datetime | None = None, *, job: str = "all", dry
                 row = base_signal_log_row(now_utc, cfg, slot_id, slot_time, attempt, gate)
                 row.update({"decision": "skipped_disabled", "reason": "scheduled_signal_disabled"})
                 if not dry_run:
+                    add_scheduled_decision_observability(row, cfg, stage=FUNNEL_STAGE_RUN_CANCELLED)
                     append_jsonl(signal_decision_log_path(now_utc), row)
         else:
             for slot_id, slot_time, attempt in due_slots:
