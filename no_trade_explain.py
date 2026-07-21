@@ -87,6 +87,54 @@ def _parse_mode_fallback(warnings: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _contract_mode_reason(reason: str, requested_mode: str, contract_mode: str) -> str:
+    """Correct stale mode labels in diagnostics without changing eligibility."""
+    text = str(reason or "").strip()
+    if not text or requested_mode == contract_mode:
+        return text
+    return re.sub(
+        rf"(?i)(по\s+режиму\s+){re.escape(requested_mode)}\b",
+        rf"\g<1>{contract_mode}",
+        text,
+    )
+
+
+def _persist_mode_contract_audit(d: dict) -> tuple[str, str, str]:
+    warnings = _get_warnings(d)
+    fallback_src, fallback_dst = _parse_mode_fallback(warnings)
+    requested = normalize_mode(d.get("requested_mode") or fallback_src or d.get("mode"))
+    effective = normalize_mode(fallback_dst or d.get("mode"))
+    contract = normalize_mode(d.get("contract_mode") or effective)
+
+    d["requested_mode"] = requested
+    d["effective_mode"] = effective
+    d["contract_mode"] = contract
+    d["published_mode"] = effective
+    if requested != effective and not d.get("mode_transition_reason"):
+        d["mode_transition_reason"] = f"mode_fallback: {requested}->{effective}"
+
+    reasons = _iter_str_list(d.get("no_trade_reasons"))
+    if reasons:
+        failure = _contract_mode_reason(reasons[0], requested, contract)
+        if "tp ladder" in failure.lower() or "tp-" in failure.lower():
+            d["tp_ladder_valid"] = False
+            d["tp_ladder_failure_reason"] = failure
+            match = re.search(r"(?i)уровень\s+структуры\s+только\s+([0-9]+(?:[.,][0-9]+)?)", failure)
+            if match:
+                try:
+                    d["structural_target_available"] = float(match.group(1).replace(",", "."))
+                except ValueError:
+                    pass
+
+    required_rr_by_mode = {"aggressive": 1.0, "neutral": 1.5, "conservative": 1.5}
+    d.setdefault("required_rr", required_rr_by_mode[contract])
+    try:
+        d.setdefault("calculated_rr", float(d.get("rr")))
+    except (TypeError, ValueError):
+        pass
+    return requested, effective, contract
+
+
 def _disabled_by_tags(d: dict, mode: str) -> list[str]:
     entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
     bucket = entries.get(mode) if isinstance(entries.get(mode), dict) else {}
@@ -244,12 +292,12 @@ def build_decision_path(d: dict) -> list[dict]:
     if not isinstance(d, dict):
         return []
 
+    requested_audit, final_mode, contract_mode = _persist_mode_contract_audit(d)
     warnings = _get_warnings(d)
     src, dst = _parse_mode_fallback(warnings)
-    final_mode = normalize_mode(d.get("mode"))
-    requested_mode = src or final_mode
+    requested_mode = normalize_mode(d.get("requested_mode") or src or requested_audit)
     if dst:
-        final_mode = dst
+        final_mode = normalize_mode(dst)
 
     no_trade = bool(d.get("no_trade"))
     path: list[dict] = []
@@ -259,7 +307,12 @@ def build_decision_path(d: dict) -> list[dict]:
             {"mode": requested_mode, "result": "rejected", "reason": _infer_mode_reject_reason_key(d, requested_mode)}
         )
         if no_trade:
-            path.append({"mode": final_mode, "result": "rejected", "reason": _infer_primary_no_trade_reason_key(d)})
+            reason = _contract_mode_reason(
+                _infer_primary_no_trade_reason_key(d),
+                requested_mode,
+                contract_mode,
+            )
+            path.append({"mode": final_mode, "result": "rejected", "reason": reason})
             path.append({"mode": "final", "result": "no_trade"})
         else:
             path.append({"mode": final_mode, "result": "accepted"})

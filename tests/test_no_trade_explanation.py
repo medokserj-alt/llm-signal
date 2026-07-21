@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import render_strict
+import no_trade_explain
 
 
 def _render_text(data: dict) -> str:
@@ -106,6 +107,37 @@ class TestNoTradeExplanation(unittest.TestCase):
         self.assertIn("XRP/USDT", out)
         self.assertIn("SHORT", out)
         self.assertIn("entry 2.1300", out)
+
+    def test_downgraded_tp_diagnostic_uses_effective_contract_mode_and_persists_audit(self) -> None:
+        payload = {
+            "mode": "neutral",
+            "requested_mode": "aggressive",
+            "warnings": ["mode_fallback: aggressive->neutral"],
+            "no_trade": True,
+            "no_trade_reasons": [
+                "Невозможно собрать валидный TP ladder по режиму aggressive: "
+                "доступный сверху уровень структуры только 1.1637, он слишком близко к entry_range."
+            ],
+            "rr": 0.45,
+        }
+
+        no_trade_explain.ensure_decision_path(payload)
+
+        self.assertEqual(payload["requested_mode"], "aggressive")
+        self.assertEqual(payload["effective_mode"], "neutral")
+        self.assertEqual(payload["contract_mode"], "neutral")
+        self.assertEqual(payload["published_mode"], "neutral")
+        self.assertEqual(payload["mode_transition_reason"], "mode_fallback: aggressive->neutral")
+        self.assertEqual(payload["required_rr"], 1.5)
+        self.assertEqual(payload["calculated_rr"], 0.45)
+        self.assertFalse(payload["tp_ladder_valid"])
+        self.assertEqual(payload["structural_target_available"], 1.1637)
+        self.assertIn("по режиму neutral", payload["tp_ladder_failure_reason"])
+        self.assertNotIn("по режиму aggressive", payload["decision_path"][1]["reason"])
+
+        out = _render_text(payload)
+        self.assertIn("по режиму neutral", out)
+        self.assertNotIn("TP ladder по режиму aggressive", out)
 
 
 if __name__ == "__main__":
