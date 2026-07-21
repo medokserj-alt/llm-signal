@@ -94,6 +94,136 @@ class TestScheduledTimeMath(unittest.TestCase):
 
 
 class TestAiaGate(unittest.TestCase):
+    @staticmethod
+    def _strict_counter_long(**overrides):
+        candidate = {
+            "_contract_candidate": True,
+            "symbol": "BTC/USDT",
+            "direction": "long",
+            "strategy_type": "wait_confirm",
+            "entry_price": 100.0,
+            "sl": 98.0,
+            "tp2": 104.0,
+            "rr": 2.0,
+            "price_vs_ema20_m15": "above",
+            "price_vs_ema20_h1": "above",
+            "confirmation_rules": ["M5/M15 reclaim and hold EMA20 with volume confirmation"],
+            "volume_confirmation_available": True,
+            "volume_confirmation": True,
+            "market_reaction": "absorbed",
+            "structure_invalidated": False,
+            "overextended_leader_risk": False,
+            "range_position": "lower_edge",
+            "directly_under_resistance": False,
+            "no_trade": False,
+        }
+        candidate.update(overrides)
+        return candidate
+
+    @staticmethod
+    def _background_context(**overrides):
+        context = {
+            "event_risk_level": "severe",
+            "event_bias": "risk_off",
+            "flow_bias": "bullish",
+            "focus_asset": "BTC",
+            "immediate_shock_active": False,
+            "background_risk_active": True,
+        }
+        context.update(overrides)
+        return context
+
+    def test_strict_counter_risk_long_is_reachable_after_absorption(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            self._strict_counter_long(), self._background_context()
+        )
+        self.assertTrue(out["can_publish_full_signal"])
+        self.assertEqual(out["execution_mode"], "TACTICAL_CONFIRM_ONLY")
+        self.assertTrue(out["tactical_counter_risk_allowed"])
+        self.assertEqual(out["entry_mode_required"], "WAIT_CONFIRM")
+        self.assertEqual(out["risk_size_mode"], "REDUCED")
+        self.assertIn("major_asset_btc_eth", out["regime_confirmation_reasons"])
+
+    def test_base_asset_recognizes_compact_exchange_symbols(self) -> None:
+        self.assertEqual(sr._base_asset("BTCUSDT"), "BTC")
+        self.assertEqual(sr._base_asset("ETH/USDT"), "ETH")
+
+    def test_counter_risk_long_requires_stronger_evidence_than_aligned_short(self) -> None:
+        weak_long = self._strict_counter_long(confirmation_rules=[])
+        long_out = sr.evaluate_post_generation_event_risk_gate(weak_long, self._background_context())
+        short_out = sr.evaluate_post_generation_event_risk_gate(
+            {"_contract_candidate": True, "symbol": "BTC/USDT", "direction": "short"},
+            self._background_context(),
+        )
+        self.assertFalse(long_out["can_publish_full_signal"])
+        self.assertIn("fresh_m5_m15_reclaim_or_hold_required", long_out["tactical_counter_risk_failed_reasons"])
+        self.assertTrue(short_out["can_publish_full_signal"])
+
+    def test_counter_risk_long_blocks_extended_range_middle_and_invalid_contract(self) -> None:
+        cases = (
+            (self._strict_counter_long(overextended_leader_risk=True), "not_extended_or_chasing"),
+            (self._strict_counter_long(range_position="range_middle"), "not_range_middle"),
+            (self._strict_counter_long(no_trade=True), "contract_valid_required"),
+            (self._strict_counter_long(rr=0.9, required_risk_reward=1.0), "contract_valid_required"),
+            (self._strict_counter_long(structure_invalidated=True), "structure_not_invalidated"),
+        )
+        for candidate, reason in cases:
+            with self.subTest(reason=reason):
+                out = sr.evaluate_post_generation_event_risk_gate(candidate, self._background_context())
+                self.assertFalse(out["can_publish_full_signal"])
+                self.assertIn(reason, out["tactical_counter_risk_failed_reasons"])
+
+    def test_immediate_shock_deadline_blocks_even_strict_counter_long(self) -> None:
+        out = sr.evaluate_post_generation_event_risk_gate(
+            self._strict_counter_long(),
+            self._background_context(
+                immediate_shock_active=True,
+                immediate_shock_until="2999-07-21T07:01:16Z",
+            ),
+        )
+        self.assertFalse(out["can_publish_full_signal"])
+        self.assertEqual(out["blocked_reason"], "immediate_shock_counter_risk")
+
+    def test_tactical_payload_constraints_preserve_wait_confirm_reduced_risk_and_short_ttl(self) -> None:
+        payload = {"entry_mode": "wait_confirm", "validity_minutes": 720}
+        ttl = sr._apply_tactical_payload_constraints(payload, {"event_bias": "risk_off"})
+        self.assertEqual(ttl, 180)
+        self.assertEqual(payload["entry_mode"], "wait_confirm")
+        self.assertEqual(payload["risk_size_mode"], "REDUCED")
+        self.assertFalse(payload["automatic_entry_allowed"])
+        self.assertEqual(payload["confirm_timeout_minutes"], 180)
+
+    def test_tactical_message_discloses_background_counter_bias_and_cancellation(self) -> None:
+        text = sr.render_tactical_confirm_prefix(
+            {"direction": "long"}, {"event_bias": "risk_off"}, 180
+        )
+        self.assertIn("Severe headline background remains active", text)
+        self.assertIn("counter to event bias", text)
+        self.assertIn("WAIT_CONFIRM", text)
+        self.assertIn("REDUCED", text)
+        self.assertIn("No chase", text)
+        self.assertIn("new material escalation", text)
+
+    def test_tactical_publication_keeps_main_targets_and_dima_window_only(self) -> None:
+        c = cfg()
+        c.dima_scheduled_mode = "WINDOW_ONLY"
+        row = {
+            "decision": "tactical_confirm_signal",
+            "publication_type": "tactical_confirm_signal",
+            "window_message_sent": False,
+        }
+        result = {
+            "published": True,
+            "publication_type": "tactical_confirm_signal",
+            "scheduled_full_signal_targets": sr.scheduled_full_signal_targets(c),
+            "reason": "published",
+        }
+        audit = sr.build_publication_audit(row, c, result)
+        self.assertEqual(audit["payload_type"], "FULL_SIGNAL")
+        self.assertTrue(audit["targets"]["Sergey"]["sent"])
+        self.assertTrue(audit["targets"]["mixed"]["sent"])
+        self.assertTrue(audit["targets"]["Dima"]["skipped"])
+
     def test_post_generation_severe_risk_off_long_without_flip_is_blocked(self) -> None:
         out = sr.evaluate_post_generation_event_risk_gate(
             {"direction": "long"},
@@ -124,11 +254,12 @@ class TestAiaGate(unittest.TestCase):
 
     def test_post_generation_severe_risk_off_long_with_flip_is_allowed(self) -> None:
         out = sr.evaluate_post_generation_event_risk_gate(
-            {"direction": "long", "explicit_regime_flip_reason": "confirmed_market_reversal"},
+            {"direction": "long", "entry_mode": "wait_confirm", "explicit_regime_flip_reason": "confirmed_market_reversal"},
             {"event_risk_level": "severe", "event_bias": "risk_off"},
         )
         self.assertTrue(out["can_publish_full_signal"])
         self.assertEqual(out["explicit_regime_flip_reason"], "confirmed_market_reversal")
+        self.assertEqual(out["execution_mode"], "TACTICAL_CONFIRM_ONLY")
 
     def test_immediate_fresh_escalation_still_blocks_counter_risk_long(self) -> None:
         out = sr.evaluate_post_generation_event_risk_gate(

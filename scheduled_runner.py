@@ -461,12 +461,34 @@ def _candidate_from_payload(payload: dict, signal_id: str | None = None) -> dict
         "tp2": _try_float(payload.get("tp2") if payload.get("tp2") is not None else tp.get("tp2")),
         "tp3": _try_float(payload.get("tp3") if payload.get("tp3") is not None else tp.get("tp3")),
         "rr": _try_float(payload.get("rr")),
+        "required_risk_reward": _selected_mode_required_rr(
+            str(payload.get("mode") or meta.get("mode") or ""), payload
+        ),
         "confidence": payload.get("confidence"),
         "confidence_rank": _confidence_rank(payload.get("confidence")),
         "mode": str(payload.get("mode") or meta.get("mode") or "").strip().lower(),
         "holding_horizon": str(payload.get("holding_horizon") or "").strip().lower(),
         "strategy_type": str(payload.get("entry_mode") or meta.get("entry_type") or "").strip().lower(),
         "ema20_m15": _try_float(payload.get("ema20_m15")),
+        "price_vs_ema20_m15": payload.get("price_vs_ema20_m15"),
+        "price_vs_ema20_h1": payload.get("price_vs_ema20_h1"),
+        "ema_guard_state": payload.get("ema_guard_state"),
+        "ema_fan_m15_state": payload.get("ema_fan_m15_state"),
+        "ema_fan_h1_state": payload.get("ema_fan_h1_state"),
+        "confirmation_rules": payload.get("confirmation_rules"),
+        "fresh_reclaim_present": payload.get("fresh_reclaim_present") or payload.get("fresh_reclaim") or payload.get("fresh_reset_reclaim"),
+        "leader_status_retained": payload.get("leader_status_retained"),
+        "why_asset": payload.get("why_asset"),
+        "volume_confirmation_available": payload.get("volume_confirmation_available"),
+        "volume_confirmation": payload.get("volume_confirmation"),
+        "market_reaction": payload.get("market_reaction"),
+        "structure_invalidated": payload.get("structure_invalidated"),
+        "overextended_leader_risk": payload.get("overextended_leader_risk"),
+        "chase_risk": payload.get("chase_risk") or (payload.get("flow_derivatives_modifiers") or {}).get("chase_risk") if isinstance(payload.get("flow_derivatives_modifiers"), dict) else payload.get("chase_risk"),
+        "range_position": payload.get("range_position"),
+        "directly_under_resistance": payload.get("directly_under_resistance"),
+        "bnb_high_quality_eligible": payload.get("bnb_high_quality_eligible"),
+        "_contract_candidate": True,
         "hard_block_conditions": payload.get("hard_block_conditions") if isinstance(payload.get("hard_block_conditions"), list) else [],
         "no_trade": bool(payload.get("no_trade")),
         "event_risk": payload.get("event_risk") if isinstance(payload.get("event_risk"), dict) else {},
@@ -743,7 +765,7 @@ def _infer_candidate_funnel_stage(row: dict, result: dict, payload: dict, rr: fl
     if decision in {"cancel", "skipped_disabled"} and not payload:
         return FUNNEL_STAGE_RUN_CANCELLED
     if result.get("published"):
-        if publication_type == "full_signal":
+        if publication_type in {"full_signal", "tactical_confirm_signal"}:
             return FUNNEL_STAGE_PUBLICATION_SENT
         return FUNNEL_STAGE_PUBLICATION_SKIPPED
     if payload and (payload.get("no_trade") or reason == "signal_core_no_trade"):
@@ -806,7 +828,7 @@ def build_publication_audit(row: dict, cfg: SchedulerConfig, result: dict | None
     payload_type = None
     if row.get("window_message_sent") or row.get("dima_window_cooldown_applied"):
         payload_type = "WINDOW_ONLY"
-    if publication_type == "full_signal" or (result.get("published") and not publication_type):
+    if publication_type in {"full_signal", "tactical_confirm_signal"} or (result.get("published") and not publication_type):
         payload_type = "FULL_SIGNAL"
     elif publication_type in {"active_signal_update", "management_update", "conflict_update", "urgent_review", "replace_wait_confirm", "suppress_duplicate"}:
         payload_type = "LIFECYCLE_NOTIFICATION"
@@ -2439,7 +2461,7 @@ def due_signal_slots(now_utc: datetime, cfg: SchedulerConfig, state: dict) -> li
         scheduled = slot_datetime_msk(now_msk.date(), hhmm)
         sid = slot_id_for(scheduled)
         sstate = slots_state.get(sid)
-        if isinstance(sstate, dict) and sstate.get("status") in {"published", "macro_substitution", "cancelled", "deferred", "error"}:
+        if isinstance(sstate, dict) and sstate.get("status") in {"published", "tactical_confirm_signal", "macro_substitution", "cancelled", "deferred", "error"}:
             continue
         if is_due(now_msk, scheduled, cfg.due_window_minutes):
             out.append((sid, scheduled, 1))
@@ -2942,6 +2964,16 @@ def _norm(value, default="unknown") -> str:
     return text if text else default
 
 
+def _base_asset(value) -> str:
+    text = _norm(value, "").upper().replace("-", "/").replace("_", "/")
+    if "/" in text:
+        return text.split("/", 1)[0]
+    for quote in ("USDT", "USDC", "BUSD", "USD"):
+        if text.endswith(quote) and len(text) > len(quote):
+            return text[: -len(quote)]
+    return text
+
+
 def _candidate_from_context(ctx: dict) -> tuple[str, str]:
     candidate = ctx.get("signal_candidate")
     asset = None
@@ -2951,7 +2983,7 @@ def _candidate_from_context(ctx: dict) -> tuple[str, str]:
         direction = candidate.get("direction") or candidate.get("side")
     asset = asset or ctx.get("focus_asset") or "none"
     direction = direction or ctx.get("focus_direction") or "unknown"
-    return _norm(asset, "none").upper().split("/", 1)[0], _norm(direction).upper()
+    return _base_asset(asset) or "NONE", _norm(direction).upper()
 
 
 def direction_conflicts_event_bias(direction: str, event_bias: str) -> bool:
@@ -2993,25 +3025,88 @@ def _risk_shock_state(ctx: dict) -> dict:
         nearest_int = int(nearest) if nearest not in (None, "") else None
     except (TypeError, ValueError):
         nearest_int = None
-    immediate = bool(
-        headline_delta == "ESCALATION"
-        or "escalation" in transition
-        or ctx.get("event_risk_window_active")
-        or (nearest_int is not None and nearest_int <= 30)
-    )
+    explicit_active = ctx.get("immediate_shock_active")
+    explicit_window = ctx.get("immediate_shock_window")
+    immediate_until = ctx.get("immediate_shock_until")
+    until_dt = None
+    if immediate_until:
+        try:
+            until_dt = datetime.fromisoformat(str(immediate_until).replace("Z", "+00:00"))
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=UTC)
+        except Exception:
+            until_dt = None
+    if until_dt is not None:
+        immediate = utc_now() < until_dt.astimezone(UTC)
+    elif explicit_active is not None:
+        immediate = bool(explicit_active)
+    elif explicit_window is not None:
+        immediate = bool(explicit_window)
+    else:
+        immediate = bool(
+            headline_delta == "ESCALATION"
+            or "escalation" in transition
+            or (ctx.get("event_risk_window_active") and nearest_int is not None and nearest_int <= 30)
+            or (nearest_int is not None and nearest_int <= 30)
+        )
     return {
         "immediate_shock_window": immediate,
         "background_risk_active": _norm(ctx.get("event_risk_level"), "").lower() == "severe",
-        "immediate_shock_until": ctx.get("immediate_shock_until"),
+        "immediate_shock_until": immediate_until,
         "material_event_at": ctx.get("material_event_at") or ctx.get("headline_timestamp"),
         "last_material_change_at": ctx.get("last_material_change_at") or ctx.get("headline_timestamp"),
         "snapshot_built_at": ctx.get("snapshot_built_at") or ctx.get("event_risk_generated_at") or ctx.get("generated_at"),
     }
 
 
+def _counter_risk_tactical_requirements(candidate: dict, ctx: dict) -> dict:
+    asset = _base_asset(candidate.get("asset") or candidate.get("symbol") or ctx.get("focus_asset"))
+    rules = " ".join(str(item) for item in _clean_list(candidate.get("confirmation_rules"))).lower()
+    m15 = _norm(candidate.get("price_vs_ema20_m15") or candidate.get("ema_guard_state"), "").lower()
+    h1 = _norm(candidate.get("price_vs_ema20_h1") or candidate.get("ema_guard_state"), "").lower()
+    fresh_rule = bool(candidate.get("fresh_reclaim_present")) or (
+        any(token in rules for token in ("reclaim", "retest", "hold", "удерж", "возврат", "ретест"))
+        and any(token in rules for token in ("m5", "m15"))
+    )
+    focus = _base_asset(ctx.get("focus_asset"))
+    why_asset = str(candidate.get("why_asset") or "").lower()
+    leader_retained = bool(candidate.get("leader_status_retained")) or focus == asset or "leader" in why_asset or "лидер" in why_asset
+    allowed_asset = asset in {"BTC", "ETH"} or (asset == "BNB" and bool(candidate.get("bnb_high_quality_eligible")))
+    rr = _rr_for_signal(candidate)
+    required_rr = _try_float(candidate.get("required_risk_reward")) or 1.0
+    reaction = _norm(candidate.get("market_reaction"), "").lower()
+    range_position = _norm(candidate.get("range_position"), "").lower()
+    failed: list[str] = []
+    checks = (
+        ("leader_asset_required", allowed_asset),
+        ("wait_confirm_required", _is_confirm_only_candidate(candidate)),
+        ("contract_valid_required", not candidate.get("no_trade") and rr is not None and rr >= required_rr),
+        ("fresh_m5_m15_reclaim_or_hold_required", fresh_rule),
+        ("m15_above_or_reclaimed_ema20_required", m15 in {"above", "above_both", "reclaimed", "bullish"} or bool(candidate.get("fresh_reclaim_present"))),
+        ("h1_structure_must_remain_intact", h1 in {"above", "above_both", "reclaimed", "bullish"}),
+        ("leader_status_must_be_retained", leader_retained),
+        ("volume_confirmation_required_when_available", not candidate.get("volume_confirmation_available") or bool(candidate.get("volume_confirmation")) or "volume" in rules or "объ" in rules),
+        ("no_immediate_downside_reaction", reaction not in {"downside", "bearish_break", "breakdown", "risk_flip"}),
+        ("not_directly_under_resistance", not bool(candidate.get("directly_under_resistance"))),
+        ("not_extended_or_chasing", not bool(candidate.get("overextended_leader_risk")) and _norm(candidate.get("chase_risk"), "").lower() not in {"extended", "active_chase"}),
+        ("not_range_middle", range_position not in {"middle", "range_middle", "mid"}),
+        ("structure_not_invalidated", not bool(candidate.get("structure_invalidated"))),
+    )
+    for reason, passed in checks:
+        if not passed:
+            failed.append(reason)
+    return {
+        "tactical_counter_risk_allowed": not failed,
+        "tactical_counter_risk_failed_reasons": failed,
+        "post_headline_reaction_observed": not _risk_shock_state(ctx)["immediate_shock_window"],
+        "structure_invalidated": bool(candidate.get("structure_invalidated")),
+        "conditions_to_eligibility": failed,
+    }
+
+
 def _regime_confirmation_reasons(candidate: dict, ctx: dict) -> list[str]:
     reasons: list[str] = []
-    asset = str(candidate.get("asset") or candidate.get("symbol") or ctx.get("focus_asset") or "").upper().split("/", 1)[0]
+    asset = _base_asset(candidate.get("asset") or candidate.get("symbol") or ctx.get("focus_asset"))
     direction = _normalize_direction(candidate.get("direction") or ctx.get("focus_direction"))
     flow_bias = _norm(ctx.get("flow_bias"), "").lower()
     if asset in {"BTC", "ETH"}:
@@ -3044,6 +3139,7 @@ def determine_execution_mode(candidate: dict, gate_context: dict) -> dict:
     conflict = direction_conflicts_event_bias(direction, event_bias)
     reasons = _regime_confirmation_reasons(candidate, gate_context)
     confirm_only = _is_confirm_only_candidate(candidate)
+    tactical = _counter_risk_tactical_requirements(candidate, gate_context) if candidate.get("_contract_candidate") else None
     mode = "NORMAL"
     blocked_reason = None
     if event_risk_level == "severe" and event_bias == "risk_off" and conflict:
@@ -3051,7 +3147,13 @@ def determine_execution_mode(candidate: dict, gate_context: dict) -> dict:
             mode = "BLOCKED"
             blocked_reason = "immediate_shock_counter_risk"
         elif candidate.get("explicit_regime_flip_reason") or gate_context.get("explicit_regime_flip_reason") or gate_context.get("regime_flip_reason"):
-            mode = "TACTICAL_CONFIRM_ONLY" if confirm_only else "NORMAL"
+            mode = "TACTICAL_CONFIRM_ONLY" if confirm_only else "BLOCKED"
+            blocked_reason = None if confirm_only else "counter_risk_requires_wait_confirm"
+        elif tactical is not None and tactical["tactical_counter_risk_allowed"]:
+            mode = "TACTICAL_CONFIRM_ONLY"
+        elif tactical is not None:
+            mode = "BLOCKED"
+            blocked_reason = "counter_risk_strict_confirmation_failed"
         elif confirm_only and len(reasons) >= 2:
             mode = "TACTICAL_CONFIRM_ONLY"
         else:
@@ -3064,6 +3166,13 @@ def determine_execution_mode(candidate: dict, gate_context: dict) -> dict:
         "entry_mode_required": "WAIT_CONFIRM" if mode == "TACTICAL_CONFIRM_ONLY" else None,
         "blocked_reason": blocked_reason,
         "candidate_confirm_only": confirm_only,
+        **(tactical or {
+            "tactical_counter_risk_allowed": mode == "TACTICAL_CONFIRM_ONLY",
+            "tactical_counter_risk_failed_reasons": [],
+            "post_headline_reaction_observed": not shock["immediate_shock_window"],
+            "structure_invalidated": False,
+            "conditions_to_eligibility": [],
+        }),
         **shock,
     }
 
@@ -3116,6 +3225,41 @@ def evaluate_post_generation_event_risk_gate(candidate: dict, gate_context: dict
         "publication_type": "blocked_by_severe_risk" if blocked else "tactical_confirm_signal" if execution["execution_mode"] == "TACTICAL_CONFIRM_ONLY" else "full_signal",
         **execution,
     }
+
+
+def _apply_tactical_payload_constraints(payload: dict, execution: dict) -> int:
+    ttl_candidates = [
+        _try_float(payload.get("confirm_timeout_minutes")),
+        _try_float(payload.get("validity_minutes")),
+        _try_float(payload.get("max_valid_minutes")),
+    ]
+    existing = min((int(value) for value in ttl_candidates if value is not None and value > 0), default=180)
+    ttl = min(existing, 180)
+    payload["entry_mode"] = "wait_confirm"
+    payload["confirm_timeout_minutes"] = ttl
+    payload["validity_minutes"] = ttl
+    payload["max_valid_minutes"] = ttl
+    payload["execution_mode"] = "TACTICAL_CONFIRM_ONLY"
+    payload["risk_size_mode"] = "REDUCED"
+    payload["automatic_entry_allowed"] = False
+    payload["event_bias"] = execution.get("event_bias") or payload.get("event_bias")
+    return ttl
+
+
+def render_tactical_confirm_prefix(candidate: dict, execution: dict, ttl_minutes: int) -> str:
+    counter = direction_conflicts_event_bias(candidate.get("direction"), execution.get("event_bias"))
+    return "\n".join(
+        [
+            "⚠️ TACTICAL_CONFIRM_ONLY",
+            "Severe headline background remains active; the first reaction window has elapsed without a confirmed structural break.",
+            "Direction is counter to event bias." if counter else "Direction is aligned with event bias.",
+            "Entry: WAIT_CONFIRM only after the stated strict reclaim/hold; no automatic entry.",
+            "Risk: REDUCED. No chase.",
+            f"TTL: {ttl_minutes} minutes.",
+            "Cancel immediately on structural failure or a new material escalation.",
+            "",
+        ]
+    )
 
 
 def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
@@ -3228,6 +3372,12 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         "focus_asset": asset,
         "focus_direction": direction,
         "flow_bias": _norm(ctx.get("flow_bias"), "unknown").lower(),
+        "execution_bias": ctx.get("execution_bias"),
+        "focus_before_risk": ctx.get("focus_before_risk") or asset,
+        "focus_after_risk": ctx.get("focus_after_risk") or asset,
+        "focus_status": ctx.get("focus_status"),
+        "focus_preserved": ctx.get("focus_preserved"),
+        "focus_reset_reason": ctx.get("focus_reset_reason"),
         "event_risk_level": event_risk_level,
         "headline_risk_delta": headline_risk_delta,
         "previous_risk_level": ctx.get("previous_risk_level"),
@@ -3250,6 +3400,11 @@ def evaluate_aia_gate(ctx: dict, cfg: SchedulerConfig) -> dict:
         "last_material_change_at": execution["last_material_change_at"],
         "snapshot_built_at": execution["snapshot_built_at"],
         "immediate_shock_until": execution["immediate_shock_until"],
+        "post_headline_reaction_observed": execution.get("post_headline_reaction_observed"),
+        "structure_invalidated": execution.get("structure_invalidated"),
+        "tactical_counter_risk_allowed": execution.get("tactical_counter_risk_allowed"),
+        "tactical_counter_risk_failed_reasons": execution.get("tactical_counter_risk_failed_reasons"),
+        "conditions_to_eligibility": execution.get("conditions_to_eligibility"),
     }
 
 
@@ -3608,6 +3763,10 @@ async def generate_and_publish_signal(
             **post_generation_gate,
         }
 
+    tactical_ttl_minutes = None
+    if post_generation_gate.get("execution_mode") == "TACTICAL_CONFIRM_ONLY":
+        tactical_ttl_minutes = _apply_tactical_payload_constraints(payload, post_generation_gate)
+
     publish_text = parts[0]
     if duplicate_decision.get("publication_type") == "replace_wait_confirm":
         publish_text = render_replacement_prefix(duplicate_decision, candidate) + parts[0]
@@ -3623,6 +3782,8 @@ async def generate_and_publish_signal(
             + "\n\n"
             + parts[0]
         )
+    if post_generation_gate.get("execution_mode") == "TACTICAL_CONFIRM_ONLY":
+        publish_text = render_tactical_confirm_prefix(candidate, post_generation_gate, int(tactical_ttl_minutes or 180)) + publish_text
 
     old_get_targets = tg_bot.get_main_publication_targets
     old_get_chat = tg_bot.get_main_publication_chat_id
@@ -3708,6 +3869,24 @@ async def generate_and_publish_signal(
         **day_diagnostics,
         **duplicate_result,
         "post_generation_event_risk_gate": True,
+        "publication_type": post_generation_gate.get("publication_type") or "full_signal",
+        "can_publish_full_signal": post_generation_gate.get("can_publish_full_signal"),
+        "execution_mode": post_generation_gate.get("execution_mode"),
+        "risk_size_mode": post_generation_gate.get("risk_size_mode"),
+        "entry_mode_required": post_generation_gate.get("entry_mode_required"),
+        "regime_confirmation_reasons": post_generation_gate.get("regime_confirmation_reasons"),
+        "candidate_confirm_only": post_generation_gate.get("candidate_confirm_only"),
+        "immediate_shock_window": post_generation_gate.get("immediate_shock_window"),
+        "immediate_shock_until": post_generation_gate.get("immediate_shock_until"),
+        "background_risk_active": post_generation_gate.get("background_risk_active"),
+        "material_event_at": post_generation_gate.get("material_event_at"),
+        "last_material_change_at": post_generation_gate.get("last_material_change_at"),
+        "post_headline_reaction_observed": post_generation_gate.get("post_headline_reaction_observed"),
+        "structure_invalidated": post_generation_gate.get("structure_invalidated"),
+        "tactical_counter_risk_allowed": post_generation_gate.get("tactical_counter_risk_allowed"),
+        "tactical_counter_risk_failed_reasons": post_generation_gate.get("tactical_counter_risk_failed_reasons"),
+        "conditions_to_eligibility": post_generation_gate.get("conditions_to_eligibility"),
+        "confirmation_ttl_minutes": tactical_ttl_minutes,
         "explicit_regime_flip_reason": post_generation_gate.get("explicit_regime_flip_reason"),
         "post_generation_event_risk_blocked_reason": post_generation_gate.get("blocked_reason"),
         "channel_mode": "WINDOW_ONLY" if dima_window_only(cfg) else "FULL_SIGNAL",
@@ -3741,6 +3920,12 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
         "focus_asset": gate.get("focus_asset", "none"),
         "focus_direction": gate.get("focus_direction", "unknown"),
         "flow_bias": gate.get("flow_bias", "unknown"),
+        "execution_bias": gate.get("execution_bias"),
+        "focus_before_risk": gate.get("focus_before_risk"),
+        "focus_after_risk": gate.get("focus_after_risk"),
+        "focus_status": gate.get("focus_status"),
+        "focus_preserved": gate.get("focus_preserved"),
+        "focus_reset_reason": gate.get("focus_reset_reason"),
         "event_risk_level": gate.get("event_risk_level", "unknown"),
         "headline_risk_delta": gate.get("headline_risk_delta", "NONE"),
         "previous_risk_level": gate.get("previous_risk_level"),
@@ -3762,6 +3947,11 @@ def base_signal_log_row(now_utc: datetime, cfg: SchedulerConfig, slot_id: str, s
         "last_material_change_at": gate.get("last_material_change_at"),
         "snapshot_built_at": gate.get("snapshot_built_at"),
         "immediate_shock_until": gate.get("immediate_shock_until"),
+        "post_headline_reaction_observed": gate.get("post_headline_reaction_observed"),
+        "structure_invalidated": gate.get("structure_invalidated"),
+        "tactical_counter_risk_allowed": gate.get("tactical_counter_risk_allowed"),
+        "tactical_counter_risk_failed_reasons": gate.get("tactical_counter_risk_failed_reasons", []),
+        "conditions_to_eligibility": gate.get("conditions_to_eligibility", []),
         "target_chat_ids": cfg.target_chat_ids,
         "signal_id": None,
         "error": None,
@@ -4079,6 +4269,12 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 "material_event_at",
                 "last_material_change_at",
                 "snapshot_built_at",
+                "post_headline_reaction_observed",
+                "structure_invalidated",
+                "tactical_counter_risk_allowed",
+                "tactical_counter_risk_failed_reasons",
+                "conditions_to_eligibility",
+                "confirmation_ttl_minutes",
             ):
                 if key in result:
                     row[key] = result.get(key)
