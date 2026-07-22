@@ -144,6 +144,33 @@ class TestAiaGate(unittest.TestCase):
         self.assertEqual(out["risk_size_mode"], "REDUCED")
         self.assertIn("major_asset_btc_eth", out["regime_confirmation_reasons"])
 
+    def test_neutral_focusless_flow_allows_strict_major_technical_contract(self) -> None:
+        candidate = self._strict_counter_long(
+            symbol="ETH/USDT",
+            fresh_reclaim_present=True,
+            why_asset="Explicit ETH reclaim with structural invalidation",
+        )
+        out = sr.evaluate_post_generation_event_risk_gate(
+            candidate,
+            self._background_context(flow_bias="neutral", focus_asset="none"),
+        )
+
+        self.assertTrue(out["can_publish_full_signal"])
+        self.assertEqual(out["execution_mode"], "TACTICAL_CONFIRM_ONLY")
+        self.assertTrue(out["neutral_major_technical_exception"])
+        self.assertNotIn("leader_status_must_be_retained", out["tactical_counter_risk_failed_reasons"])
+
+    def test_neutral_focusless_flow_does_not_exempt_altcoin_leader_requirement(self) -> None:
+        candidate = self._strict_counter_long(symbol="SOL/USDT", fresh_reclaim_present=True)
+        out = sr.evaluate_post_generation_event_risk_gate(
+            candidate,
+            self._background_context(flow_bias="neutral", focus_asset="none"),
+        )
+
+        self.assertFalse(out["can_publish_full_signal"])
+        self.assertIn("leader_asset_required", out["tactical_counter_risk_failed_reasons"])
+        self.assertIn("leader_status_must_be_retained", out["tactical_counter_risk_failed_reasons"])
+
     def test_base_asset_recognizes_compact_exchange_symbols(self) -> None:
         self.assertEqual(sr._base_asset("BTCUSDT"), "BTC")
         self.assertEqual(sr._base_asset("ETH/USDT"), "ETH")
@@ -2156,6 +2183,39 @@ class TestScheduledCandidateFunnelObservability(unittest.TestCase):
             self.assertEqual(row["candidate_funnel"]["entry"], 64328.57)
             self.assertEqual(row["publication_audit"]["payload_type"], "FULL_SIGNAL")
             self.assertEqual(state["slots"]["20260716_2130"]["status"], "published")
+
+
+class DailySignalHealthTests(unittest.TestCase):
+    def test_contract_valid_policy_blocks_remain_visible_as_possible_overfilter(self) -> None:
+        rows = [
+            {
+                "slot_id": "20260722_1830",
+                "attempt": 1,
+                "candidate_funnel": {
+                    "stage": sr.FUNNEL_STAGE_POLICY_BLOCKED,
+                    "candidate_generated": True,
+                    "candidate_count": 1,
+                    "entry_mode": "wait_confirm",
+                    "execution_mode": "BLOCKED",
+                    "full_signal_eligible": False,
+                    "full_signal_block_reasons": ["blocked_by_severe_risk"],
+                    "conditions_to_eligibility": ["leader_status_must_be_retained"],
+                    "pre_generation_gate": "allowed",
+                },
+            }
+        ]
+
+        audit = sr.build_daily_signal_health(rows)
+
+        self.assertEqual(audit["contract_valid_count"], 1)
+        self.assertEqual(audit["post_generation_block_count"], 1)
+        self.assertEqual(audit["wait_confirm_count"], 1)
+        self.assertEqual(audit["median_candidate_distance_to_eligibility"], 1)
+        self.assertEqual(audit["no_signal_day_classification"], "POSSIBLE_OVERFILTER")
+
+    def test_no_generated_candidate_is_healthy_no_trade(self) -> None:
+        audit = sr.build_daily_signal_health([])
+        self.assertEqual(audit["no_signal_day_classification"], "HEALTHY_NO_TRADE")
 
 
 if __name__ == "__main__":

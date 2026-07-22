@@ -8,9 +8,11 @@ import logging
 import os
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 from macro_event_guard import evaluate_macro_event_guard, macro_dedupe_key, normalize_scheduled_macro_events
@@ -715,7 +717,7 @@ def build_candidate_funnel(row: dict, cfg: SchedulerConfig, result: dict | None 
                 "adx_m15": _first_present(payload.get("adx_m15"), (payload.get("adx_guard") or {}).get("state") if isinstance(payload.get("adx_guard"), dict) else payload.get("adx_guard")),
                 "volume_confirmation": payload.get("volume_confirmation"),
                 "fresh_reclaim_required": any("fresh_reclaim" in str(reason) for reason in reasons),
-                "fresh_reclaim_present": _first_present(payload.get("fresh_reclaim"), payload.get("fresh_reset_reclaim"), payload.get("fresh_higher_low_after_reset")),
+                "fresh_reclaim_present": _first_present(payload.get("fresh_reclaim_present"), payload.get("fresh_reclaim"), payload.get("fresh_reset_reclaim"), payload.get("fresh_higher_low_after_reset")),
                 "regime_flip_required": any("regime_confirmation" in str(reason) or "regime_flip" in str(reason) for reason in reasons),
                 "regime_flip_present": bool(_first_present(payload.get("explicit_regime_flip_reason"), payload.get("regime_flip_reason"), result.get("explicit_regime_flip_reason"))),
                 "confirmation_required": _first_present(result.get("confirmation_required"), payload.get("entry_mode") == "wait_confirm", row.get("entry_mode_required") == "WAIT_CONFIRM"),
@@ -2069,6 +2071,90 @@ def signal_decision_log_path(now_utc: datetime) -> Path:
     return LOGS_DIR / f"scheduled_signal_decisions_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.jsonl"
 
 
+def signal_health_audit_path(now_utc: datetime) -> Path:
+    return LOGS_DIR / f"scheduled_signal_health_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.json"
+
+
+def build_daily_signal_health(rows: list[dict]) -> dict:
+    rows = [row for row in rows if isinstance(row, dict)]
+    funnels = [row.get("candidate_funnel") for row in rows if isinstance(row.get("candidate_funnel"), dict)]
+    generated = [funnel for funnel in funnels if funnel.get("candidate_generated")]
+    stages = [str(funnel.get("stage") or "") for funnel in funnels]
+    contract_valid_stages = {
+        FUNNEL_STAGE_POLICY_BLOCKED,
+        FUNNEL_STAGE_FULL_SIGNAL_ELIGIBLE,
+        FUNNEL_STAGE_WAIT_CONFIRM_PERSISTED,
+        FUNNEL_STAGE_PUBLICATION_SENT,
+    }
+    reason_counts: Counter[str] = Counter()
+    distances: list[int] = []
+    for funnel in funnels:
+        reasons = _clean_list(funnel.get("full_signal_block_reasons"))
+        reason_counts.update(str(reason) for reason in reasons if str(reason).strip())
+        conditions = _clean_list(funnel.get("conditions_to_eligibility"))
+        if funnel.get("candidate_generated"):
+            distances.append(len(set(str(item) for item in conditions)))
+    published_count = sum(
+        1
+        for row in rows
+        if bool(row.get("published"))
+        or str(row.get("decision") or "").lower() in {"publish", "published", "signal_published", "tactical_confirm_signal"}
+    )
+    contract_valid_count = sum(1 for stage in stages if stage in contract_valid_stages)
+    post_generation_block_count = sum(1 for stage in stages if stage == FUNNEL_STAGE_POLICY_BLOCKED)
+    if published_count:
+        classification = "SIGNAL_DAY"
+    elif contract_valid_count and post_generation_block_count:
+        classification = "POSSIBLE_OVERFILTER"
+    elif generated:
+        classification = "SELECTIVE_NO_TRADE"
+    else:
+        classification = "HEALTHY_NO_TRADE"
+    unique_slots = {str(row.get("slot_id")) for row in rows if row.get("slot_id")}
+    return {
+        "scheduled_slots_count": len(unique_slots),
+        "retries_executed_count": sum(1 for row in rows if int(row.get("attempt") or 1) > 1),
+        "raw_candidates_count": sum(int(funnel.get("candidate_count") or 0) for funnel in funnels),
+        "contract_valid_count": contract_valid_count,
+        "wait_confirm_count": sum(1 for funnel in generated if str(funnel.get("entry_mode") or "").lower() == "wait_confirm"),
+        "tactical_confirm_count": sum(1 for funnel in funnels if funnel.get("execution_mode") == "TACTICAL_CONFIRM_ONLY"),
+        "publication_eligible_count": sum(1 for funnel in funnels if funnel.get("full_signal_eligible") is True),
+        "published_count": published_count,
+        "pre_generation_block_count": sum(
+            1 for funnel in funnels if not funnel.get("candidate_generated") and funnel.get("pre_generation_gate") not in {None, "allowed"}
+        ),
+        "post_generation_block_count": post_generation_block_count,
+        "top_rejection_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in reason_counts.most_common(10)
+        ],
+        "median_candidate_distance_to_eligibility": median(distances) if distances else None,
+        # These replay-only metrics require future candles and are deliberately
+        # not guessed by the live scheduler.
+        "candidates_confirmed_between_slots": None,
+        "opportunities_missed_by_schedule": None,
+        "unreachable_policy_paths": [],
+        "no_signal_day_classification": classification,
+    }
+
+
+def append_signal_decision_with_health(now_utc: datetime, row: dict) -> None:
+    decision_path = signal_decision_log_path(now_utc)
+    append_jsonl(decision_path, row)
+    rows: list[dict] = []
+    try:
+        for line in decision_path.read_text(encoding="utf-8").splitlines():
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                rows.append(parsed)
+    except (OSError, json.JSONDecodeError):
+        return
+    audit = build_daily_signal_health(rows)
+    audit["audit_only"] = True
+    audit["updated_at_utc"] = now_utc.isoformat().replace("+00:00", "Z")
+    write_json_atomic(signal_health_audit_path(now_utc), audit)
+
+
 def scheduled_state_guard_shadow_log_path(now_utc: datetime) -> Path:
     return LOGS_DIR / f"scheduled_state_guard_shadow_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.jsonl"
 
@@ -3070,8 +3156,16 @@ def _counter_risk_tactical_requirements(candidate: dict, ctx: dict) -> dict:
     )
     focus = _base_asset(ctx.get("focus_asset"))
     why_asset = str(candidate.get("why_asset") or "").lower()
-    leader_retained = bool(candidate.get("leader_status_retained")) or focus == asset or "leader" in why_asset or "лидер" in why_asset
     allowed_asset = asset in {"BTC", "ETH"} or (asset == "BNB" and bool(candidate.get("bnb_high_quality_eligible")))
+    flow_bias = _norm(ctx.get("flow_bias"), "unknown").lower()
+    neutral_major_exception = asset in {"BTC", "ETH"} and flow_bias in {"neutral", "unknown", ""} and focus in {"", "NONE"}
+    leader_retained = (
+        bool(candidate.get("leader_status_retained"))
+        or focus == asset
+        or "leader" in why_asset
+        or "лидер" in why_asset
+        or neutral_major_exception
+    )
     rr = _rr_for_signal(candidate)
     required_rr = _try_float(candidate.get("required_risk_reward")) or 1.0
     reaction = _norm(candidate.get("market_reaction"), "").lower()
@@ -3100,6 +3194,7 @@ def _counter_risk_tactical_requirements(candidate: dict, ctx: dict) -> dict:
         "tactical_counter_risk_failed_reasons": failed,
         "post_headline_reaction_observed": not _risk_shock_state(ctx)["immediate_shock_window"],
         "structure_invalidated": bool(candidate.get("structure_invalidated")),
+        "neutral_major_technical_exception": neutral_major_exception,
         "conditions_to_eligibility": failed,
     }
 
@@ -3969,7 +4064,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         row.update({"decision": "duplicate_skip", "reason": f"already_{current.get('status')}", "signal_id": current.get("signal_id")})
         if not dry_run:
             add_scheduled_decision_observability(row, cfg, stage=FUNNEL_STAGE_RETRY_DEDUPED)
-            append_jsonl(signal_decision_log_path(now_utc), row)
+            append_signal_decision_with_health(now_utc, row)
         return
 
     gate = evaluate_aia_gate(load_aia_context(), cfg)
@@ -4064,7 +4159,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
         if not dry_run:
             write_json_atomic(cfg.signal_state_path, state)
             add_scheduled_decision_observability(row, cfg, stage=FUNNEL_STAGE_PUBLICATION_SKIPPED)
-            append_jsonl(signal_decision_log_path(now_utc), row)
+            append_signal_decision_with_health(now_utc, row)
         return
 
     if not gate["allowed"]:
@@ -4108,7 +4203,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
                 cfg,
                 stage=FUNNEL_STAGE_RUN_CANCELLED if row.get("decision") == "cancel" else FUNNEL_STAGE_PRE_GENERATION,
             )
-            append_jsonl(signal_decision_log_path(now_utc), row)
+            append_signal_decision_with_health(now_utc, row)
         return
 
     try:
@@ -4293,7 +4388,7 @@ async def run_signal_slot(now_utc: datetime, cfg: SchedulerConfig, state: dict, 
     if not dry_run:
         write_json_atomic(cfg.signal_state_path, state)
         add_scheduled_decision_observability(row, cfg, result if "result" in locals() else None)
-        append_jsonl(signal_decision_log_path(now_utc), row)
+        append_signal_decision_with_health(now_utc, row)
         if "state_guard_shadow_available" in locals() and state_guard_shadow_available:
             append_jsonl(scheduled_state_guard_shadow_log_path(now_utc), state_guard_shadow_log_row(now_utc, slot_id, result))
 
@@ -4377,7 +4472,7 @@ async def run_due_jobs(now_utc: datetime | None = None, *, job: str = "all", dry
                 row.update({"decision": "skipped_disabled", "reason": "scheduled_signal_disabled"})
                 if not dry_run:
                     add_scheduled_decision_observability(row, cfg, stage=FUNNEL_STAGE_RUN_CANCELLED)
-                    append_jsonl(signal_decision_log_path(now_utc), row)
+                    append_signal_decision_with_health(now_utc, row)
         else:
             for slot_id, slot_time, attempt in due_slots:
                 await run_signal_slot(now_utc, cfg, state, slot_id, slot_time, attempt, dry_run=dry_run)

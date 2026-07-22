@@ -58,6 +58,28 @@ def test_bnb_aggressive_alt_long_under_severe_risk_off_is_no_trade_without_recla
     assert out["execution_diagnosis"]["stale_risk_on_long_blocked"] is True
 
 
+def test_mixed_ema_fan_can_pass_on_real_closed_m15_reclaim_sequence() -> None:
+    out = _base_signal(direction="long", symbol="ETH/USDT")
+    out["time_msk"] = "22.07.2026, 13:30"
+    out["ema_fan_m15_state"] = "mixed"
+    out["ema_fan_h1_state"] = "mixed"
+    start_ms = 1784692800000
+    closes = [100.0] * 20 + [99.0, 99.2, 98.9, 100.8, 101.2]
+    out["ohlcv_m15_tail"] = [
+        [start_ms + idx * 900000, close, close, close, close, 1000.0]
+        for idx, close in enumerate(closes)
+    ]
+    out.setdefault("warnings", [])
+    out.setdefault("no_trade_reasons", [])
+
+    get_signal_json.apply_critical_topic_risk_compatibility(out)
+
+    assert out["no_trade"] is False
+    assert out["fresh_reclaim_present"] is True
+    assert out["fresh_reclaim_evidence"] == "m15_two_closed_candles_above_ema20_after_reset"
+    assert out["ema_fan_m15_state"] == "mixed"
+
+
 def test_btc_short_under_risk_off_alarm_can_remain_allowed_wait_confirm() -> None:
     data = _base_signal(direction="short", symbol="BTC/USDT")
     data["price"] = 72400.0

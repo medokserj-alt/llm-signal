@@ -9271,6 +9271,63 @@ def _has_fresh_reset_reclaim(d: dict) -> bool:
     wl = " ".join(str(w or "").strip().lower() for w in warnings)
     if "fresh_reset_reclaim" in wl or "volume_supported_reclaim" in wl:
         return True
+
+    # A reclaim happens before the moving-average fan can become bullish.  Requiring
+    # both EMA fans to be bullish made the counter-risk path confirm only after a
+    # large part of the move was over.  Use closed M15 candles to recognize the
+    # narrower event: a close from at/below EMA20 followed by two closes above it.
+    rows = d.get("ohlcv_m15_tail")
+    closed_rows: list[list[Any]] = []
+    cutoff_ms: int | None = None
+    time_msk = str(d.get("time_msk") or "").strip()
+    if time_msk:
+        try:
+            cutoff_ms = int(
+                datetime.strptime(time_msk, "%d.%m.%Y, %H:%M")
+                .replace(tzinfo=ZoneInfo("Europe/Moscow"))
+                .timestamp()
+                * 1000
+            )
+        except (TypeError, ValueError):
+            cutoff_ms = None
+    if isinstance(rows, list):
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            try:
+                ts = int(row[0])
+                float(row[4])
+            except (TypeError, ValueError):
+                continue
+            # The exchange tail includes the still-open candle at the evaluation
+            # timestamp.  It must never be used as confirmation.
+            if cutoff_ms is not None and ts >= cutoff_ms:
+                continue
+            if cutoff_ms is None and row_index == len(rows) - 1:
+                continue
+            closed_rows.append(row)
+    closes = [float(row[4]) for row in closed_rows]
+    if len(closes) >= 22:
+        ema_values: list[float | None] = [None] * len(closes)
+        ema = sum(closes[:20]) / 20.0
+        ema_values[19] = ema
+        alpha = 2.0 / 21.0
+        for idx in range(20, len(closes)):
+            ema = closes[idx] * alpha + ema * (1.0 - alpha)
+            ema_values[idx] = ema
+        latest = len(closes) - 1
+        held_above = all(
+            ema_values[idx] is not None and closes[idx] > float(ema_values[idx])
+            for idx in (latest - 1, latest)
+        )
+        reset_seen = any(
+            ema_values[idx] is not None and closes[idx] <= float(ema_values[idx])
+            for idx in range(max(19, latest - 7), latest - 1)
+        )
+        if held_above and reset_seen:
+            d["fresh_reclaim_present"] = True
+            d["fresh_reclaim_evidence"] = "m15_two_closed_candles_above_ema20_after_reset"
+            return True
     symbol = str(d.get("symbol") or "").strip()
     tech = d.get("pool_technical_context")
     selected_tech = tech.get(symbol) if isinstance(tech, dict) and isinstance(tech.get(symbol), dict) else {}
