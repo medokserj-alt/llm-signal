@@ -55,7 +55,7 @@ class DimaWindowModeTests(unittest.TestCase):
         self.assertEqual(sr.scheduled_full_signal_targets(cfg), [-1003492385200, -1003530482991])
 
         cfg.dima_scheduled_mode = "FULL_SIGNAL"
-        self.assertEqual(sr.scheduled_full_signal_targets(cfg), cfg.target_chat_ids)
+        self.assertEqual(sr.scheduled_full_signal_targets(cfg), [-1003492385200, -1003530482991])
 
     def test_dima_scheduled_signal_is_replaced_by_non_lifecycle_window(self) -> None:
         cfg = _cfg()
@@ -71,9 +71,10 @@ class DimaWindowModeTests(unittest.TestCase):
         )
         message = sr.render_dima_market_window(_avoid_context())
 
-        self.assertTrue(audit["window_message_sent"])
+        self.assertFalse(audit["window_message_sent"])
         self.assertFalse(audit["lifecycle_created"])
-        self.assertEqual(audit["channel_mode"], "WINDOW_ONLY")
+        self.assertEqual(audit["channel_mode"], "MINIMAL_END_USER")
+        self.assertEqual(audit["dima_window_audit_reason"], "technical_window_not_allowed")
         self.assertIn("🧭 Рыночное окно", message)
         self.assertIn("сейчас плохое окно для нового входа", message)
         for forbidden in ("entry", " SL", " TP", " RR"):
@@ -193,9 +194,9 @@ class DimaWindowModeTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue(changed["window_message_sent"])
-        self.assertFalse(changed["dima_window_cooldown_applied"])
-        self.assertEqual(changed["dima_window_audit_reason"], "execution_mode_changed")
+        self.assertFalse(changed["window_message_sent"])
+        self.assertTrue(changed["dima_window_cooldown_applied"])
+        self.assertEqual(changed["dima_window_audit_reason"], "technical_window_not_allowed")
 
     def test_repeated_same_window_is_suppressed_during_cooldown(self) -> None:
         cfg = _cfg()
@@ -211,7 +212,7 @@ class DimaWindowModeTests(unittest.TestCase):
                 dry_run=True,
             )
         )
-        self.assertTrue(first["window_message_sent"])
+        self.assertFalse(first["window_message_sent"])
         self.assertFalse(second["window_message_sent"])
         self.assertTrue(second["dima_window_cooldown_applied"])
 
@@ -229,9 +230,9 @@ class DimaWindowModeTests(unittest.TestCase):
                 dry_run=True,
             )
         )
-        self.assertTrue(changed["window_message_sent"])
-        self.assertFalse(changed["dima_window_cooldown_applied"])
-        self.assertEqual(changed["dima_window_update_reason"], "изменился режим риска")
+        self.assertFalse(changed["window_message_sent"])
+        self.assertTrue(changed["dima_window_cooldown_applied"])
+        self.assertEqual(changed["dima_window_update_reason"], "minimal_profile_suppressed")
 
     def test_stale_dima_macro_window_is_suppressed(self) -> None:
         cfg = _cfg()
@@ -246,7 +247,7 @@ class DimaWindowModeTests(unittest.TestCase):
             )
         )
         self.assertFalse(audit["dima_macro_window_sent"])
-        self.assertTrue(audit["dima_macro_stale_suppressed"])
+        self.assertTrue(audit["dima_macro_profile_suppressed"])
 
 
 if __name__ == "__main__":

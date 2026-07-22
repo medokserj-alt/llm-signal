@@ -1727,7 +1727,7 @@ class TestScheduledSignalState(unittest.TestCase):
             self.assertEqual(result["aia_forward_mode"], "awaited_scheduled")
             self.assertEqual(sent_payloads, [{"signal_id": "20260606_153001"}])
             self.assertTrue(publish_kwargs[0]["skip_aia_forward"])
-            self.assertEqual(built_kwargs[0]["publish_targets"], c.target_chat_ids)
+            self.assertEqual(built_kwargs[0]["publish_targets"], [-1003492385200, -1003530482991])
 
     def test_generate_and_publish_signal_aia_failure_keeps_publish(self) -> None:
         import tg_bot

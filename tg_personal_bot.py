@@ -16,6 +16,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from cleanup_old_signals import cleanup_old_signals
 from pinned_state import get_pinned_message_id, load_pinned_state, save_pinned_state, set_pinned_message_id
 from rbac import analysis_menu_layout, is_admin
+from channel_profiles import profile_for_user
 
 # ============== BASE / ENV ==================
 
@@ -414,6 +415,9 @@ def is_shared_main_route_uid(uid: int) -> bool:
     return shared_chat_id is not None and direct_chat_id == shared_chat_id
 
 def get_main_publication_chat_id(uid: int) -> int | None:
+    explicit_profile = profile_for_user(uid)
+    if explicit_profile is not None and explicit_profile.chat_id is not None:
+        return explicit_profile.chat_id
     cfg = USER_CONFIG.get(str(uid))
     if not isinstance(cfg, dict):
         shared_chat_id = get_shared_main_chat_id()
@@ -1289,6 +1293,7 @@ def _build_signal_json_v1(
     out = {
         "signal_id": str(signal_id),
         "signal_origin": "user",
+        "signal_origin_type": "USER_REQUESTED",
         "symbol": str(symbol),
         "direction": str(direction),
         "entry_zone": entry_zone,
@@ -1299,8 +1304,16 @@ def _build_signal_json_v1(
     }
     if origin_user_id is not None:
         out["origin_user_id"] = origin_user_id
+        out["requester_telegram_user_id"] = origin_user_id
+        out["requested_at"] = str(published_at)
+        out["request_correlation_id"] = str(signal_id)
+        owner_profile = profile_for_user(origin_user_id)
+        if owner_profile is not None:
+            out["requester_profile_id"] = owner_profile.profile_id
+            out["owner_profile_id"] = owner_profile.profile_id
     if origin_chat_id is not None:
         out["origin_chat_id"] = origin_chat_id
+        out["requester_chat_id"] = origin_chat_id
     if publish_targets:
         out["publish_targets"] = publish_targets
     if entry_price is not None:

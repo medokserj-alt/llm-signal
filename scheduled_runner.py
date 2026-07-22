@@ -16,6 +16,7 @@ from statistics import median
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 from macro_event_guard import evaluate_macro_event_guard, macro_dedupe_key, normalize_scheduled_macro_events
+from channel_profiles import end_user_profiles, report_end_user_chat_ids
 
 MSK = ZoneInfo("Europe/Moscow")
 UTC = timezone.utc
@@ -1998,7 +1999,7 @@ class SchedulerConfig:
     scheduled_state_guard_duplicate_enforcement_enabled: bool = False
     scheduled_state_guard_manual_override_enabled: bool = False
     scheduled_state_guard_manual_override_reason: str = ""
-    dima_scheduled_mode: str = "FULL_SIGNAL"
+    dima_scheduled_mode: str = "WINDOW_ONLY"
     dima_chat_id: int = DEFAULT_DIMA_CHAT_ID
     dima_window_cooldown_minutes: int = 90
     dima_macro_update_max_age_minutes: int = 60
@@ -2044,7 +2045,7 @@ class SchedulerConfig:
             scheduled_state_guard_manual_override_reason=str(
                 os.getenv("SCHEDULED_STATE_GUARD_MANUAL_OVERRIDE_REASON", "")
             ).strip(),
-            dima_scheduled_mode=str(os.getenv("TG_DIMA_SCHEDULED_MODE", "FULL_SIGNAL")).strip().upper(),
+            dima_scheduled_mode=str(os.getenv("TG_DIMA_SCHEDULED_MODE", "WINDOW_ONLY")).strip().upper(),
             dima_chat_id=parse_int_env("TG_DIMA_CHAT_ID", DEFAULT_DIMA_CHAT_ID),
             dima_window_cooldown_minutes=max(1, parse_int_env("DIMA_WINDOW_COOLDOWN_MINUTES", 90)),
             dima_macro_update_max_age_minutes=max(1, parse_int_env("DIMA_MACRO_UPDATE_MAX_AGE_MINUTES", 60)),
@@ -2056,11 +2057,19 @@ def dima_window_only(cfg: SchedulerConfig) -> bool:
 
 
 def scheduled_full_signal_targets(cfg: SchedulerConfig) -> list[int]:
-    targets = list(cfg.target_chat_ids)
-    if not dima_window_only(cfg):
-        return targets
+    profiles = end_user_profiles()
+    end_user_by_chat = {p.chat_id: p for p in profiles if p.chat_id is not None}
     dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
-    return [chat_id for chat_id in targets if chat_id != dima_chat_id]
+    targets = [
+        chat_id
+        for chat_id in cfg.target_chat_ids
+        if chat_id != dima_chat_id
+        and (end_user_by_chat.get(chat_id, None) is None or end_user_by_chat[chat_id].receive_scheduled_signals)
+    ]
+    for profile in profiles:
+        if profile.chat_id is not None and profile.receive_scheduled_signals and profile.chat_id not in targets:
+            targets.append(profile.chat_id)
+    return targets
 
 
 def publish_decision_log_path(now_utc: datetime) -> Path:
@@ -2931,7 +2940,7 @@ async def maybe_publish_dima_market_window(
 ) -> dict:
     snap = dima_window_snapshot(ctx)
     audit = {
-        "channel_mode": "WINDOW_ONLY" if dima_window_only(cfg) else "FULL_SIGNAL",
+        "channel_mode": "MINIMAL_END_USER" if dima_window_only(cfg) else "FULL_SIGNAL",
         "window_message_sent": False,
         "lifecycle_created": False,
         "dima_manual_signal_preserved": True,
@@ -2943,42 +2952,11 @@ async def maybe_publish_dima_market_window(
     dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
     if not dima_window_only(cfg) or dima_chat_id not in cfg.target_chat_ids:
         return audit
-    previous = state.get("dima_window") if isinstance(state.get("dima_window"), dict) else None
-    important_change = bool(
-        previous
-        and any(
-            previous.get(key) != snap.get(key)
-            for key in ("execution_mode", "risk_regime", "focus", "direction", "window_type", "window_quality")
-        )
-    )
-    previous_at = None
-    if previous:
-        try:
-            previous_at = datetime.fromisoformat(str(previous.get("sent_at_utc") or "").replace("Z", "+00:00"))
-        except Exception:
-            previous_at = None
-    elapsed_minutes = (now_utc - previous_at).total_seconds() / 60.0 if previous_at else None
-    cooldown = int(getattr(cfg, "dima_window_cooldown_minutes", 90))
-    same_key = bool(previous and previous.get("dedup_key") == snap["dedup_key"])
-    current_slot = str(ctx.get("slot_id") or "").strip()
-    same_slot = bool(current_slot and previous and previous.get("slot_id") == current_slot)
-    if same_key and not important_change and elapsed_minutes is not None and elapsed_minutes < cooldown:
-        audit["dima_window_cooldown_applied"] = True
-        audit["dima_window_update_reason"] = "повторное окно подавлено периодом защиты"
-        audit["dima_window_audit_reason"] = _dima_window_audit_reason(previous, snap, same_slot=same_slot)
-        return audit
-    context = make_context(dry_run=dry_run)
-    await context.bot.send_message(
-        chat_id=dima_chat_id,
-        text=render_dima_market_window(ctx),
-        parse_mode=None,
-        disable_web_page_preview=True,
-    )
-    reason = _dima_window_update_reason(previous, snap)
-    state["dima_window"] = {**snap, "sent_at_utc": now_utc.isoformat().replace("+00:00", "Z"), "slot_id": current_slot or None}
-    audit["window_message_sent"] = True
-    audit["dima_window_update_reason"] = reason
-    audit["dima_window_audit_reason"] = _dima_window_audit_reason(previous, snap)
+    # The minimal end-user profile never receives the legacy technical/negative
+    # scheduled window. Positive request prompts are owned by AIA presentation.
+    audit["dima_window_cooldown_applied"] = True
+    audit["dima_window_update_reason"] = "minimal_profile_suppressed"
+    audit["dima_window_audit_reason"] = "technical_window_not_allowed"
     return audit
 
 
@@ -3019,27 +2997,18 @@ async def maybe_publish_dima_macro_window(
     now_utc: datetime,
     dry_run: bool = False,
 ) -> dict:
-    audit = {"dima_macro_window_sent": False, "dima_macro_stale_suppressed": False, "lifecycle_created": False}
+    audit = {
+        "dima_macro_window_sent": False,
+        "dima_macro_stale_suppressed": False,
+        "dima_macro_profile_suppressed": False,
+        "lifecycle_created": False,
+    }
     dima_chat_id = int(getattr(cfg, "dima_chat_id", DEFAULT_DIMA_CHAT_ID))
     if not dima_window_only(cfg) or dima_chat_id not in cfg.target_chat_ids:
         return audit
-    raw_time = event.get("event_time_utc")
-    try:
-        event_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
-    except Exception:
-        event_time = None
-    max_age = int(getattr(cfg, "dima_macro_update_max_age_minutes", 60))
-    if event_time is not None and (now_utc - event_time).total_seconds() / 60.0 > max_age:
-        audit["dima_macro_stale_suppressed"] = True
-        return audit
-    context = make_context(dry_run=dry_run)
-    await context.bot.send_message(
-        chat_id=dima_chat_id,
-        text=render_dima_macro_window(event, classification),
-        parse_mode=None,
-        disable_web_page_preview=True,
-    )
-    audit["dima_macro_window_sent"] = True
+    # Calendar facts and delayed recommendations are rendered by AIA. The
+    # legacy scheduled macro window is a technical advisory and is suppressed.
+    audit["dima_macro_profile_suppressed"] = True
     return audit
 
 
@@ -3575,25 +3544,49 @@ def extract_report_dir(kind: str, proc) -> Path | None:
     return sorted(dirs)[-1] if dirs else None
 
 
-async def publish_report(kind: str, cfg: SchedulerConfig, *, dry_run: bool = False) -> dict:
+def scheduled_report_targets(kind: str, cfg: SchedulerConfig) -> list[int]:
+    return list(dict.fromkeys([*cfg.target_chat_ids, *report_end_user_chat_ids(kind)]))
+
+
+async def publish_report(
+    kind: str,
+    cfg: SchedulerConfig,
+    *,
+    dry_run: bool = False,
+    target_chat_ids: list[int] | None = None,
+    report_dir: Path | None = None,
+) -> dict:
     import tg_bot
 
-    script = f"./run_{kind}.sh"
-    proc = run_command(["bash", "-lc", f"chmod +x {script} && {script}"], timeout=1200, dry_run=dry_run)
-    if getattr(proc, "returncode", 1) != 0:
-        raise RuntimeError((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or f"{script} failed").strip())
-    report_dir = extract_report_dir(kind, proc)
+    if report_dir is None:
+        script = f"./run_{kind}.sh"
+        proc = run_command(["bash", "-lc", f"chmod +x {script} && {script}"], timeout=1200, dry_run=dry_run)
+        if getattr(proc, "returncode", 1) != 0:
+            raise RuntimeError((getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or f"{script} failed").strip())
+        report_dir = extract_report_dir(kind, proc)
     if not report_dir:
         raise RuntimeError(f"{kind.upper()} report artifact not found")
     context = make_context(dry_run=dry_run)
     emoji = "🗓" if kind == "day" else "📰"
     message_ids: list[int] = []
-    for channel in cfg.target_chat_ids:
+    successful_targets: list[int] = []
+    target_errors: dict[str, str] = {}
+    report_targets = list(target_chat_ids) if target_chat_ids is not None else scheduled_report_targets(kind, cfg)
+    for channel in report_targets:
         before = len(context.bot.sent) if dry_run else 0
-        await tg_bot._post_report(kind, emoji, context, channel, report_dir=report_dir)
-        if dry_run:
-            message_ids.extend(item["message_id"] for item in context.bot.sent[before:])
-    return {"artifact_path": relpath(report_dir), "message_id": message_ids[0] if message_ids else None}
+        try:
+            await tg_bot._post_report(kind, emoji, context, channel, report_dir=report_dir)
+            successful_targets.append(channel)
+            if dry_run:
+                message_ids.extend(item["message_id"] for item in context.bot.sent[before:])
+        except Exception as exc:
+            target_errors[str(channel)] = str(exc)
+    return {
+        "artifact_path": relpath(report_dir),
+        "message_id": message_ids[0] if message_ids else None,
+        "target_chat_ids": successful_targets,
+        "target_errors": target_errors,
+    }
 
 
 def read_last_signal_payload() -> dict:
@@ -3940,6 +3933,24 @@ async def generate_and_publish_signal(
             last_payload=payload,
             last_json_path=PROJECT_ROOT / "logs/last.json",
         )
+        if signal_json_v1 and all(key in signal_json_v1 for key in ("symbol", "direction", "published_at")):
+            signal_json_v1.update(
+                {
+                    "signal_origin": "scheduled",
+                    "signal_origin_type": "SCHEDULED",
+                    "owner_profile_id": None,
+                    "lifecycle_targets": full_signal_targets.copy(),
+                }
+            )
+            for requester_key in (
+                "origin_user_id",
+                "requester_telegram_user_id",
+                "requester_chat_id",
+                "requester_profile_id",
+                "requested_at",
+                "request_correlation_id",
+            ):
+                signal_json_v1.pop(requester_key, None)
         if signal_json_v1 and duplicate_decision.get("publication_type") == "replace_wait_confirm":
             signal_json_v1["publication_type"] = "replace_wait_confirm"
             signal_json_v1["replaced_signal_id"] = duplicate_decision.get("replaced_signal_id")
@@ -4400,6 +4411,10 @@ async def run_publish_job(kind: str, now_utc: datetime, cfg: SchedulerConfig, *,
     now_msk = to_msk(now_utc)
     scheduled = slot_datetime_msk(now_msk.date(), cfg.day_time_msk if kind == "day" else cfg.mid_time_msk)
     key = scheduled.strftime("%Y%m%d") if kind == "day" else mid_cycle_id(now_msk.date(), cfg.start_date_msk, cfg.mid_interval_days)
+    report_targets = scheduled_report_targets(kind, cfg)
+    previous_state = state[kind].get(key, {}) if isinstance(state[kind].get(key), dict) else {}
+    successful_targets = list(dict.fromkeys(previous_state.get("target_chat_ids") or []))
+    pending_targets = [target for target in report_targets if target not in set(successful_targets)]
     row = {
         "ts_utc": now_utc.isoformat().replace("+00:00", "Z"),
         "generated_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
@@ -4410,13 +4425,14 @@ async def run_publish_job(kind: str, now_utc: datetime, cfg: SchedulerConfig, *,
         "interval_days": cfg.mid_interval_days if kind == "mid" else None,
         "cycle_id": key if kind == "mid" else None,
         "decision": None,
-        "target_chat_ids": cfg.target_chat_ids,
+        "target_chat_ids": report_targets,
+        "pending_target_chat_ids": pending_targets,
         "artifact_path": None,
         "message_id": None,
         "signal_id": None,
         "error": None,
     }
-    if state[kind].get(key, {}).get("status") == "published":
+    if previous_state.get("status") == "published" and not pending_targets:
         row["decision"] = "duplicate_skip"
         row["artifact_path"] = state[kind][key].get("artifact_path")
         row["message_id"] = state[kind][key].get("message_id")
@@ -4424,16 +4440,36 @@ async def run_publish_job(kind: str, now_utc: datetime, cfg: SchedulerConfig, *,
             append_jsonl(publish_decision_log_path(now_utc), row)
         return
     try:
-        result = await publish_report(kind, cfg, dry_run=dry_run)
+        existing_artifact = previous_state.get("artifact_path")
+        existing_report_dir = PROJECT_ROOT / existing_artifact if isinstance(existing_artifact, str) and existing_artifact else None
+        result = await publish_report(
+            kind,
+            cfg,
+            dry_run=dry_run,
+            target_chat_ids=pending_targets,
+            report_dir=existing_report_dir if existing_report_dir is not None and existing_report_dir.exists() else None,
+        )
+        delivered_targets = list(dict.fromkeys([*successful_targets, *result.get("target_chat_ids", [])]))
+        remaining_targets = [target for target in report_targets if target not in set(delivered_targets)]
         state[kind][key] = {
-            "status": "published",
+            "status": "published" if not remaining_targets else "partial",
             "slot_time_msk": scheduled.isoformat(),
             "generated_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
             "artifact_path": result.get("artifact_path"),
             "message_id": result.get("message_id"),
-            "target_chat_ids": cfg.target_chat_ids,
+            "target_chat_ids": delivered_targets,
+            "target_errors": result.get("target_errors") or {},
         }
-        row.update({"decision": "publish", "artifact_path": result.get("artifact_path"), "message_id": result.get("message_id")})
+        row.update(
+            {
+                "decision": "publish" if not remaining_targets else "partial",
+                "artifact_path": result.get("artifact_path"),
+                "message_id": result.get("message_id"),
+                "successful_target_chat_ids": delivered_targets,
+                "remaining_target_chat_ids": remaining_targets,
+                "target_errors": result.get("target_errors") or {},
+            }
+        )
     except Exception as exc:
         row.update({"decision": "error", "error": str(exc)})
     if not dry_run:
