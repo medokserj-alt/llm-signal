@@ -2197,6 +2197,7 @@ async def _publish_signal_result(
     sig_html: Path | None,
     run_log: Path | None,
     skip_aia_forward: bool = False,
+    delivery_result: dict | None = None,
 ) -> bool:
     published_at = _utc_now_z()
     signal_id = _infer_signal_id(sig_html, run_log, published_at)
@@ -2290,6 +2291,12 @@ async def _publish_signal_result(
         delivery_kind=delivery_kind,
         protect_content=False,
     )
+    if isinstance(delivery_result, dict):
+        delivery_result["delivered_chat_ids"] = delivered_chat_ids.copy()
+        requested_targets = get_main_publication_targets(uid)
+        delivery_result["failed_chat_ids"] = [
+            chat_id for chat_id in requested_targets if chat_id not in set(delivered_chat_ids)
+        ]
     if not delivered_chat_ids:
         _log_signal_publication(
             event="telegram_publish_failed",

@@ -2072,6 +2072,25 @@ def scheduled_full_signal_targets(cfg: SchedulerConfig) -> list[int]:
     return targets
 
 
+def successful_signal_publication_targets(
+    requested_targets: list[int],
+    delivery_result: dict | None,
+    *,
+    published: bool,
+) -> list[int]:
+    """Return only chats with an acknowledged Telegram publication.
+
+    The fallback preserves compatibility with test/mocked publishers that
+    predate structured per-target results; the real publisher always fills it.
+    """
+    delivery_result = delivery_result if isinstance(delivery_result, dict) else {}
+    delivered = delivery_result.get("delivered_chat_ids")
+    if isinstance(delivered, list):
+        delivered_set = {int(chat_id) for chat_id in delivered}
+        return [chat_id for chat_id in requested_targets if chat_id in delivered_set]
+    return requested_targets.copy() if published else []
+
+
 def publish_decision_log_path(now_utc: datetime) -> Path:
     return LOGS_DIR / f"scheduled_publish_decisions_{now_utc.astimezone(MSK).strftime('%Y%m%d')}.jsonl"
 
@@ -3877,6 +3896,7 @@ async def generate_and_publish_signal(
     old_get_chat = tg_bot.get_main_publication_chat_id
     old_get_mode = tg_bot.get_user_mode
     full_signal_targets = scheduled_full_signal_targets(cfg)
+    signal_delivery_result: dict[str, list[int]] = {}
     try:
         tg_bot.get_main_publication_targets = lambda uid: full_signal_targets.copy()
         tg_bot.get_main_publication_chat_id = lambda uid: full_signal_targets[0] if full_signal_targets else None
@@ -3894,6 +3914,7 @@ async def generate_and_publish_signal(
                 sig_html=Path(sig_html),
                 run_log=Path(run_log) if run_log else None,
                 skip_aia_forward=True,
+                delivery_result=signal_delivery_result,
             )
         else:
             ok = True
@@ -3908,6 +3929,14 @@ async def generate_and_publish_signal(
         "aia_forward_error": None,
         "aia_forward_mode": "awaited_scheduled",
     }
+    delivered_signal_targets = successful_signal_publication_targets(
+        full_signal_targets,
+        signal_delivery_result,
+        published=bool(ok),
+    )
+    failed_signal_targets = [
+        chat_id for chat_id in full_signal_targets if chat_id not in set(delivered_signal_targets)
+    ]
     if ok:
         if tp_validation["invalid_tp_ladder"]:
             LOGGER.warning(
@@ -3926,9 +3955,9 @@ async def generate_and_publish_signal(
         signal_json_v1 = tg_bot._build_signal_json_v1(
             signal_id=signal_id,
             published_at=published_at,
-            channel_id=full_signal_targets[0] if full_signal_targets else None,
-            origin_chat_id=full_signal_targets[0] if full_signal_targets else None,
-            publish_targets=full_signal_targets.copy(),
+            channel_id=delivered_signal_targets[0] if delivered_signal_targets else None,
+            origin_chat_id=delivered_signal_targets[0] if delivered_signal_targets else None,
+            publish_targets=delivered_signal_targets.copy(),
             symbol_hint=None,
             last_payload=payload,
             last_json_path=PROJECT_ROOT / "logs/last.json",
@@ -3939,7 +3968,7 @@ async def generate_and_publish_signal(
                     "signal_origin": "scheduled",
                     "signal_origin_type": "SCHEDULED",
                     "owner_profile_id": None,
-                    "lifecycle_targets": full_signal_targets.copy(),
+                    "lifecycle_targets": delivered_signal_targets.copy(),
                 }
             )
             for requester_key in (
@@ -3966,6 +3995,8 @@ async def generate_and_publish_signal(
         "artifact_path": relpath(Path(sig_html)),
         "run_log": relpath(Path(run_log)) if run_log else None,
         "last_payload": payload,
+        "publication_targets": delivered_signal_targets,
+        "failed_publication_targets": failed_signal_targets,
         **aia_forward,
         "aia_forward_warning": "aia_forward_failed" if ok and not aia_forward.get("aia_forward_ok") else None,
         **tp_validation,

@@ -63,6 +63,28 @@ class ChannelProfileRoutingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertNotIn(-1003907734859, channel_profiles.scheduled_end_user_chat_ids())
 
+    def test_failed_v_publication_is_not_a_lifecycle_target(self):
+        requested = [-1003492385200, -1003530482991, -1003907734859]
+        delivered = scheduled_runner.successful_signal_publication_targets(
+            requested,
+            {
+                "delivered_chat_ids": [-1003492385200, -1003530482991],
+                "failed_chat_ids": [-1003907734859],
+            },
+            published=True,
+        )
+        self.assertEqual(delivered, [-1003492385200, -1003530482991])
+        self.assertNotIn(-1003907734859, delivered)
+
+    def test_successful_v_publication_is_a_lifecycle_target(self):
+        requested = [-1003492385200, -1003530482991, -1003907734859]
+        delivered = scheduled_runner.successful_signal_publication_targets(
+            requested,
+            {"delivered_chat_ids": requested.copy(), "failed_chat_ids": []},
+            published=True,
+        )
+        self.assertIn(-1003907734859, delivered)
+
     def test_v_requested_signal_persists_structured_owner(self):
         payload = {
             "symbol": "BTC/USDT",
