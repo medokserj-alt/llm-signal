@@ -2186,6 +2186,24 @@ class TestScheduledCandidateFunnelObservability(unittest.TestCase):
 
 
 class DailySignalHealthTests(unittest.TestCase):
+    def test_duplicate_management_requires_per_target_entry_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logs = root / "logs"
+            logs.mkdir()
+            with patch("scheduled_runner.AGENT_STATE_REPO_ROOT", root):
+                self.assertFalse(sr._entry_notice_delivered("20260727_093003", -1003492385200))
+                (logs / "sent_notifications_20260727.jsonl").write_text(
+                    json.dumps({
+                        "signal_id": "20260727_093003",
+                        "action_kind": "notify_entry_live",
+                        "target_chat_id": -1003492385200,
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+                self.assertTrue(sr._entry_notice_delivered("20260727_093003", -1003492385200))
+                self.assertFalse(sr._entry_notice_delivered("20260727_093003", -1003530482991))
+
     def test_contract_valid_policy_blocks_remain_visible_as_possible_overfilter(self) -> None:
         rows = [
             {

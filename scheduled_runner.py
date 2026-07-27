@@ -16,7 +16,7 @@ from statistics import median
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 from macro_event_guard import evaluate_macro_event_guard, macro_dedupe_key, normalize_scheduled_macro_events
-from channel_profiles import end_user_profiles, report_end_user_chat_ids
+from channel_profiles import end_user_profiles, profile_for_chat, report_end_user_chat_ids
 
 MSK = ZoneInfo("Europe/Moscow")
 UTC = timezone.utc
@@ -102,6 +102,9 @@ SCHEDULED_PENDING_EXPIRING_STATUSES = {
     "SETUP_ARMED",
     "WAIT_POST_EVENT_REPRICE",
 }
+_SUPPRESS_MINIMAL_PLAIN_MESSAGE = False
+_ENTRY_CONTINUITY_SIGNAL_ID: str | None = None
+_MINIMAL_DUPLICATE_DECISION: dict | None = None
 SCHEDULED_ADVISORY_NON_BLOCKING_STATUSES = {
     "RE_EVAL_ACTIVE_SIGNAL",
     "MARKET_REPRICE_ALERT",
@@ -118,6 +121,7 @@ NOT_IN_WORK_SIGNAL_STATUSES = {
     "TAKE_PROFIT_DONE",
 }
 SCHEDULED_SIGNAL_LIFECYCLE_EVENTS_PATH = LOGS_DIR / "scheduled_signal_lifecycle_events.jsonl"
+ENTRY_PLAN_REPLACEMENT_PROPOSALS_PATH = AGENT_STATE_REPO_ROOT / "logs" / "entry_plan_replacement_proposals.jsonl"
 STATE_GUARD_DECISION_LOG_FIELDS = (
     "state_guard_shadow_enabled",
     "state_guard_status",
@@ -1945,14 +1949,111 @@ def render_replacement_prefix(decision: dict, candidate: dict) -> str:
     )
 
 
-async def publish_plain_message(cfg: SchedulerConfig, message: str, *, dry_run: bool = False) -> list[int]:
+def _render_minimal_duplicate_update(decision: dict) -> str | None:
+    """Only expose a concrete action; candidate entry prices remain audit-only."""
+    old = decision.get("duplicate_signal") if isinstance(decision.get("duplicate_signal"), dict) else {}
+    symbol = _display_symbol(old.get("symbol") or decision.get("active_same_direction_symbol") or "")
+    direction = str(old.get("direction") or decision.get("active_same_direction_direction") or "").upper()
+    status = str(old.get("status") or decision.get("duplicate_signal_status") or "").upper()
+    if not symbol or direction not in {"LONG", "SHORT"}:
+        return None
+    if status in LIVE_POSITION_STATUSES:
+        if decision.get("risk_reassessment_required") or decision.get("management_review_required"):
+            return "\n".join([
+                "⚠️ Риск по сделке вырос", "", f"{symbol} {direction}", "Статус: сделка открыта.", "",
+                "Что делать:", "Не увеличивать позицию.", "Текущий стоп оставить без изменений.",
+            ])
+        return None
+    if str(decision.get("pending_update_classification") or "").lower() in {"reprice_review_pending_setup", "refresh_pending_setup"}:
+        new_entry = decision.get("new_entry")
+        old_entry = decision.get("previous_entry")
+        lines = ["🔄 Точка входа обновлена", "", f"{symbol} {direction}", ""]
+        if new_entry is not None:
+            lines.append(f"Новая ТВХ: {new_entry}")
+        if old_entry is not None:
+            lines.append(f"Предыдущая ТВХ: {old_entry} отменена.")
+        return "\n".join(lines + ["", "Статус:", "Вход ещё не состоялся.", "", "Что делать:", "Пока не входить.", "Ждать нового подтверждения."])
+    return None
+
+
+async def publish_plain_message(
+    cfg: SchedulerConfig,
+    message: str,
+    *,
+    dry_run: bool = False,
+) -> list[int]:
+    suppress_minimal_profiles = _SUPPRESS_MINIMAL_PLAIN_MESSAGE
     context = make_context(dry_run=dry_run)
     message_ids: list[int] = []
+    minimal_chat_ids = {
+        profile.chat_id for profile in end_user_profiles() if profile.chat_id is not None and profile.minimal_mode
+    }
     for channel in scheduled_full_signal_targets(cfg):
-        sent = await context.bot.send_message(chat_id=channel, text=message, parse_mode=None, disable_web_page_preview=True)
+        if suppress_minimal_profiles and channel in minimal_chat_ids:
+            continue
+        if _ENTRY_CONTINUITY_SIGNAL_ID and not _entry_notice_delivered(_ENTRY_CONTINUITY_SIGNAL_ID, channel):
+            continue
+        target_message = message
+        if profile_for_chat(channel) is not None and _MINIMAL_DUPLICATE_DECISION is not None:
+            target_message = _render_minimal_duplicate_update(_MINIMAL_DUPLICATE_DECISION)
+            if target_message is None:
+                continue
+        sent = await context.bot.send_message(chat_id=channel, text=target_message, parse_mode=None, disable_web_page_preview=True)
         if dry_run:
             message_ids.append(getattr(sent, "message_id", None))
     return [mid for mid in message_ids if mid is not None]
+
+
+def _silent_duplicate_for_minimal_profiles(decision: dict) -> bool:
+    """A duplicate scan without a changed user action is audit-only for minimal users."""
+    if str(decision.get("publication_type") or "").lower() != "management_update":
+        return False
+    return not any(
+        bool(decision.get(key))
+        for key in (
+            "headline_update_generated",
+            "management_review_required",
+            "risk_reassessment_required",
+            "replacement_selected",
+            "reprice_required",
+        )
+    )
+
+
+def _entry_notice_delivered(signal_id: str, target_chat_id: int) -> bool:
+    """Read-only cross-repository continuity check for scheduled management output."""
+    day = signal_id[:8]
+    if len(day) != 8 or not day.isdigit():
+        return False
+    path = AGENT_STATE_REPO_ROOT / "logs" / f"sent_notifications_{day}.jsonl"
+    try:
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            row = json.loads(raw)
+            if (
+                row.get("signal_id") == signal_id
+                and row.get("action_kind") == "notify_entry_live"
+                and int(row.get("target_chat_id")) == int(target_chat_id)
+            ):
+                return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return False
+
+
+async def publish_duplicate_update_message(cfg: SchedulerConfig, message: str, decision: dict, *, dry_run: bool) -> list[int]:
+    global _SUPPRESS_MINIMAL_PLAIN_MESSAGE, _ENTRY_CONTINUITY_SIGNAL_ID, _MINIMAL_DUPLICATE_DECISION
+    previous = _SUPPRESS_MINIMAL_PLAIN_MESSAGE
+    previous_signal_id = _ENTRY_CONTINUITY_SIGNAL_ID
+    previous_decision = _MINIMAL_DUPLICATE_DECISION
+    _SUPPRESS_MINIMAL_PLAIN_MESSAGE = _silent_duplicate_for_minimal_profiles(decision)
+    _ENTRY_CONTINUITY_SIGNAL_ID = str(decision.get("duplicate_signal_id") or "") or None
+    _MINIMAL_DUPLICATE_DECISION = decision
+    try:
+        return await publish_plain_message(cfg, message, dry_run=dry_run)
+    finally:
+        _SUPPRESS_MINIMAL_PLAIN_MESSAGE = previous
+        _ENTRY_CONTINUITY_SIGNAL_ID = previous_signal_id
+        _MINIMAL_DUPLICATE_DECISION = previous_decision
 
 
 def emit_replacement_event(decision: dict, candidate: dict) -> None:
@@ -1971,6 +2072,37 @@ def emit_replacement_event(decision: dict, candidate: dict) -> None:
             "new_candidate_sl": decision.get("new_candidate_sl"),
         },
     )
+
+
+def propose_entry_plan_replacement(decision: dict, candidate: dict) -> dict:
+    """Durably propose, but never publish, an unentered-plan replacement.
+
+    AIA is the lifecycle owner.  It will accept/reject this immutable proposal
+    and only its accepted lifecycle event can notify end users.
+    """
+    signal_id = str(decision.get("replaced_signal_id") or "")
+    source_candidate_id = str(candidate.get("signal_id") or "")
+    required = ("entry_price", "sl", "tp1")
+    if not signal_id or not source_candidate_id or any(candidate.get(key) is None for key in required):
+        return {"proposed": False, "reason": "incomplete_replacement_risk_plan"}
+    proposal = {
+        "ts": utc_now().isoformat().replace("+00:00", "Z"),
+        "event": "ENTRY_PLAN_REPLACEMENT_PROPOSED",
+        "proposal_id": f"{signal_id}:{source_candidate_id}",
+        "signal_id": signal_id,
+        "source_candidate_id": source_candidate_id,
+        "symbol": candidate.get("symbol") or candidate.get("display_symbol"),
+        "direction": candidate.get("direction"),
+        "entry_price": candidate.get("entry_price"),
+        "sl": candidate.get("sl"),
+        "tp1": candidate.get("tp1"),
+        "tp2": candidate.get("tp2"),
+        "tp3": candidate.get("tp3"),
+        "previous_entry": decision.get("old_entry"),
+        "source": "core_scheduled_rescan",
+    }
+    append_jsonl(ENTRY_PLAN_REPLACEMENT_PROPOSALS_PATH, proposal)
+    return {"proposed": True, "proposal_id": proposal["proposal_id"], "reason": "awaiting_aia_canonical_acceptance"}
 
 
 @dataclass
@@ -3786,8 +3918,29 @@ async def generate_and_publish_signal(
         ):
             if gate_context.get(key) not in (None, "", [], {}):
                 decision[key] = gate_context.get(key)
+        if decision.get("pending_update_classification") == "reprice_review_pending_setup":
+            decision["replaced_signal_id"] = decision.get("duplicate_signal_id")
+            decision["old_entry"] = decision.get("previous_entry")
+            proposal = propose_entry_plan_replacement(decision, candidate)
+            return {
+                "published": False,
+                "reason": proposal["reason"],
+                "signal_id": None,
+                "candidate_signal_id": signal_id,
+                "artifact_path": relpath(Path(sig_html)),
+                "run_log": relpath(Path(run_log)) if run_log else None,
+                "last_payload": payload,
+                "publication_type": "entry_plan_replacement_proposed",
+                "entry_plan_replacement_proposed": proposal.get("proposed", False),
+                "entry_plan_replacement_proposal_id": proposal.get("proposal_id"),
+                **tp_validation,
+                **state_guard_shadow,
+                **state_guard_runtime,
+                **state_guard_enforcement,
+                **day_diagnostics,
+            }
         message = render_duplicate_update_message(decision, candidate)
-        message_ids = await publish_plain_message(cfg, message, dry_run=dry_run)
+        message_ids = await publish_duplicate_update_message(cfg, message, decision, dry_run=dry_run)
         return {
             "published": True,
             "reason": decision["replacement_reason"],
@@ -3816,6 +3969,29 @@ async def generate_and_publish_signal(
     duplicate_decision = evaluate_duplicate_publication(candidate, load_in_work_signal_state(now_utc), now_utc=now_utc)
     duplicate_result = {k: v for k, v in duplicate_decision.items() if k != "duplicate_signal"}
 
+    if duplicate_decision.get("publication_type") == "replace_wait_confirm":
+        # Do not publish a cosmetic new-entry message or a second signal.  The
+        # existing setup remains authoritative until AIA accepts this proposal.
+        proposal = propose_entry_plan_replacement(duplicate_decision, candidate)
+        return {
+            "published": False,
+            "reason": proposal["reason"],
+            "signal_id": None,
+            "candidate_signal_id": signal_id,
+            "artifact_path": relpath(Path(sig_html)),
+            "run_log": relpath(Path(run_log)) if run_log else None,
+            "last_payload": payload,
+            "publication_type": "entry_plan_replacement_proposed",
+            "aia_forward_attempted": False,
+            "aia_forward_ok": False,
+            "aia_forward_error": None,
+            "aia_forward_mode": "durable_replacement_proposal",
+            "entry_plan_replacement_proposed": proposal.get("proposed", False),
+            "entry_plan_replacement_proposal_id": proposal.get("proposal_id"),
+            **tp_validation,
+            **duplicate_result,
+        }
+
     if duplicate_decision.get("publication_type") in {"active_signal_update", "conflict_update", "urgent_review"}:
         if duplicate_decision.get("publication_type") == "urgent_review" and not dry_run:
             old = duplicate_decision.get("duplicate_signal") or {}
@@ -3830,7 +4006,7 @@ async def generate_and_publish_signal(
                 propose_reverse_signal=bool(duplicate_decision.get("propose_reverse_signal")),
             )
         message = render_duplicate_update_message(duplicate_decision, candidate)
-        message_ids = await publish_plain_message(cfg, message, dry_run=dry_run)
+        message_ids = await publish_duplicate_update_message(cfg, message, duplicate_decision, dry_run=dry_run)
         return {
             "published": True,
             "reason": str(duplicate_decision.get("replacement_reason") or "duplicate_in_work_signal"),
